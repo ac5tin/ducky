@@ -1,0 +1,36 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Ducky",
+  "version": "0.1.0",
+  "identifier": "app.ducky.mcp",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Ducky",
+        "label": "main",
+        "width": 1240,
+        "height": 820,
+        "minWidth": 940,
+        "minHeight": 620,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.png"],
+    "category": "DeveloperTool",
+    "shortDescription": "A friendly MCP client",
+    "longDescription": "Ducky is an easy-to-use desktop app that connects AI models (OpenAI, Claude, Z.ai, Ollama and more) to MCP servers — tools, resources and prompts — without any configuration files."
+  }
+}
