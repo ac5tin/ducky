@@ -78,11 +78,13 @@ pub struct ChatOptions {
     pub model: String,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
+    /// Reasoning effort requested for this turn (None = provider default).
+    pub effort: Option<crate::config::EffortLevel>,
 }
 
 impl Default for ChatOptions {
     fn default() -> Self {
-        Self { model: String::new(), max_tokens: None, temperature: None }
+        Self { model: String::new(), max_tokens: None, temperature: None, effort: None }
     }
 }
 
@@ -212,6 +214,8 @@ pub fn build_provider(cfg: &ProviderConfig, api_key: Option<&str>) -> std::sync:
             base_url: cfg.base_url.clone(),
             api_key: key,
             name: cfg.name.clone(),
+            // Z.ai needs `thinking` enabled for `reasoning_effort` to apply
+            thinking_toggle: matches!(cfg.kind.as_str(), "zai" | "zai-coding"),
         }),
         ApiType::Anthropic => std::sync::Arc::new(anthropic::AnthropicProvider {
             base_url: cfg.base_url.clone(),

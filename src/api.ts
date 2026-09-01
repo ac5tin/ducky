@@ -6,6 +6,7 @@ import type {
   BackendEvent,
   ConnectorSuggestion,
   ConversationMeta,
+  EffortLevel,
   McpServerConfig,
   ProviderConfig,
   ProviderPreset,
@@ -99,6 +100,13 @@ export const conversationRename = (id: string, title: string) =>
 
 export const conversationSetModel = (id: string, providerId: string, model: string) =>
   invoke<void>("conversation_set_model", { id, providerId, model });
+
+export const conversationSetEffort = (id: string, effort: EffortLevel | null) =>
+  invoke<void>("conversation_set_effort", { id, effort });
+
+/** Effort levels the model supports per models.dev; empty = hide the selector. */
+export const effortLevels = (kind: string, model: string) =>
+  invoke<EffortLevel[]>("effort_levels", { kind, model });
 
 export const conversationGet = (
   id: string,

@@ -11,6 +11,7 @@ export type Theme = "system" | "light" | "dark";
 export type ApprovalMode = "always_ask" | "auto_approve_read_only" | "auto_approve_all";
 export type SamplingMode = "ask" | "auto_approve" | "deny";
 export type ToolRule = "allow" | "deny";
+export type EffortLevel = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 export interface ProviderConfig {
   id: string;
@@ -70,6 +71,7 @@ export interface ConversationMeta {
   title: string;
   provider_id: string;
   model: string;
+  effort: EffortLevel | null;
   created_at: string;
   updated_at: string;
 }

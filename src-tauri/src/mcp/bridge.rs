@@ -285,6 +285,7 @@ impl InteractiveBridge {
             model: backend.model.clone(),
             max_tokens: Some(params.max_tokens),
             temperature: None,
+            effort: None,
         };
         let provider = backend.provider.clone();
         let handle = tokio::spawn(async move {

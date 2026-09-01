@@ -287,6 +287,7 @@ pub fn conversation_create(
         title: String::new(),
         provider_id,
         model,
+        effort: None,
         created_at: now(),
         updated_at: now(),
     };
@@ -335,6 +336,35 @@ pub fn conversation_set_model(
         meta.model = model;
     }
     state.store.save_config().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn conversation_set_effort(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    effort: Option<config::EffortLevel>,
+) -> Result<(), String> {
+    {
+        let mut c = state.store.config.lock().unwrap();
+        let Some(meta) = c.conversations.iter_mut().find(|c| c.id == id) else {
+            return Err("Unknown conversation".into());
+        };
+        meta.effort = effort;
+    }
+    state.store.save_config().map_err(|e| e.to_string())
+}
+
+/// Effort levels the given model supports, from the models.dev catalog.
+/// Empty = the model is known to have no effort control; unknown models get
+/// the default low/medium/high trio (see `catalog::lookup`).
+#[tauri::command]
+pub async fn effort_levels(
+    state: State<'_, Arc<AppState>>,
+    kind: String,
+    model: String,
+) -> Result<Vec<config::EffortLevel>, String> {
+    // async commands with borrowed state must return a Result (Tauri requirement)
+    Ok(state.catalog.effort_levels(&kind, &model).await)
 }
 
 #[tauri::command]

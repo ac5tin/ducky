@@ -95,6 +95,45 @@ impl AnthropicProvider {
             })
             .collect()
     }
+
+    /// Anthropic expresses effort as an extended-thinking token budget;
+    /// `None` (effort `none`) means no thinking block at all.
+    fn thinking_budget(effort: crate::config::EffortLevel) -> Option<u32> {
+        use crate::config::EffortLevel;
+        match effort {
+            EffortLevel::None => None,
+            EffortLevel::Minimal => Some(1024),
+            EffortLevel::Low => Some(2048),
+            EffortLevel::Medium => Some(8192),
+            EffortLevel::High => Some(16384),
+            EffortLevel::XHigh => Some(32768),
+            EffortLevel::Max => Some(65536),
+        }
+    }
+
+    fn build_body(system: &str, wire_msgs: Vec<Value>, tools: &[ToolDef], opts: &ChatOptions) -> Value {
+        let mut body = json!({
+            "model": opts.model,
+            "max_tokens": opts.max_tokens.unwrap_or(8192),
+            "messages": wire_msgs,
+            "stream": true,
+        });
+        if !system.is_empty() {
+            body["system"] = json!(system);
+        }
+        if !tools.is_empty() {
+            body["tools"] = json!(Self::tools_to_wire(tools));
+        }
+        if let Some(budget) = opts.effort.and_then(Self::thinking_budget) {
+            body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+            // thinking requires max_tokens > budget_tokens
+            body["max_tokens"] = json!(budget + 8192);
+            // and requires temperature to be unset or exactly 1 — omit it
+        } else if let Some(t) = opts.temperature {
+            body["temperature"] = json!(t);
+        }
+        body
+    }
 }
 
 /// Append a content block, merging into the previous message when the role
@@ -121,21 +160,7 @@ impl LlmProvider for AnthropicProvider {
         tx: mpsc::Sender<ProviderEvent>,
     ) -> anyhow::Result<StopReason> {
         let (system, wire_msgs) = Self::messages_to_wire(messages);
-        let mut body = json!({
-            "model": opts.model,
-            "max_tokens": opts.max_tokens.unwrap_or(8192),
-            "messages": wire_msgs,
-            "stream": true,
-        });
-        if !system.is_empty() {
-            body["system"] = json!(system);
-        }
-        if !tools.is_empty() {
-            body["tools"] = json!(Self::tools_to_wire(tools));
-        }
-        if let Some(t) = opts.temperature {
-            body["temperature"] = json!(t);
-        }
+        let body = Self::build_body(&system, wire_msgs, tools, opts);
 
         let response = http_client()
             .post(self.endpoint("/messages"))
@@ -331,5 +356,32 @@ mod tests {
         }];
         let wire = AnthropicProvider::tools_to_wire(&tools);
         assert_eq!(wire[0]["input_schema"]["type"], "object");
+    }
+
+    #[test]
+    fn effort_maps_to_thinking_budget() {
+        use crate::config::EffortLevel;
+        let opts = |effort| ChatOptions {
+            model: "claude-opus-4.7".into(),
+            max_tokens: None,
+            temperature: None,
+            effort,
+        };
+
+        let body = AnthropicProvider::build_body("", vec![], &[], &opts(Some(EffortLevel::Medium)));
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 8192);
+        assert_eq!(body["max_tokens"], 8192 + 8192);
+
+        let body = AnthropicProvider::build_body("", vec![], &[], &opts(Some(EffortLevel::High)));
+        assert_eq!(body["thinking"]["budget_tokens"], 16384);
+
+        // effort "none" sends no thinking block at all
+        let body = AnthropicProvider::build_body("", vec![], &[], &opts(Some(EffortLevel::None)));
+        assert!(body.get("thinking").is_none());
+
+        let body = AnthropicProvider::build_body("", vec![], &[], &opts(None));
+        assert!(body.get("thinking").is_none());
+        assert_eq!(body["max_tokens"], 8192);
     }
 }

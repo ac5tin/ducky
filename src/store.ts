@@ -5,6 +5,7 @@ import type {
   AppConfig,
   BackendEvent,
   ConnectorSuggestion,
+  EffortLevel,
   ProviderConfig,
   ProviderPreset,
   RawMessage,
@@ -120,6 +121,7 @@ interface StoreState {
   newConversation: () => Promise<void>;
   deleteConversation: (id: string) => Promise<void>;
   setActiveModel: (providerId: string, model: string) => Promise<void>;
+  setActiveEffort: (effort: EffortLevel | null) => Promise<void>;
 
   send: (text: string) => Promise<void>;
   stop: () => void;
@@ -285,6 +287,13 @@ export const useStore = create<StoreState>((set, get) => ({
     const id = get().activeConversationId;
     if (!id) return;
     await api.conversationSetModel(id, providerId, model);
+    await get().refreshConfig();
+  },
+
+  async setActiveEffort(effort) {
+    const id = get().activeConversationId;
+    if (!id) return;
+    await api.conversationSetEffort(id, effort);
     await get().refreshConfig();
   },
 

@@ -1,6 +1,7 @@
 //! Ducky — a friendly cross-platform MCP client.
 
 pub mod agent;
+pub mod catalog;
 pub mod commands;
 pub mod config;
 pub mod events;
@@ -40,7 +41,7 @@ pub fn run() {
             let sink: Arc<dyn events::EventSink> = Arc::new(state::TauriSink {
                 app: handle.clone(),
             });
-            let app_state = state::AppState::build(store, sink);
+            let app_state = state::AppState::build(store, sink, &data_dir);
             app.manage(app_state.clone());
 
             // Auto-connect enabled MCP servers in the background.
@@ -64,7 +65,9 @@ pub fn run() {
             commands::conversation_delete,
             commands::conversation_rename,
             commands::conversation_set_model,
+            commands::conversation_set_effort,
             commands::conversation_get,
+            commands::effort_levels,
             commands::chat_send,
             commands::chat_cancel,
             commands::approval_respond,

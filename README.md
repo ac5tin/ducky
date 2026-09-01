@@ -22,6 +22,7 @@ Built with **Rust + Tauri 2** for a small footprint and native performance.
 - **Full MCP 2026-07-28 support** — the newest protocol revision, implemented on the official [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk) SDK (Tier 1 conformance).
 - **Human in the loop** — every tool call asks before it runs (configurable), with plain-language approval cards.
 - **Multi-provider** — switch models mid-conversation. Local models (Ollama, LM Studio) work with no API key.
+- **Reasoning effort levels** — pick an effort per conversation straight from the model picker. Supported levels come from [models.dev](https://models.dev) (e.g. `low/high/max` for GLM‑5.3, `none…xhigh` for GPT‑5.x) and are mapped to each provider's native API: `reasoning_effort` (+ `thinking`) for OpenAI-compatible endpoints, extended-thinking budgets for Claude.
 - **Private by design** — API keys are stored in a `0600`-permission secrets file, never sent to the webview.
 
 ## MCP 2026-07-28 feature coverage

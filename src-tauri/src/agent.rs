@@ -192,10 +192,18 @@ impl Agent {
             // Stream one assistant turn. The provider sees a snapshot of the
             // history so we can mutate it freely while events stream in.
             let snapshot = history.clone();
+            let effort = {
+                let cfg = self.store.config.lock().unwrap();
+                cfg.conversations
+                    .iter()
+                    .find(|c| c.id == conversation_id)
+                    .and_then(|c| c.effort)
+            };
             let options = crate::providers::ChatOptions {
                 model: model.clone(),
                 max_tokens: None,
                 temperature: None,
+                effort,
             };
             let (tx, mut rx) = tokio::sync::mpsc::channel::<ProviderEvent>(256);
             let provider_call =

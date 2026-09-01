@@ -27,12 +27,14 @@ pub struct AppState {
     pub bridge: Arc<InteractiveBridge>,
     pub manager: Arc<McpManager>,
     pub agent: Arc<Agent>,
+    /// models.dev catalog for per-model effort levels.
+    pub catalog: crate::catalog::Catalog,
     /// Cancellation tokens for conversations that are generating.
     pub runtimes: Mutex<HashMap<String, Arc<ConversationRuntime>>>,
 }
 
 impl AppState {
-    pub fn build(store: Arc<Store>, sink: Arc<dyn EventSink>) -> Arc<Self> {
+    pub fn build(store: Arc<Store>, sink: Arc<dyn EventSink>, data_dir: &std::path::Path) -> Arc<Self> {
         let bridge = Arc::new(InteractiveBridge::new(sink.clone(), store.clone()));
         let manager = Arc::new(McpManager::new(store.clone(), bridge.clone(), sink.clone()));
         let agent = Arc::new(Agent {
@@ -41,12 +43,14 @@ impl AppState {
             bridge: bridge.clone(),
             sink: sink.clone(),
         });
+        let catalog = crate::catalog::Catalog::new(&data_dir.join("models-dev.json"));
         Arc::new(Self {
             store,
             sink,
             bridge,
             manager,
             agent,
+            catalog,
             runtimes: Mutex::new(HashMap::new()),
         })
     }

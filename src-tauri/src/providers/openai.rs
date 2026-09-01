@@ -17,6 +17,9 @@ pub struct OpenAiProvider {
     pub api_key: Option<String>,
     /// Display name used in error messages.
     pub name: String,
+    /// Z.ai-style gateways need `thinking` enabled for `reasoning_effort`
+    /// to take effect.
+    pub thinking_toggle: bool,
 }
 
 impl OpenAiProvider {
@@ -30,6 +33,32 @@ impl OpenAiProvider {
             req = req.bearer_auth(key);
         }
         req
+    }
+
+    fn build_body(messages: &[Msg], tools: &[ToolDef], opts: &ChatOptions, thinking_toggle: bool) -> Value {
+        let mut body = json!({
+            "model": opts.model,
+            "messages": Self::messages_to_wire(messages),
+            "stream": true,
+            "stream_options": { "include_usage": true },
+        });
+        if let Some(tools) = Self::tools_to_wire(tools) {
+            body["tools"] = json!(tools);
+            body["tool_choice"] = json!("auto");
+        }
+        if let Some(max) = opts.max_tokens {
+            body["max_tokens"] = json!(max);
+        }
+        if let Some(t) = opts.temperature {
+            body["temperature"] = json!(t);
+        }
+        if let Some(effort) = opts.effort {
+            body["reasoning_effort"] = json!(effort.as_str());
+            if thinking_toggle {
+                body["thinking"] = json!({ "type": "enabled" });
+            }
+        }
+        body
     }
 
     fn messages_to_wire(messages: &[Msg]) -> Vec<Value> {
@@ -183,22 +212,7 @@ impl LlmProvider for OpenAiProvider {
         opts: &ChatOptions,
         tx: mpsc::Sender<ProviderEvent>,
     ) -> anyhow::Result<StopReason> {
-        let mut body = json!({
-            "model": opts.model,
-            "messages": Self::messages_to_wire(messages),
-            "stream": true,
-            "stream_options": { "include_usage": true },
-        });
-        if let Some(tools) = Self::tools_to_wire(tools) {
-            body["tools"] = json!(tools);
-            body["tool_choice"] = json!("auto");
-        }
-        if let Some(max) = opts.max_tokens {
-            body["max_tokens"] = json!(max);
-        }
-        if let Some(t) = opts.temperature {
-            body["temperature"] = json!(t);
-        }
+        let body = Self::build_body(messages, tools, opts, self.thinking_toggle);
 
         let response = self
             .auth_headers(http_client().post(self.endpoint("/chat/completions")))
@@ -347,5 +361,29 @@ mod tests {
             turn.handle_chunk(&chunk2, "t").unwrap(),
             Some(ProviderEvent::ReasoningDelta(_))
         ));
+    }
+
+    #[test]
+    fn effort_sets_reasoning_effort_and_thinking() {
+        use crate::config::EffortLevel;
+        let opts = ChatOptions {
+            model: "glm-5.3".into(),
+            max_tokens: None,
+            temperature: None,
+            effort: Some(EffortLevel::High),
+        };
+        let body = OpenAiProvider::build_body(&[], &[], &opts, true);
+        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["thinking"]["type"], "enabled");
+
+        // non-Z.ai gateways get no thinking toggle
+        let body = OpenAiProvider::build_body(&[], &[], &opts, false);
+        assert_eq!(body["reasoning_effort"], "high");
+        assert!(body.get("thinking").is_none());
+
+        let unset = ChatOptions { effort: None, ..opts };
+        let body = OpenAiProvider::build_body(&[], &[], &unset, true);
+        assert!(body.get("reasoning_effort").is_none());
+        assert!(body.get("thinking").is_none());
     }
 }

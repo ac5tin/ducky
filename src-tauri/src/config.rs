@@ -101,6 +101,57 @@ fn default_true() -> bool {
     true
 }
 
+/// Reasoning effort level for a model (as offered by models.dev).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EffortLevel {
+    #[serde(rename = "none")]
+    None,
+    #[serde(rename = "minimal")]
+    Minimal,
+    #[serde(rename = "low")]
+    Low,
+    #[serde(rename = "medium")]
+    Medium,
+    #[serde(rename = "high")]
+    High,
+    #[serde(rename = "xhigh")]
+    XHigh,
+    #[serde(rename = "max")]
+    Max,
+}
+
+impl EffortLevel {
+    /// Wire value sent as the provider's effort parameter.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EffortLevel::None => "none",
+            EffortLevel::Minimal => "minimal",
+            EffortLevel::Low => "low",
+            EffortLevel::Medium => "medium",
+            EffortLevel::High => "high",
+            EffortLevel::XHigh => "xhigh",
+            EffortLevel::Max => "max",
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            EffortLevel::None => "None",
+            EffortLevel::Minimal => "Minimal",
+            EffortLevel::Low => "Low",
+            EffortLevel::Medium => "Medium",
+            EffortLevel::High => "High",
+            EffortLevel::XHigh => "XHigh",
+            EffortLevel::Max => "Max",
+        }
+    }
+
+    /// Fallback levels for models that aren't in the models.dev catalog.
+    pub fn default_levels() -> Vec<EffortLevel> {
+        vec![EffortLevel::Low, EffortLevel::Medium, EffortLevel::High]
+    }
+}
+
 /// Tool approval policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -176,6 +227,9 @@ pub struct ConversationMeta {
     pub title: String,
     pub provider_id: String,
     pub model: String,
+    /// Reasoning effort for this conversation (None = provider default).
+    #[serde(default)]
+    pub effort: Option<EffortLevel>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -686,6 +740,7 @@ mod tests {
             title: "Hi".into(),
             provider_id: "p".into(),
             model: "m".into(),
+            effort: Some(EffortLevel::High),
             created_at: "t".into(),
             updated_at: "t".into(),
         };
@@ -693,6 +748,7 @@ mod tests {
         store.save_conversation(&meta, &messages).unwrap();
         let (meta2, msgs2) = store.load_conversation("abc-123").unwrap();
         assert_eq!(meta2.title, "Hi");
+        assert_eq!(meta2.effort, Some(EffortLevel::High));
         assert_eq!(msgs2.len(), 1);
         store.delete_conversation("abc-123").unwrap();
         assert!(store.load_conversation("abc-123").is_none());
