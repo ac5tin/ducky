@@ -4,6 +4,7 @@ import { Icon } from "../icons";
 import { Markdown } from "../Markdown";
 import { ToolCallCard } from "./ToolCallCard";
 import { ModelPicker } from "./ModelPicker";
+import { WorkingDirChip } from "./WorkingDirChip";
 
 export function ChatView() {
   const items = useStore((s) => s.items);
@@ -31,7 +32,10 @@ export function ChatView() {
   return (
     <div className="relative flex h-full flex-col">
       <div className="flex items-center justify-between border-b border-slate-200 px-5 py-2.5 dark:border-slate-800">
-        <ModelPicker />
+        <div className="flex min-w-0 items-center gap-1">
+          <ModelPicker />
+          <WorkingDirChip />
+        </div>
         {streaming && (
           <span className="flex items-center gap-1.5 text-xs text-slate-400">
             <Icon name="spinner" className="h-3.5 w-3.5 animate-spin" />

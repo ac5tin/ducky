@@ -3,7 +3,6 @@
 
 use std::sync::Arc;
 
-use rmcp::ErrorData as McpError;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
     ClientCapabilities, ClientInfo, CreateMessageRequestParams, CreateMessageResult,
@@ -13,6 +12,7 @@ use rmcp::model::{
     RootsCapabilities, SamplingCapability, UrlElicitationCapability,
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleClient};
+use rmcp::ErrorData as McpError;
 
 use super::bridge::InteractiveBridge;
 use crate::config::Store;

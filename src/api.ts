@@ -32,6 +32,8 @@ export interface Bootstrap {
   server_summaries: ServerSummary[];
   presets: ProviderPreset[];
   suggestions: ConnectorSuggestion[];
+  /** The machine's home directory; the default working directory. */
+  home_dir: string;
 }
 
 export const getBootstrap = () => invoke<Bootstrap>("get_bootstrap");
@@ -80,6 +82,11 @@ export const settingsSet = (settings: {
   max_tool_iterations?: number;
   show_reasoning?: boolean;
   roots?: string[];
+  working_dir?: string | null;
+  default_provider_id?: string;
+  default_model?: string;
+  /** null clears the default effort; undefined leaves it unchanged. */
+  default_effort?: EffortLevel | null;
 }) => invoke<void>("settings_set", { settings });
 
 export const toolRuleSet = (key: string, rule: ToolRule | null) =>

@@ -34,7 +34,11 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn build(store: Arc<Store>, sink: Arc<dyn EventSink>, data_dir: &std::path::Path) -> Arc<Self> {
+    pub fn build(
+        store: Arc<Store>,
+        sink: Arc<dyn EventSink>,
+        data_dir: &std::path::Path,
+    ) -> Arc<Self> {
         let bridge = Arc::new(InteractiveBridge::new(sink.clone(), store.clone()));
         let manager = Arc::new(McpManager::new(store.clone(), bridge.clone(), sink.clone()));
         let agent = Arc::new(Agent {

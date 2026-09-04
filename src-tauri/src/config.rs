@@ -60,9 +60,16 @@ pub struct ProviderConfig {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum McpTransport {
     /// A local server launched as a child process (the classic `stdio` transport).
-    Stdio { command: String, args: Vec<String>, env: HashMap<String, String> },
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        env: HashMap<String, String>,
+    },
     /// A remote server over Streamable HTTP.
-    Http { url: String, headers: HashMap<String, String> },
+    Http {
+        url: String,
+        headers: HashMap<String, String>,
+    },
 }
 
 /// How the client authenticates against a remote HTTP MCP server.
@@ -205,6 +212,21 @@ pub struct AppSettings {
     pub max_tool_iterations: u32,
     /// Show reasoning tokens when a provider streams them.
     pub show_reasoning: bool,
+    /// Working directory for chats and spawned stdio servers.
+    /// `None` means the machine's home directory.
+    #[serde(default)]
+    pub working_dir: Option<String>,
+    /// Provider new chats start with. `None` means "keep the current behavior"
+    /// (active conversation's provider, else the first one).
+    #[serde(default)]
+    pub default_provider_id: Option<String>,
+    /// Model new chats start with, only honored together with
+    /// `default_provider_id`. `None` falls back to the provider's own default.
+    #[serde(default)]
+    pub default_model: Option<String>,
+    /// Reasoning effort new chats start with. `None` = model default.
+    #[serde(default)]
+    pub default_effort: Option<EffortLevel>,
 }
 
 impl Default for AppSettings {
@@ -217,8 +239,35 @@ impl Default for AppSettings {
             roots: Vec::new(),
             max_tool_iterations: 25,
             show_reasoning: false,
+            working_dir: None,
+            default_provider_id: None,
+            default_model: None,
+            default_effort: None,
         }
     }
+}
+
+impl AppSettings {
+    /// The directory chats and stdio servers operate in: the configured
+    /// override when present, otherwise the machine's home directory.
+    pub fn effective_working_dir(&self, home: &Path) -> PathBuf {
+        match self.working_dir.as_deref() {
+            Some(dir) if !dir.trim().is_empty() => expand_tilde(dir, home).into_owned().into(),
+            _ => home.to_path_buf(),
+        }
+    }
+}
+
+/// Expand a leading `~` (or `~/…`) to the given home directory. Servers take
+/// plain args, so a shell would never expand it for them.
+pub fn expand_tilde<'a>(path: &'a str, home: &Path) -> std::borrow::Cow<'a, str> {
+    if path == "~" {
+        return std::borrow::Cow::Owned(home.to_string_lossy().into_owned());
+    }
+    if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+        return std::borrow::Cow::Owned(home.join(rest).to_string_lossy().into_owned());
+    }
+    std::borrow::Cow::Borrowed(path)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -407,7 +456,8 @@ pub fn preset_by_id(id: &str) -> Option<&'static ProviderPreset> {
 pub const CONNECTOR_SUGGESTIONS: &[ConnectorSuggestion] = &[
     ConnectorSuggestion {
         name: "Everything (demo)",
-        description: "A friendly demo server that exercises every MCP feature — great first connection.",
+        description:
+            "A friendly demo server that exercises every MCP feature — great first connection.",
         command: "npx",
         args: &["-y", "@modelcontextprotocol/server-everything"],
     },
@@ -446,6 +496,8 @@ pub struct Store {
     config_path: PathBuf,
     secrets_path: PathBuf,
     conversations_dir: PathBuf,
+    /// The machine's home directory; the default working directory.
+    pub home_dir: PathBuf,
     pub config: Mutex<AppConfig>,
     pub secrets: Mutex<Secrets>,
 }
@@ -470,7 +522,7 @@ fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
 }
 
 impl Store {
-    pub fn new(base: &Path) -> anyhow::Result<Self> {
+    pub fn new(base: &Path, home_dir: PathBuf) -> anyhow::Result<Self> {
         let config_path = base.join("config.json");
         let secrets_path = base.join("secrets.json");
         let conversations_dir = base.join("conversations");
@@ -479,7 +531,10 @@ impl Store {
         let config = if config_path.exists() {
             serde_json::from_str(&std::fs::read_to_string(&config_path)?).unwrap_or_default()
         } else {
-            AppConfig { version: 1, ..Default::default() }
+            AppConfig {
+                version: 1,
+                ..Default::default()
+            }
         };
         let secrets: Secrets = if secrets_path.exists() {
             serde_json::from_str(&std::fs::read_to_string(&secrets_path)?).unwrap_or_default()
@@ -491,6 +546,7 @@ impl Store {
             config_path,
             secrets_path,
             conversations_dir,
+            home_dir,
             config: Mutex::new(config),
             secrets: Mutex::new(secrets),
         })
@@ -498,10 +554,7 @@ impl Store {
 
     pub fn save_config(&self) -> anyhow::Result<()> {
         let cfg = { self.config.lock().unwrap().clone() };
-        write_private(
-            &self.config_path,
-            &serde_json::to_string_pretty(&cfg)?,
-        )?;
+        write_private(&self.config_path, &serde_json::to_string_pretty(&cfg)?)?;
         Ok(())
     }
 
@@ -557,24 +610,47 @@ impl Store {
 
     pub fn conversation_path(&self, id: &str) -> PathBuf {
         // ids are uuids; guard against path traversal anyway
-        let safe: String = id.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
+        let safe: String = id
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+            .collect();
         self.conversations_dir.join(format!("{safe}.json"))
     }
 
-    pub fn save_conversation(&self, meta: &ConversationMeta, messages: &[serde_json::Value]) -> anyhow::Result<()> {
+    pub fn save_conversation(
+        &self,
+        meta: &ConversationMeta,
+        messages: &[serde_json::Value],
+    ) -> anyhow::Result<()> {
         let payload = serde_json::json!({ "meta": meta, "messages": messages });
-        write_private(&self.conversation_path(&meta.id), &serde_json::to_string_pretty(&payload)?)?;
+        write_private(
+            &self.conversation_path(&meta.id),
+            &serde_json::to_string_pretty(&payload)?,
+        )?;
         Ok(())
     }
 
-    pub fn load_conversation(&self, id: &str) -> Option<(ConversationMeta, Vec<serde_json::Value>)> {
-        let raw = std::fs::read_to_string(self.conversation_path(id)).ok()?;
+    pub fn load_conversation(
+        &self,
+        id: &str,
+    ) -> Option<(ConversationMeta, Vec<serde_json::Value>)> {
+        let path = self.conversation_path(id);
+        if !path.exists() {
+            // registered but never messaged: no transcript file yet
+            let meta = self
+                .config
+                .lock()
+                .unwrap()
+                .conversations
+                .iter()
+                .find(|c| c.id == id)?
+                .clone();
+            return Some((meta, Vec::new()));
+        }
+        let raw = std::fs::read_to_string(path).ok()?;
         let payload: serde_json::Value = serde_json::from_str(&raw).ok()?;
         let meta = serde_json::from_value(payload.get("meta")?.clone()).ok()?;
-        let messages = payload
-            .get("messages")?
-            .as_array()?
-            .clone();
+        let messages = payload.get("messages")?.as_array()?.clone();
         Some((meta, messages))
     }
 
@@ -630,7 +706,11 @@ pub fn parse_import_json(text: &str) -> anyhow::Result<Vec<ImportedServer>> {
             let args = spec
                 .get("args")
                 .and_then(|a| a.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
             let env = spec
                 .get("env")
@@ -641,11 +721,18 @@ pub fn parse_import_json(text: &str) -> anyhow::Result<Vec<ImportedServer>> {
                         .collect()
                 })
                 .unwrap_or_default();
-            McpTransport::Stdio { command: cmd.to_string(), args, env }
+            McpTransport::Stdio {
+                command: cmd.to_string(),
+                args,
+                env,
+            }
         } else {
             continue;
         };
-        out.push(ImportedServer { name: name.clone(), transport });
+        out.push(ImportedServer {
+            name: name.clone(),
+            transport,
+        });
     }
     if out.is_empty() {
         return Err(anyhow::anyhow!("No servers found in that JSON"));
@@ -670,7 +757,7 @@ mod tests {
     #[test]
     fn config_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = Store::new(tmp.path()).unwrap();
+        let store = Store::new(tmp.path(), tmp.path().to_path_buf()).unwrap();
         {
             let mut cfg = store.config.lock().unwrap();
             cfg.onboarding_complete = true;
@@ -703,7 +790,7 @@ mod tests {
         store.save_config().unwrap();
         store.set_provider_key("p1", Some("sk-test")).unwrap();
 
-        let store2 = Store::new(tmp.path()).unwrap();
+        let store2 = Store::new(tmp.path(), tmp.path().to_path_buf()).unwrap();
         let cfg = store2.config.lock().unwrap();
         assert!(cfg.onboarding_complete);
         assert_eq!(cfg.providers.len(), 1);
@@ -725,16 +812,20 @@ mod tests {
         }"#;
         let imported = parse_import_json(json).unwrap();
         assert_eq!(imported.len(), 2);
-        assert!(matches!(&imported[0].transport, McpTransport::Stdio { command, args, .. }
-            if command == "npx" && args.len() == 3));
-        assert!(matches!(&imported[1].transport, McpTransport::Http { url, .. }
-            if url == "https://example.com/mcp"));
+        assert!(
+            matches!(&imported[0].transport, McpTransport::Stdio { command, args, .. }
+            if command == "npx" && args.len() == 3)
+        );
+        assert!(
+            matches!(&imported[1].transport, McpTransport::Http { url, .. }
+            if url == "https://example.com/mcp")
+        );
     }
 
     #[test]
     fn conversation_persistence() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = Store::new(tmp.path()).unwrap();
+        let store = Store::new(tmp.path(), tmp.path().to_path_buf()).unwrap();
         let meta = ConversationMeta {
             id: "abc-123".into(),
             title: "Hi".into(),
@@ -752,5 +843,86 @@ mod tests {
         assert_eq!(msgs2.len(), 1);
         store.delete_conversation("abc-123").unwrap();
         assert!(store.load_conversation("abc-123").is_none());
+    }
+
+    #[test]
+    fn empty_conversation_loads_with_empty_messages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(tmp.path(), tmp.path().to_path_buf()).unwrap();
+        let meta = ConversationMeta {
+            id: "new-1".into(),
+            title: String::new(),
+            provider_id: "p".into(),
+            model: "m".into(),
+            effort: None,
+            created_at: "t".into(),
+            updated_at: "t".into(),
+        };
+        // conversation_create registers the meta without a transcript file
+        store.config.lock().unwrap().conversations.insert(0, meta);
+        let (meta2, msgs) = store.load_conversation("new-1").unwrap();
+        assert_eq!(meta2.id, "new-1");
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn working_dir_defaults_to_home() {
+        let home = Path::new("/home/duck");
+        let settings = AppSettings::default();
+        assert_eq!(
+            settings.effective_working_dir(home),
+            Path::new("/home/duck")
+        );
+
+        // blank strings are treated as "no override"
+        let settings = AppSettings {
+            working_dir: Some("  ".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            settings.effective_working_dir(home),
+            Path::new("/home/duck")
+        );
+
+        let settings = AppSettings {
+            working_dir: Some("/tmp/project".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            settings.effective_working_dir(home),
+            Path::new("/tmp/project")
+        );
+    }
+
+    #[test]
+    fn config_without_working_dir_loads() {
+        // old config.json files predate the working_dir field
+        let json = r#"{
+            "version": 1,
+            "settings": {
+                "theme": "dark",
+                "tool_approval": "always_ask",
+                "sampling": "ask",
+                "tool_rules": {},
+                "roots": [],
+                "max_tool_iterations": 25,
+                "show_reasoning": false
+            }
+        }"#;
+        let cfg: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.settings.working_dir, None);
+        // fields added later default to unset
+        assert_eq!(cfg.settings.default_provider_id, None);
+        assert_eq!(cfg.settings.default_model, None);
+        assert_eq!(cfg.settings.default_effort, None);
+    }
+
+    #[test]
+    fn expands_tilde_to_home() {
+        let home = Path::new("/home/duck");
+        assert_eq!(expand_tilde("~", home), "/home/duck");
+        assert_eq!(expand_tilde("~/notes", home), "/home/duck/notes");
+        assert_eq!(expand_tilde("/plain/path", home), "/plain/path");
+        assert_eq!(expand_tilde("~not-home", home), "~not-home");
     }
 }

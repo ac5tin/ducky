@@ -35,7 +35,12 @@ impl OpenAiProvider {
         req
     }
 
-    fn build_body(messages: &[Msg], tools: &[ToolDef], opts: &ChatOptions, thinking_toggle: bool) -> Value {
+    fn build_body(
+        messages: &[Msg],
+        tools: &[ToolDef],
+        opts: &ChatOptions,
+        thinking_toggle: bool,
+    ) -> Value {
         let mut body = json!({
             "model": opts.model,
             "messages": Self::messages_to_wire(messages),
@@ -93,8 +98,16 @@ impl OpenAiProvider {
                     }
                     out.push(m);
                 }
-                Msg::ToolResult { call_id, text, is_error } => {
-                    let content = if *is_error { format!("Error: {text}") } else { text.clone() };
+                Msg::ToolResult {
+                    call_id,
+                    text,
+                    is_error,
+                } => {
+                    let content = if *is_error {
+                        format!("Error: {text}")
+                    } else {
+                        text.clone()
+                    };
                     out.push(json!({
                         "role": "tool",
                         "tool_call_id": call_id,
@@ -237,7 +250,11 @@ impl LlmProvider for OpenAiProvider {
             } else {
                 serde_json::from_str(&args_json).unwrap_or_else(|_| json!({ "raw": args_json }))
             };
-            let id = if id.is_empty() { format!("call_{index}") } else { id };
+            let id = if id.is_empty() {
+                format!("call_{index}")
+            } else {
+                id
+            };
             tx.send(ProviderEvent::ToolCallBegin { index, id, name })
                 .await
                 .ok();
@@ -249,9 +266,12 @@ impl LlmProvider for OpenAiProvider {
             .ok();
         }
         if let Some(u) = turn.usage_in {
-            tx.send(ProviderEvent::Usage { input: Some(u), output: turn.usage_out })
-                .await
-                .ok();
+            tx.send(ProviderEvent::Usage {
+                input: Some(u),
+                output: turn.usage_out,
+            })
+            .await
+            .ok();
         }
 
         Ok(match turn.finish_reason.as_deref() {
@@ -289,8 +309,12 @@ mod tests {
     #[test]
     fn converts_messages_and_tools() {
         let msgs = vec![
-            Msg::System { text: "be nice".into() },
-            Msg::User { text: "hello".into() },
+            Msg::System {
+                text: "be nice".into(),
+            },
+            Msg::User {
+                text: "hello".into(),
+            },
             Msg::Assistant {
                 text: "".into(),
                 tool_calls: vec![super::super::ToolCall {
@@ -299,7 +323,11 @@ mod tests {
                     arguments: json!({"path": "a.txt"}),
                 }],
             },
-            Msg::ToolResult { call_id: "c1".into(), text: "contents".into(), is_error: false },
+            Msg::ToolResult {
+                call_id: "c1".into(),
+                text: "contents".into(),
+                is_error: false,
+            },
         ];
         let wire = OpenAiProvider::messages_to_wire(&msgs);
         assert_eq!(wire[0]["role"], "system");
@@ -381,7 +409,10 @@ mod tests {
         assert_eq!(body["reasoning_effort"], "high");
         assert!(body.get("thinking").is_none());
 
-        let unset = ChatOptions { effort: None, ..opts };
+        let unset = ChatOptions {
+            effort: None,
+            ..opts
+        };
         let body = OpenAiProvider::build_body(&[], &[], &unset, true);
         assert!(body.get("reasoning_effort").is_none());
         assert!(body.get("thinking").is_none());

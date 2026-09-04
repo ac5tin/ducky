@@ -58,7 +58,11 @@ fn client() -> reqwest::Client {
 /// trailing slash, no fragment).
 fn canonical_resource(url: &str) -> anyhow::Result<String> {
     let parsed: url::Url = url.parse()?;
-    let mut out = format!("{}://{}", parsed.scheme(), parsed.host_str().unwrap_or_default());
+    let mut out = format!(
+        "{}://{}",
+        parsed.scheme(),
+        parsed.host_str().unwrap_or_default()
+    );
     if let Some(port) = parsed.port() {
         out.push_str(&format!(":{port}"));
     }
@@ -121,12 +125,15 @@ pub async fn ensure_fresh_token(store: &Arc<Store>, cfg: &McpServerConfig) -> Re
     let updated = OAuthTokens {
         access_token: granted.access_token,
         refresh_token: granted.refresh_token.or(Some(refresh_token)),
-        expires_at_ms: granted.expires_in.map(|s| {
-            chrono::Utc::now().timestamp_millis() + (s as i64 - 30) * 1000
-        }),
+        expires_at_ms: granted
+            .expires_in
+            .map(|s| chrono::Utc::now().timestamp_millis() + (s as i64 - 30) * 1000),
         client_id: tokens.client_id.clone(),
         issuer: tokens.issuer.clone(),
-        scopes: granted.scope.map(|s| s.split(' ').map(String::from).collect()).unwrap_or_default(),
+        scopes: granted
+            .scope
+            .map(|s| s.split(' ').map(String::from).collect())
+            .unwrap_or_default(),
     };
     store
         .set_oauth_tokens(&cfg.id, Some(updated))
@@ -177,14 +184,11 @@ pub async fn login(
     let client_id = match &cfg.oauth_client_id {
         Some(id) => id.clone(),
         None => {
-            let endpoint = meta
-                .registration_endpoint
-                .clone()
-                .ok_or_else(|| {
-                    "This server requires a pre-registered client id (paste it in the \
+            let endpoint = meta.registration_endpoint.clone().ok_or_else(|| {
+                "This server requires a pre-registered client id (paste it in the \
                      connector's advanced settings)"
-                        .to_string()
-                })?;
+                    .to_string()
+            })?;
             dynamic_register(&endpoint, redirect_port(&cfg)?).await?
         }
     };
@@ -199,15 +203,17 @@ pub async fn login(
                  Try setting a different callback port in advanced settings."
             )
         })?;
-    let redirect_uri = format!("http://127.0.0.1:{}/callback", listener.local_addr().map_err(|e| e.to_string())?.port());
+    let redirect_uri = format!(
+        "http://127.0.0.1:{}/callback",
+        listener.local_addr().map_err(|e| e.to_string())?.port()
+    );
 
     // 5. PKCE + state.
     let mut verifier_bytes = [0u8; 48];
     rand::thread_rng().fill_bytes(&mut verifier_bytes);
     let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(verifier_bytes);
-    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-        Sha256::digest(verifier.as_bytes()),
-    );
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(Sha256::digest(verifier.as_bytes()));
     let state = crate::config::Store::new_id();
     let resource = canonical_resource(&mcp_url).map_err(|e| e.to_string())?;
 
@@ -275,7 +281,9 @@ pub async fn login(
             .map(|s| s.split(' ').map(String::from).collect())
             .unwrap_or_default(),
     };
-    store.set_oauth_tokens(&server_id, Some(tokens)).map_err(|e| e.to_string())?;
+    store
+        .set_oauth_tokens(&server_id, Some(tokens))
+        .map_err(|e| e.to_string())?;
 
     sink.emit(crate::events::BackendEvent::ServerStatus {
         server_id,
@@ -286,7 +294,9 @@ pub async fn login(
 }
 
 pub fn logout(store: &Arc<Store>, server_id: &str) -> Result<(), String> {
-    store.set_oauth_tokens(server_id, None).map_err(|e| e.to_string())
+    store
+        .set_oauth_tokens(server_id, None)
+        .map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -314,7 +324,9 @@ fn redirect_port(cfg: &McpServerConfig) -> Result<u16, String> {
 
 /// Fetch Protected Resource Metadata for the MCP server, following the
 /// `WWW-Authenticate` challenge first and well-known paths as fallback.
-async fn discover_resource(mcp_url: &str) -> Result<(ProtectedResourceMetadata, Option<String>), String> {
+async fn discover_resource(
+    mcp_url: &str,
+) -> Result<(ProtectedResourceMetadata, Option<String>), String> {
     let http = client();
 
     // 1. challenge the server to get the authoritative metadata URL
@@ -357,10 +369,7 @@ async fn discover_resource(mcp_url: &str) -> Result<(ProtectedResourceMetadata, 
         "{}://{}{}",
         parsed.scheme(),
         parsed.host_str().unwrap_or_default(),
-        parsed
-            .port()
-            .map(|p| format!(":{p}"))
-            .unwrap_or_default()
+        parsed.port().map(|p| format!(":{p}")).unwrap_or_default()
     );
     let path = parsed.path().trim_end_matches('/');
     let candidates: Vec<String> = match &prm_url {
@@ -371,7 +380,10 @@ async fn discover_resource(mcp_url: &str) -> Result<(ProtectedResourceMetadata, 
                 format!("{origin}/.well-known/oauth-protected-resource"),
             ];
             // insert path after well-known prefix per RFC 9728
-            v.insert(1, format!("{origin}/.well-known/oauth-protected-resource/{path}"));
+            v.insert(
+                1,
+                format!("{origin}/.well-known/oauth-protected-resource/{path}"),
+            );
             v
         }
     };
@@ -579,7 +591,10 @@ mod tests {
             parse_www_authenticate_resource(header).as_deref(),
             Some("https://mcp.example.com/.well-known/oauth-protected-resource")
         );
-        assert_eq!(parse_www_authenticate_scope(header).as_deref(), Some("files:read"));
+        assert_eq!(
+            parse_www_authenticate_scope(header).as_deref(),
+            Some("files:read")
+        );
     }
 
     #[test]
@@ -587,8 +602,8 @@ mod tests {
         let mut v = [0u8; 48];
         rand::thread_rng().fill_bytes(&mut v);
         let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v);
-        let challenge =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(Sha256::digest(verifier.as_bytes()));
         assert_eq!(challenge.len(), 43);
     }
 }

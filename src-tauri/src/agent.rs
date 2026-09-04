@@ -51,7 +51,10 @@ impl Agent {
         }
     }
 
-    fn provider_for(&self, provider_id: &str) -> Result<(Arc<dyn LlmProvider>, String, String), String> {
+    fn provider_for(
+        &self,
+        provider_id: &str,
+    ) -> Result<(Arc<dyn LlmProvider>, String, String), String> {
         let cfg = self.store.config.lock().unwrap().clone();
         let provider_cfg = cfg
             .providers
@@ -65,11 +68,36 @@ impl Agent {
             .filter(|m| !m.is_empty())
             .or_else(|| provider_cfg.models.first().cloned())
             .unwrap_or_default();
-        Ok((build_provider(provider_cfg, key.as_deref()), model, provider_cfg.name.clone()))
+        Ok((
+            build_provider(provider_cfg, key.as_deref()),
+            model,
+            provider_cfg.name.clone(),
+        ))
     }
 
-    /// Resolve a qualified tool name to its server + raw tool entry.
-    fn resolve_tool(&self, qualified: &str) -> Result<(crate::mcp::manager::ToolEntry, String), String> {
+    /// Resolve a qualified tool name to its server + raw tool entry. Builtins
+    /// are checked first so a user server can't shadow or spoof them.
+    fn resolve_tool(
+        &self,
+        qualified: &str,
+    ) -> Result<(crate::mcp::manager::ToolEntry, String), String> {
+        if let Some(tool) = crate::builtin::lookup(qualified) {
+            return Ok((
+                crate::mcp::manager::ToolEntry {
+                    server_id: crate::builtin::SERVER_ID.to_string(),
+                    name: qualified.to_string(),
+                    qualified_name: qualified.to_string(),
+                    title: None,
+                    description: Some(tool.description.to_string()),
+                    input_schema: tool.schema.clone(),
+                    output_schema: None,
+                    annotations: None,
+                    read_only_hint: Some(tool.read_only),
+                    icons: None,
+                },
+                crate::builtin::SERVER_TITLE.to_string(),
+            ));
+        }
         let tools = self.manager.aggregated_tools();
         tools
             .into_iter()
@@ -101,7 +129,14 @@ impl Agent {
         ct: CancellationToken,
     ) {
         let result = self
-            .run_turn_inner(&conversation_id, &provider_id, &model, &mut history, user_text, &ct)
+            .run_turn_inner(
+                &conversation_id,
+                &provider_id,
+                &model,
+                &mut history,
+                user_text,
+                &ct,
+            )
             .await;
 
         // persist the final history regardless of outcome
@@ -144,13 +179,27 @@ impl Agent {
     ) -> Result<(), String> {
         history.push(Msg::User { text: user_text });
 
-        let max_iterations = self.store.config.lock().unwrap().settings.max_tool_iterations;
+        let max_iterations = self
+            .store
+            .config
+            .lock()
+            .unwrap()
+            .settings
+            .max_tool_iterations;
         // attribute interactive requests (approvals, elicitations, sampling)
         // to this conversation for the duration of the turn
-        self.bridge.set_conversation_ctx(Some(conversation_id.to_string()));
+        self.bridge
+            .set_conversation_ctx(Some(conversation_id.to_string()));
 
         let outcome = self
-            .loop_turn(conversation_id, provider_id, model, history, max_iterations, ct)
+            .loop_turn(
+                conversation_id,
+                provider_id,
+                model,
+                history,
+                max_iterations,
+                ct,
+            )
             .await;
 
         self.bridge.set_conversation_ctx(None);
@@ -169,7 +218,11 @@ impl Agent {
     ) -> Result<(), String> {
         for _ in 0..max_iterations {
             let (provider, default_model, _provider_name) = self.provider_for(provider_id)?;
-            let model = if model.is_empty() { default_model } else { model.to_string() };
+            let model = if model.is_empty() {
+                default_model
+            } else {
+                model.to_string()
+            };
 
             // Give the interactive bridge a way to fulfil sampling requests
             // with the model the user is actually talking to.
@@ -178,9 +231,9 @@ impl Agent {
                 model: model.clone(),
             }));
 
-            // Collect tools from every connected server.
+            // Collect tools from every connected server, plus the builtins.
             let tool_entries = self.manager.aggregated_tools();
-            let tools: Vec<ToolDef> = tool_entries
+            let mut tools: Vec<ToolDef> = tool_entries
                 .iter()
                 .map(|t| ToolDef {
                     name: t.qualified_name.clone(),
@@ -188,10 +241,31 @@ impl Agent {
                     parameters: t.input_schema.clone(),
                 })
                 .collect();
+            tools.extend(crate::builtin::tool_defs());
 
             // Stream one assistant turn. The provider sees a snapshot of the
-            // history so we can mutate it freely while events stream in.
-            let snapshot = history.clone();
+            // history plus a system message with the current working
+            // directory (injected per turn, never persisted) so we can mutate
+            // it freely while events stream in.
+            let cwd = {
+                let cfg = self.store.config.lock().unwrap();
+                cfg.settings.effective_working_dir(&self.store.home_dir)
+            };
+            let mut snapshot = history.clone();
+            snapshot.insert(
+                0,
+                Msg::System {
+                    text: format!(
+                        "Working directory: {}. Resolve relative file paths the user mentions \
+                         against this directory. Built-in file tools are confined to the \
+                         working directory. Base every claim about the file system on actual \
+                         tool output — never invent, simulate, or guess tool results. If no \
+                         available tool can answer a question, say so plainly instead of making \
+                         up an answer.",
+                        cwd.display()
+                    ),
+                },
+            );
             let effort = {
                 let cfg = self.store.config.lock().unwrap();
                 cfg.conversations
@@ -206,8 +280,7 @@ impl Agent {
                 effort,
             };
             let (tx, mut rx) = tokio::sync::mpsc::channel::<ProviderEvent>(256);
-            let provider_call =
-                provider.stream_chat(&snapshot, &tools, &options, tx);
+            let provider_call = provider.stream_chat(&snapshot, &tools, &options, tx);
 
             let mut text = String::new();
             let mut tool_calls: BTreeMap<usize, (String, String, String)> = BTreeMap::new();
@@ -281,12 +354,23 @@ impl Agent {
                         serde_json::from_str(&args_json)
                             .unwrap_or_else(|_| serde_json::json!({ "raw": args_json }))
                     };
-                    let id = if id.is_empty() { format!("call_{index}") } else { id };
-                    ToolCall { id, name, arguments }
+                    let id = if id.is_empty() {
+                        format!("call_{index}")
+                    } else {
+                        id
+                    };
+                    ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    }
                 })
                 .collect();
 
-            history.push(Msg::Assistant { text: text.clone(), tool_calls: calls.clone() });
+            history.push(Msg::Assistant {
+                text: text.clone(),
+                tool_calls: calls.clone(),
+            });
             self.persist(conversation_id, history)?;
 
             if stop != StopReason::ToolUse || calls.is_empty() {
@@ -379,12 +463,40 @@ impl Agent {
             ApprovalDecision::AllowOnce => {}
         }
 
-        self.emit_tool_update(
-            conversation_id,
-            &call.id,
-            "running",
-            serde_json::json!({}),
-        );
+        self.emit_tool_update(conversation_id, &call.id, "running", serde_json::json!({}));
+
+        // Builtins run in-process — no server to connect. Result text goes
+        // straight to the model and the tool card.
+        if crate::builtin::is_builtin(&call.name) {
+            let cwd = {
+                let cfg = self.store.config.lock().unwrap();
+                cfg.settings.effective_working_dir(&self.store.home_dir)
+            };
+            let result = tokio::select! {
+                _ = ct.cancelled() => Err("cancelled by user".to_string()),
+                r = crate::builtin::execute(&call.name, &call.arguments, &cwd) => r,
+            };
+            return match result {
+                Ok(text) => {
+                    self.emit_tool_update(
+                        conversation_id,
+                        &call.id,
+                        "done",
+                        serde_json::json!({ "result_text": text }),
+                    );
+                    text
+                }
+                Err(e) => {
+                    self.emit_tool_update(
+                        conversation_id,
+                        &call.id,
+                        "error",
+                        serde_json::json!({ "result_text": e, "is_error": true }),
+                    );
+                    format!("Error: {e}")
+                }
+            };
+        }
 
         // make sure the server is connected (auto-connect on demand)
         if self.manager.get(&entry.server_id).is_none() {
@@ -401,9 +513,8 @@ impl Agent {
                 }
             };
             if !matches!(status, crate::mcp::manager::ServerStatus::Connected) {
-                let message = format!(
-                    "The MCP server for this tool is not connected (status: {status:?})."
-                );
+                let message =
+                    format!("The MCP server for this tool is not connected (status: {status:?}).");
                 self.emit_tool_update(
                     conversation_id,
                     &call.id,
@@ -472,7 +583,9 @@ impl Agent {
                 .ok_or("conversation missing")?;
             meta.updated_at = chrono::Utc::now().to_rfc3339();
             if meta.title.is_empty() {
-                if let Some(Msg::User { text }) = history.iter().find(|m| matches!(m, Msg::User { .. })) {
+                if let Some(Msg::User { text }) =
+                    history.iter().find(|m| matches!(m, Msg::User { .. }))
+                {
                     meta.title = text.chars().take(48).collect();
                 }
             }

@@ -1,6 +1,7 @@
 //! Ducky — a friendly cross-platform MCP client.
 
 pub mod agent;
+pub mod builtin;
 pub mod catalog;
 pub mod commands;
 pub mod config;
@@ -32,12 +33,15 @@ pub fn run() {
         .setup(|app| {
             use tauri::Manager;
             let handle = app.handle().clone();
-            let data_dir = handle
-                .path()
-                .app_data_dir()
-                .expect("app data dir");
+            let data_dir = handle.path().app_data_dir().expect("app data dir");
             std::fs::create_dir_all(&data_dir).ok();
-            let store = Arc::new(config::Store::new(&data_dir).expect("config store"));
+            let home_dir = handle.path().home_dir().unwrap_or_else(|_| {
+                std::env::var("HOME")
+                    .or_else(|_| std::env::var("USERPROFILE"))
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| data_dir.clone())
+            });
+            let store = Arc::new(config::Store::new(&data_dir, home_dir).expect("config store"));
             let sink: Arc<dyn events::EventSink> = Arc::new(state::TauriSink {
                 app: handle.clone(),
             });

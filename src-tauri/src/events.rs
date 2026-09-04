@@ -7,13 +7,25 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BackendEvent {
     /// Assistant streamed some text.
-    ChatDelta { conversation_id: String, text: String },
+    ChatDelta {
+        conversation_id: String,
+        text: String,
+    },
     /// Assistant streamed hidden reasoning (shown when enabled).
-    ReasoningDelta { conversation_id: String, text: String },
+    ReasoningDelta {
+        conversation_id: String,
+        text: String,
+    },
     /// A full assistant turn (text + tool calls) is complete.
-    MessageDone { conversation_id: String, message_id: String },
+    MessageDone {
+        conversation_id: String,
+        message_id: String,
+    },
     /// The chat turn failed.
-    ChatError { conversation_id: String, error: String },
+    ChatError {
+        conversation_id: String,
+        error: String,
+    },
     /// Tool call lifecycle updates. `status` is one of
     /// `pending_approval | running | awaiting_input | done | denied | error`.
     ToolCallUpdate {
@@ -61,7 +73,11 @@ pub enum BackendEvent {
         max_tokens: Option<u32>,
     },
     /// Connection state of an MCP server changed.
-    ServerStatus { server_id: String, status: String, detail: Option<String> },
+    ServerStatus {
+        server_id: String,
+        status: String,
+        detail: Option<String>,
+    },
     /// Something on a server changed and lists should be refetched.
     ServerDataChanged { server_id: String, what: String },
     /// Progress on a long-running request.

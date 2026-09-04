@@ -73,7 +73,9 @@ export interface SamplingRequest {
 
 export type View = "chat" | "connectors" | "settings" | "onboarding";
 
-let unlisten: (() => void) | null = null;
+// Shared init promise: concurrent init() calls (StrictMode double-effect) must
+// not register a second backend listener, or every delta is handled twice.
+let initPromise: Promise<void> | null = null;
 const media = typeof window !== "undefined" ? window.matchMedia("(prefers-color-scheme: dark)") : null;
 
 function applyTheme(theme: "system" | "light" | "dark") {
@@ -95,6 +97,8 @@ interface StoreState {
   suggestions: ConnectorSuggestion[];
   servers: ServerSummary[];
   version: string;
+  /** The machine's home directory; the default working directory. */
+  homeDir: string;
 
   view: View;
   activeConversationId: string | null;
@@ -184,6 +188,7 @@ export const useStore = create<StoreState>((set, get) => ({
   suggestions: [],
   servers: [],
   version: "",
+  homeDir: "",
 
   view: "chat",
   activeConversationId: null,
@@ -197,20 +202,28 @@ export const useStore = create<StoreState>((set, get) => ({
   toasts: [],
 
   async init() {
-    if (unlisten) return;
-    unlisten = await api.listenBackend((event) => handleEvent(event, set, get));
-    const boot = await api.getBootstrap();
-    const info = await api.appInfo().catch(() => ({ version: "" }));
-    applyTheme(boot.config.settings.theme);
-    set({
-      ready: true,
-      config: boot.config,
-      presets: boot.presets,
-      suggestions: boot.suggestions,
-      servers: boot.server_summaries,
-      version: info.version,
-      view: boot.config.onboarding_complete && boot.config.providers.length > 0 ? "chat" : "onboarding",
-    });
+    if (!initPromise) {
+      initPromise = (async () => {
+        await api.listenBackend((event) => handleEvent(event, set, get));
+        const boot = await api.getBootstrap();
+        const info = await api.appInfo().catch(() => ({ version: "" }));
+        applyTheme(boot.config.settings.theme);
+        set({
+          ready: true,
+          config: boot.config,
+          presets: boot.presets,
+          suggestions: boot.suggestions,
+          servers: boot.server_summaries,
+          version: info.version,
+          homeDir: boot.home_dir ?? "",
+          view: boot.config.onboarding_complete && boot.config.providers.length > 0 ? "chat" : "onboarding",
+        });
+      })().catch((e) => {
+        initPromise = null;
+        throw e;
+      });
+    }
+    return initPromise;
   },
 
   setView(view) {
@@ -263,12 +276,19 @@ export const useStore = create<StoreState>((set, get) => ({
   },
 
   async newConversation() {
-    const provider = get().activeProvider();
+    const { config } = get();
+    // an app-level default model wins over "whatever was used last"
+    const defaultProvider = defaultProviderOf(config);
+    const provider = defaultProvider ?? get().activeProvider();
     if (!provider) {
       get().toast("error", "Add an AI provider first (Settings → Providers).");
       return;
     }
-    const model = provider.default_model || provider.models[0] || "";
+    const model =
+      (defaultProvider && config?.settings.default_model) ||
+      provider.default_model ||
+      provider.models[0] ||
+      "";
     const meta = await api.conversationCreate(provider.id, model);
     await get().refreshConfig();
     set({ activeConversationId: meta.id, items: [], view: "chat" });
@@ -341,13 +361,20 @@ export const useStore = create<StoreState>((set, get) => ({
       const provider = config.providers.find((p) => p.id === conv?.provider_id);
       if (provider) return provider;
     }
-    return config.providers[0] ?? null;
+    return defaultProviderOf(config) ?? config.providers[0] ?? null;
   },
 }));
 
 // ---------------------------------------------------------------------------
 // Backend event handling
 // ---------------------------------------------------------------------------
+
+/** The provider whose model new chats start with, if it still exists. */
+function defaultProviderOf(config: AppConfig | null): ProviderConfig | null {
+  const id = config?.settings.default_provider_id;
+  if (!id || !config) return null;
+  return config.providers.find((p) => p.id === id) ?? null;
+}
 
 type SetFn = typeof useStore.setState;
 type GetFn = () => StoreState;

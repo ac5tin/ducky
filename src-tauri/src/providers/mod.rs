@@ -20,12 +20,23 @@ use crate::config::{ApiType, ProviderConfig};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Msg {
-    System { text: String },
-    User { text: String },
+    System {
+        text: String,
+    },
+    User {
+        text: String,
+    },
     /// Assistant turn: optional text plus any tool calls it made.
-    Assistant { text: String, tool_calls: Vec<ToolCall> },
+    Assistant {
+        text: String,
+        tool_calls: Vec<ToolCall>,
+    },
     /// Result of one tool call, fed back to the model.
-    ToolResult { call_id: String, text: String, is_error: bool },
+    ToolResult {
+        call_id: String,
+        text: String,
+        is_error: bool,
+    },
 }
 
 impl Msg {
@@ -59,10 +70,20 @@ pub enum ProviderEvent {
     TextDelta(String),
     ReasoningDelta(String),
     /// A tool call started (id + name known).
-    ToolCallBegin { index: usize, id: String, name: String },
+    ToolCallBegin {
+        index: usize,
+        id: String,
+        name: String,
+    },
     /// Fragment of tool-call JSON arguments.
-    ToolCallArgsDelta { index: usize, fragment: String },
-    Usage { input: Option<u64>, output: Option<u64> },
+    ToolCallArgsDelta {
+        index: usize,
+        fragment: String,
+    },
+    Usage {
+        input: Option<u64>,
+        output: Option<u64>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -84,7 +105,12 @@ pub struct ChatOptions {
 
 impl Default for ChatOptions {
     fn default() -> Self {
-        Self { model: String::new(), max_tokens: None, temperature: None, effort: None }
+        Self {
+            model: String::new(),
+            max_tokens: None,
+            temperature: None,
+            effort: None,
+        }
     }
 }
 
@@ -115,7 +141,10 @@ pub(crate) fn http_client() -> reqwest::Client {
         .expect("reqwest client")
 }
 
-pub(crate) async fn ensure_ok(response: reqwest::Response, provider: &str) -> anyhow::Result<reqwest::Response> {
+pub(crate) async fn ensure_ok(
+    response: reqwest::Response,
+    provider: &str,
+) -> anyhow::Result<reqwest::Response> {
     let status = response.status();
     if status.is_success() {
         return Ok(response);
@@ -139,11 +168,7 @@ pub(crate) async fn ensure_ok(response: reqwest::Response, provider: &str) -> an
                         .map(|s| s.to_string())
                         .or_else(|| Some(e.to_string()))
                 })
-                .or_else(|| {
-                    v.get("message")
-                        .and_then(|m| m.as_str())
-                        .map(String::from)
-                })
+                .or_else(|| v.get("message").and_then(|m| m.as_str()).map(String::from))
         })
         .unwrap_or_else(|| {
             let trimmed = body.trim();
@@ -207,7 +232,10 @@ where
     Ok(())
 }
 
-pub fn build_provider(cfg: &ProviderConfig, api_key: Option<&str>) -> std::sync::Arc<dyn LlmProvider> {
+pub fn build_provider(
+    cfg: &ProviderConfig,
+    api_key: Option<&str>,
+) -> std::sync::Arc<dyn LlmProvider> {
     let key = api_key.map(|s| s.to_string());
     match cfg.api_type {
         ApiType::OpenAi => std::sync::Arc::new(openai::OpenAiProvider {
@@ -246,7 +274,11 @@ mod tests {
 
     #[test]
     fn msg_serialises_stable() {
-        let m = Msg::ToolResult { call_id: "x".into(), text: "hi".into(), is_error: false };
+        let m = Msg::ToolResult {
+            call_id: "x".into(),
+            text: "hi".into(),
+            is_error: false,
+        };
         let v = m.as_json();
         assert_eq!(v["kind"], "tool_result");
         let back = Msg::from_json(&v).unwrap();

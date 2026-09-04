@@ -1,21 +1,8 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import * as api from "../../api";
 import { useStore } from "../../store";
-import type { EffortLevel } from "../../types";
 import { Icon } from "../icons";
-
-const EFFORT_LABELS: Record<EffortLevel, string> = {
-  none: "None",
-  minimal: "Minimal",
-  low: "Low",
-  medium: "Medium",
-  high: "High",
-  xhigh: "XHigh",
-  max: "Max",
-};
-
-// levels per provider kind + model, so re-opening the picker is instant
-const effortCache = new Map<string, EffortLevel[]>();
+import { EFFORT_LABELS, EffortPill, useEffortLevels } from "./effortLevels";
 
 export function ModelPicker() {
   const config = useStore((s) => s.config);
@@ -23,36 +10,42 @@ export function ModelPicker() {
   const activeProvider = useStore((s) => s.activeProvider());
   const setActiveModel = useStore((s) => s.setActiveModel);
   const setActiveEffort = useStore((s) => s.setActiveEffort);
+  const refreshConfig = useStore((s) => s.refreshConfig);
   const setView = useStore((s) => s.setView);
   const [open, setOpen] = useState(false);
-  const [efforts, setEfforts] = useState<EffortLevel[]>([]);
 
   const conversation = config?.conversations.find((c) => c.id === activeId);
-  const currentModel = conversation?.model || activeProvider?.default_model || activeProvider?.models[0] || "";
+  // before a chat exists, surface the app-level default model if one applies
+  const defaultApplies = !!activeProvider && config?.settings.default_provider_id === activeProvider.id;
+  const currentModel =
+    conversation?.model ||
+    (defaultApplies ? config?.settings.default_model : null) ||
+    activeProvider?.default_model ||
+    activeProvider?.models[0] ||
+    "";
   const effort = conversation?.effort ?? null;
+  const efforts = useEffortLevels(activeProvider?.kind, currentModel);
 
-  useEffect(() => {
+  const isDefaultModel = (model: string) =>
+    !!activeProvider &&
+    config?.settings.default_provider_id === activeProvider.id &&
+    config?.settings.default_model === model;
+  const isDefault =
+    !!currentModel && isDefaultModel(currentModel) && (config?.settings.default_effort ?? null) === effort;
+
+  const toggleDefault = async () => {
     if (!activeProvider || !currentModel) return;
-    const key = `${activeProvider.kind}/${currentModel}`;
-    const cached = effortCache.get(key);
-    if (cached) {
-      setEfforts(cached);
-      return;
-    }
-    let cancelled = false;
-    api
-      .effortLevels(activeProvider.kind, currentModel)
-      .then((levels) => {
-        effortCache.set(key, levels);
-        if (!cancelled) setEfforts(levels);
-      })
-      .catch(() => {
-        if (!cancelled) setEfforts([]);
+    if (isDefault) {
+      await api.settingsSet({ default_provider_id: "", default_model: "", default_effort: null });
+    } else {
+      await api.settingsSet({
+        default_provider_id: activeProvider.id,
+        default_model: currentModel,
+        default_effort: effort,
       });
-    return () => {
-      cancelled = true;
-    };
-  }, [activeProvider?.kind, activeProvider?.id, currentModel]);
+    }
+    await refreshConfig();
+  };
 
   if (!activeProvider) {
     return (
@@ -88,7 +81,7 @@ export function ModelPicker() {
             {activeProvider.models.map((model) => (
               <button
                 key={model}
-                className={`flex w-full items-center justify-between px-3 py-2 text-left text-sm transition hover:bg-slate-50 dark:hover:bg-slate-800 ${
+                className={`flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-sm transition hover:bg-slate-50 dark:hover:bg-slate-800 ${
                   model === currentModel ? "font-semibold text-sky-600 dark:text-sky-400" : ""
                 }`}
                 onClick={() => {
@@ -97,6 +90,9 @@ export function ModelPicker() {
                 }}
               >
                 <span className="truncate">{model}</span>
+                {isDefaultModel(model) && (
+                  <span className="shrink-0 text-[10px] uppercase tracking-wide text-slate-400">default</span>
+                )}
                 {model === currentModel && <Icon name="check" className="h-4 w-4 shrink-0" />}
               </button>
             ))}
@@ -116,24 +112,22 @@ export function ModelPicker() {
                 </div>
               </div>
             )}
+            {currentModel && (
+              <div className="mt-1 flex items-center justify-between border-t border-slate-200 px-3 py-2 dark:border-slate-700">
+                <span className="text-xs text-slate-400">Default for new chats</span>
+                <button
+                  className={`text-xs font-medium transition hover:underline ${
+                    isDefault ? "text-slate-400" : "text-sky-600 dark:text-sky-400"
+                  }`}
+                  onClick={() => toggleDefault().catch((e) => console.error(e))}
+                >
+                  {isDefault ? "Remove" : "Set as default"}
+                </button>
+              </div>
+            )}
           </div>
         </>
       )}
     </div>
-  );
-}
-
-function EffortPill({ label, selected, onClick }: { label: string; selected: boolean; onClick: () => void }) {
-  return (
-    <button
-      className={`rounded-md px-2 py-1 text-xs transition ${
-        selected
-          ? "bg-sky-50 font-medium text-sky-600 dark:bg-slate-800 dark:text-sky-400"
-          : "text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
-      }`}
-      onClick={onClick}
-    >
-      {label}
-    </button>
   );
 }

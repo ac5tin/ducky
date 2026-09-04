@@ -46,14 +46,13 @@ impl ServerHandler for EchoServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
-        let schema: Arc<serde_json::Map<String, serde_json::Value>> = serde_json::from_value(
-            serde_json::json!({
+        let schema: Arc<serde_json::Map<String, serde_json::Value>> =
+            serde_json::from_value(serde_json::json!({
                 "type": "object",
                 "properties": { "message": { "type": "string" } },
                 "required": ["message"]
-            }),
-        )
-        .unwrap();
+            }))
+            .unwrap();
         let ask_schema: Arc<serde_json::Map<String, serde_json::Value>> = serde_json::from_value(
             serde_json::json!({"type": "object", "additionalProperties": false}),
         )
@@ -77,10 +76,10 @@ impl ServerHandler for EchoServer {
                     .and_then(|a| a.get("message"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                    "echo: {msg}"
-                ))])
-                .into())
+                Ok(
+                    CallToolResult::success(vec![ContentBlock::text(format!("echo: {msg}"))])
+                        .into(),
+                )
             }
             "ask_name" => {
                 if let Some(responses) = &request.input_responses {
@@ -118,7 +117,10 @@ impl ServerHandler for EchoServer {
                     InputRequiredResult::from_input_requests(input_requests),
                 ))
             }
-            other => Err(McpError::invalid_request(format!("Unknown tool: {other}"), None)),
+            other => Err(McpError::invalid_request(
+                format!("Unknown tool: {other}"),
+                None,
+            )),
         }
     }
 }
@@ -133,7 +135,13 @@ fn test_handler(bridge: Arc<InteractiveBridge>, sink: Arc<CollectingSink>) -> Du
         server_name: Arc::from("test_server"),
         server_title: Arc::from("Test Server"),
         bridge,
-        store: Arc::new(Store::new(std::path::Path::new("/tmp/ducky-test-store")).unwrap()),
+        store: Arc::new(
+            Store::new(
+                std::path::Path::new("/tmp/ducky-test-store"),
+                std::env::temp_dir(),
+            )
+            .unwrap(),
+        ),
         sink,
     }
 }
@@ -167,12 +175,9 @@ async fn connect(
 fn temp_bridge() -> (Arc<InteractiveBridge>, Arc<CollectingSink>) {
     let sink = Arc::new(CollectingSink::default());
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(Store::new(dir.path()).unwrap());
+    let store = Arc::new(Store::new(dir.path(), dir.path().to_path_buf()).unwrap());
     std::mem::forget(dir); // keep config files alive for the test process
-    (
-        Arc::new(InteractiveBridge::new(sink.clone(), store)),
-        sink,
-    )
+    (Arc::new(InteractiveBridge::new(sink.clone(), store)), sink)
 }
 
 // ---------------------------------------------------------------------------
@@ -182,10 +187,7 @@ fn temp_bridge() -> (Arc<InteractiveBridge>, Arc<CollectingSink>) {
 #[tokio::test]
 async fn connects_with_modern_protocol_and_lists_tools() {
     let (bridge, _sink) = temp_bridge();
-    let handler = test_handler(
-        bridge,
-        Arc::new(CollectingSink::default()),
-    );
+    let handler = test_handler(bridge, Arc::new(CollectingSink::default()));
     let service = connect(handler, CancellationToken::new()).await;
 
     // modern servers expose their negotiated protocol version
@@ -203,9 +205,8 @@ async fn connects_with_modern_protocol_and_lists_tools() {
     assert!(names.contains(&"ask_name".to_string()));
 
     let mut params = CallToolRequestParams::new("echo".to_string());
-    params.arguments = Some(
-        serde_json::from_value(serde_json::json!({ "message": "hi" })).unwrap(),
-    );
+    params.arguments =
+        Some(serde_json::from_value(serde_json::json!({ "message": "hi" })).unwrap());
     let result = service.call_tool(params).await.expect("call echo");
     assert_eq!(result.is_error, Some(false));
     let text = result
@@ -237,12 +238,15 @@ async fn mrtr_elicitation_roundtrip() {
         loop {
             {
                 let events = sink.events.lock().unwrap();
-                if let Some(BackendEvent::ElicitationRequested { request_id, mode, message, .. }) =
-                    events.iter().rev().find_map(|e| match e {
-                        BackendEvent::ElicitationRequested { .. } => Some(e.clone()),
-                        _ => None,
-                    })
-                {
+                if let Some(BackendEvent::ElicitationRequested {
+                    request_id,
+                    mode,
+                    message,
+                    ..
+                }) = events.iter().rev().find_map(|e| match e {
+                    BackendEvent::ElicitationRequested { .. } => Some(e.clone()),
+                    _ => None,
+                }) {
                     assert_eq!(mode, "form");
                     assert_eq!(message, "What is your name?");
                     return request_id;
@@ -257,9 +261,8 @@ async fn mrtr_elicitation_roundtrip() {
     // the user answers the form
     assert!(bridge.resolve_elicitation(
         &request_id,
-        rmcp::model::ElicitResult::new(rmcp::model::ElicitationAction::Accept).with_content(
-            serde_json::json!({ "name": "Ducky" })
-        ),
+        rmcp::model::ElicitResult::new(rmcp::model::ElicitationAction::Accept)
+            .with_content(serde_json::json!({ "name": "Ducky" })),
     ));
 
     // the tool call completes with the elicited data

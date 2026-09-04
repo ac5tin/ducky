@@ -33,6 +33,8 @@ pub struct Bootstrap {
     pub server_summaries: Vec<crate::mcp::manager::ServerSummary>,
     pub presets: &'static [config::ProviderPreset],
     pub suggestions: Vec<SuggestionView>,
+    /// The machine's home directory; the default working directory.
+    pub home_dir: String,
 }
 
 #[derive(Serialize)]
@@ -59,6 +61,7 @@ pub fn get_bootstrap(state: State<'_, Arc<AppState>>) -> Bootstrap {
                 args: s.args.iter().map(|a| a.to_string()).collect(),
             })
             .collect(),
+        home_dir: state.store.home_dir.to_string_lossy().into_owned(),
     }
 }
 
@@ -108,10 +111,7 @@ pub async fn provider_add(
     state.store.save_config().map_err(|e| e.to_string())?;
 
     // try to populate the model list right away (non-fatal)
-    let provider = crate::providers::build_provider(
-        &cfg,
-        state.store.provider_key(&id).as_deref(),
-    );
+    let provider = crate::providers::build_provider(&cfg, state.store.provider_key(&id).as_deref());
     if let Ok(models) = provider.list_models().await {
         if let Some(p) = state
             .store
@@ -177,8 +177,17 @@ pub fn provider_delete(state: State<'_, Arc<AppState>>, id: String) -> Result<()
     {
         let mut c = state.store.config.lock().unwrap();
         c.providers.retain(|p| p.id != id);
+        // drop a dangling default model setting with its provider
+        if c.settings.default_provider_id.as_deref() == Some(id.as_str()) {
+            c.settings.default_provider_id = None;
+            c.settings.default_model = None;
+            c.settings.default_effort = None;
+        }
     }
-    state.store.set_provider_key(&id, None).map_err(|e| e.to_string())?;
+    state
+        .store
+        .set_provider_key(&id, None)
+        .map_err(|e| e.to_string())?;
     state.store.save_config().map_err(|e| e.to_string())
 }
 
@@ -189,7 +198,11 @@ pub async fn provider_test(
 ) -> Result<Vec<String>, String> {
     let (cfg, key) = {
         let c = state.store.config.lock().unwrap();
-        let p = c.providers.iter().find(|p| p.id == id.clone()).ok_or("Unknown provider")?;
+        let p = c
+            .providers
+            .iter()
+            .find(|p| p.id == id.clone())
+            .ok_or("Unknown provider")?;
         (p.clone(), state.store.provider_key(&p.id))
     };
     let provider = crate::providers::build_provider(&cfg, key.as_deref());
@@ -214,10 +227,12 @@ pub fn provider_has_key(state: State<'_, Arc<AppState>>, id: String) -> bool {
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub fn settings_set(
+pub async fn settings_set(
     state: State<'_, Arc<AppState>>,
     settings: AppSettingsPatch,
 ) -> Result<(), String> {
+    // ids of stdio servers to relaunch because their spawn cwd changed
+    let mut restart_stdio: Vec<String> = Vec::new();
     {
         let mut c = state.store.config.lock().unwrap();
         if let Some(theme) = settings.theme {
@@ -238,8 +253,66 @@ pub fn settings_set(
         if let Some(v) = settings.roots {
             c.settings.roots = v;
         }
+        if let Some(v) = settings.working_dir {
+            let v = if v.trim().is_empty() { None } else { Some(v) };
+            if let Some(dir) = &v {
+                let meta = std::fs::metadata(dir).map_err(|e| format!("{dir}: {e}"))?;
+                if !meta.is_dir() {
+                    return Err(format!("{dir} is not a directory"));
+                }
+            }
+            if c.settings.working_dir != v {
+                c.settings.working_dir = v;
+                restart_stdio = c
+                    .mcp_servers
+                    .iter()
+                    .filter(|s| matches!(s.transport, config::McpTransport::Stdio { .. }))
+                    .map(|s| s.id.clone())
+                    .collect();
+            }
+        }
+        if let Some(v) = settings.default_provider_id {
+            let v = if v.trim().is_empty() { None } else { Some(v) };
+            if let Some(id) = &v {
+                if !c.providers.iter().any(|p| &p.id == id) {
+                    return Err(format!("Unknown provider {id}"));
+                }
+            }
+            c.settings.default_provider_id = v;
+        }
+        if let Some(v) = settings.default_model {
+            let v = if v.trim().is_empty() { None } else { Some(v) };
+            c.settings.default_model = v;
+        }
+        if let Some(v) = settings.default_effort {
+            c.settings.default_effort = v;
+        }
     }
-    state.store.save_config().map_err(|e| e.to_string())
+    state.store.save_config().map_err(|e| e.to_string())?;
+
+    // stdio servers bake their cwd in at spawn time; relaunch the connected
+    // ones so a changed working directory takes effect immediately
+    for id in restart_stdio {
+        if !matches!(
+            state.manager.status(&id),
+            crate::mcp::manager::ServerStatus::Connected
+        ) {
+            continue;
+        }
+        state.manager.disconnect(&id).await;
+        let _ = state.manager.connect(&id).await;
+    }
+    Ok(())
+}
+
+/// Missing field → `None` (keep current), `null` → `Some(None)` (clear),
+/// value → `Some(Some(v))` (set). Lets the UI reset the default effort
+/// without touching the rest of the default.
+fn deserialize_clearable<'de, D>(de: D) -> Result<Option<Option<config::EffortLevel>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(de).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -250,6 +323,11 @@ pub struct AppSettingsPatch {
     pub max_tool_iterations: Option<u32>,
     pub show_reasoning: Option<bool>,
     pub roots: Option<Vec<String>>,
+    pub working_dir: Option<String>,
+    pub default_provider_id: Option<String>,
+    pub default_model: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_clearable")]
+    pub default_effort: Option<Option<config::EffortLevel>>,
 }
 
 #[tauri::command]
@@ -282,12 +360,13 @@ pub fn conversation_create(
     provider_id: String,
     model: String,
 ) -> ConversationMeta {
+    let effort = state.store.config.lock().unwrap().settings.default_effort;
     let meta = ConversationMeta {
         id: uuid(),
         title: String::new(),
         provider_id,
         model,
-        effort: None,
+        effort,
         created_at: now(),
         updated_at: now(),
     };
@@ -296,12 +375,16 @@ pub fn conversation_create(
         c.conversations.insert(0, meta.clone());
     }
     let _ = state.store.save_config();
+    let _ = state.store.save_conversation(&meta, &[]);
     meta
 }
 
 #[tauri::command]
 pub fn conversation_delete(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
-    state.store.delete_conversation(&id).map_err(|e| e.to_string())
+    state
+        .store
+        .delete_conversation(&id)
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -460,7 +543,9 @@ pub fn approval_respond(state: State<'_, Arc<AppState>>, response: ApprovalRespo
         "allow_once" | "allow" => ApprovalDecision::AllowOnce,
         _ => ApprovalDecision::Deny,
     };
-    state.bridge.resolve_approval(&response.request_id, decision)
+    state
+        .bridge
+        .resolve_approval(&response.request_id, decision)
 }
 
 #[derive(Deserialize)]
@@ -471,10 +556,7 @@ pub struct ElicitationResponse {
 }
 
 #[tauri::command]
-pub fn elicitation_respond(
-    state: State<'_, Arc<AppState>>,
-    response: ElicitationResponse,
-) -> bool {
+pub fn elicitation_respond(state: State<'_, Arc<AppState>>, response: ElicitationResponse) -> bool {
     use rmcp::model::ElicitationAction;
     let action = match response.action.as_str() {
         "accept" => ElicitationAction::Accept,
@@ -485,11 +567,17 @@ pub fn elicitation_respond(
     if let Some(content) = response.content {
         result = result.with_content(content);
     }
-    state.bridge.resolve_elicitation(&response.request_id, result)
+    state
+        .bridge
+        .resolve_elicitation(&response.request_id, result)
 }
 
 #[tauri::command]
-pub fn sampling_respond(state: State<'_, Arc<AppState>>, request_id: String, approve: bool) -> bool {
+pub fn sampling_respond(
+    state: State<'_, Arc<AppState>>,
+    request_id: String,
+    approve: bool,
+) -> bool {
     state.bridge.resolve_sampling(&request_id, approve)
 }
 
@@ -530,15 +618,16 @@ impl From<McpTransportView> for config::McpTransport {
             McpTransportView::Stdio { command, args, env } => {
                 config::McpTransport::Stdio { command, args, env }
             }
-            McpTransportView::Http { url, headers } => {
-                config::McpTransport::Http { url, headers }
-            }
+            McpTransportView::Http { url, headers } => config::McpTransport::Http { url, headers },
         }
     }
 }
 
 #[tauri::command]
-pub fn mcp_add(state: State<'_, Arc<AppState>>, server: NewServer) -> Result<McpServerConfig, String> {
+pub fn mcp_add(
+    state: State<'_, Arc<AppState>>,
+    server: NewServer,
+) -> Result<McpServerConfig, String> {
     let cfg = McpServerConfig {
         id: uuid(),
         name: server.name,
@@ -559,10 +648,7 @@ pub fn mcp_add(state: State<'_, Arc<AppState>>, server: NewServer) -> Result<Mcp
 }
 
 #[tauri::command]
-pub fn mcp_update(
-    state: State<'_, Arc<AppState>>,
-    server: McpServerConfig,
-) -> Result<(), String> {
+pub fn mcp_update(state: State<'_, Arc<AppState>>, server: McpServerConfig) -> Result<(), String> {
     {
         let mut c = state.store.config.lock().unwrap();
         let Some(existing) = c.mcp_servers.iter_mut().find(|s| s.id == server.id) else {
@@ -584,7 +670,11 @@ pub async fn mcp_remove(state: State<'_, Arc<AppState>>, id: String) -> Result<(
 }
 
 #[tauri::command]
-pub fn mcp_set_enabled(state: State<'_, Arc<AppState>>, id: String, enabled: bool) -> Result<(), String> {
+pub fn mcp_set_enabled(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    enabled: bool,
+) -> Result<(), String> {
     {
         let mut c = state.store.config.lock().unwrap();
         let Some(s) = c.mcp_servers.iter_mut().find(|s| s.id == id) else {
@@ -619,12 +709,18 @@ pub fn mcp_summaries(state: State<'_, Arc<AppState>>) -> Vec<crate::mcp::manager
 }
 
 #[tauri::command]
-pub fn mcp_summary(state: State<'_, Arc<AppState>>, id: String) -> crate::mcp::manager::ServerSummary {
+pub fn mcp_summary(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> crate::mcp::manager::ServerSummary {
     state.manager.summary(&id)
 }
 
 #[tauri::command]
-pub async fn mcp_refresh(state: State<'_, Arc<AppState>>, id: String) -> Result<crate::mcp::manager::ServerSummary, String> {
+pub async fn mcp_refresh(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<crate::mcp::manager::ServerSummary, String> {
     state.manager.refresh_server(&id).await
 }
 
@@ -645,7 +741,10 @@ pub async fn mcp_get_prompt(
     name: String,
     arguments: HashMap<String, String>,
 ) -> Result<serde_json::Value, String> {
-    let result = state.manager.get_prompt(&server_id, &name, arguments).await?;
+    let result = state
+        .manager
+        .get_prompt(&server_id, &name, arguments)
+        .await?;
     serde_json::to_value(&result).map_err(|e| e.to_string())
 }
 
@@ -689,7 +788,10 @@ pub fn mcp_import_preview(text: String) -> Result<Vec<ImportedPreview>, String> 
     let imported = config::parse_import_json(&text).map_err(|e| e.to_string())?;
     Ok(imported
         .into_iter()
-        .map(|i| ImportedPreview { name: i.name, transport: i.transport })
+        .map(|i| ImportedPreview {
+            name: i.name,
+            transport: i.transport,
+        })
         .collect())
 }
 
@@ -813,4 +915,23 @@ pub fn app_info() -> serde_json::Value {
         "version": env!("CARGO_PKG_VERSION"),
         "mcp_spec": "2026-07-28",
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_effort_patch_is_tristate() {
+        // missing field keeps the current default
+        let keep: AppSettingsPatch = serde_json::from_str("{}").unwrap();
+        assert_eq!(keep.default_effort, None);
+
+        // null clears it
+        let clear: AppSettingsPatch = serde_json::from_str(r#"{"default_effort": null}"#).unwrap();
+        assert_eq!(clear.default_effort, Some(None));
+
+        let set: AppSettingsPatch = serde_json::from_str(r#"{"default_effort": "high"}"#).unwrap();
+        assert_eq!(set.default_effort, Some(Some(config::EffortLevel::High)));
+    }
 }

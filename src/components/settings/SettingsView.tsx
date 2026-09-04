@@ -2,13 +2,15 @@ import { useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useStore } from "../../store";
 import * as api from "../../api";
-import type { ProviderConfig } from "../../types";
+import type { EffortLevel, ProviderConfig } from "../../types";
 import { Button, Field, Modal, inputClass } from "../modals/Modal";
 import { Icon } from "../icons";
+import { EFFORT_LABELS, EffortPill, useEffortLevels } from "../chat/effortLevels";
 
 export function SettingsView() {
   const config = useStore((s) => s.config);
   const version = useStore((s) => s.version);
+  const homeDir = useStore((s) => s.homeDir);
   const refreshConfig = useStore((s) => s.refreshConfig);
   const toast = useStore((s) => s.toast);
   const setView = useStore((s) => s.setView);
@@ -21,6 +23,16 @@ export function SettingsView() {
   const patch = async (p: Parameters<typeof api.settingsSet>[0]) => {
     await api.settingsSet(p);
     await refreshConfig();
+  };
+
+  const changeWorkingDir = async () => {
+    const path = await open({
+      directory: true,
+      defaultPath: settings.working_dir ?? (homeDir || undefined),
+    });
+    if (typeof path === "string" && path !== settings.working_dir) {
+      await patch({ working_dir: path }).catch((e) => toast("error", `${e}`));
+    }
   };
 
   return (
@@ -67,6 +79,14 @@ export function SettingsView() {
               Add provider
             </Button>
           </div>
+        </Section>
+
+        {/* Default model */}
+        <Section
+          title="Default model"
+          description="New chats start with this model and reasoning effort. Without a default, they remember what you used last."
+        >
+          <DefaultModelSection />
         </Section>
 
         {/* Permissions */}
@@ -158,6 +178,48 @@ export function SettingsView() {
               </div>
             </div>
           )}
+        </Section>
+
+        {/* Working directory */}
+        <Section
+          title="Working directory"
+          description="New chats start here. Local MCP servers launch in this folder, and the AI treats it as the base for file paths."
+        >
+          <div className="space-y-2">
+            <div className="flex items-center justify-between gap-3 rounded-xl bg-slate-50 px-3 py-2 text-sm dark:bg-slate-800">
+              <span className="flex min-w-0 items-center gap-2">
+                <Icon name="folder" className="h-4 w-4 shrink-0 text-slate-400" />
+                <span className="truncate font-mono">
+                  {settings.working_dir ?? homeDir}
+                </span>
+              </span>
+              {settings.working_dir && (
+                <span className="shrink-0 rounded bg-amber-100 px-1.5 py-0.5 text-xs font-medium text-amber-700 dark:bg-amber-950 dark:text-amber-300">
+                  custom
+                </span>
+              )}
+            </div>
+            <div className="flex gap-2">
+              <Button variant="secondary" onClick={changeWorkingDir}>
+                <Icon name="folder" className="h-4 w-4" />
+                Change…
+              </Button>
+              {settings.working_dir && (
+                <Button
+                  variant="ghost"
+                  onClick={() =>
+                    patch({ working_dir: null }).catch((e) => toast("error", `${e}`))
+                  }
+                >
+                  Reset to home folder
+                </Button>
+              )}
+            </div>
+            <p className="text-xs text-slate-400">
+              Changing this restarts connected local MCP servers so they pick up
+              the new folder.
+            </p>
+          </div>
         </Section>
 
         {/* Folders */}
@@ -308,6 +370,99 @@ function Section({
       )}
       {description ? children : <div className="mt-4">{children}</div>}
     </section>
+  );
+}
+
+function DefaultModelSection() {
+  const config = useStore((s) => s.config);
+  const refreshConfig = useStore((s) => s.refreshConfig);
+  const toast = useStore((s) => s.toast);
+
+  const defProviderId = config?.settings.default_provider_id ?? null;
+  const defModel = config?.settings.default_model ?? null;
+  const provider = defProviderId
+    ? (config?.providers.find((p) => p.id === defProviderId) ?? null)
+    : null;
+  // the model new chats would actually resolve to — effort pills reflect it
+  const resolvedModel =
+    (provider && defModel) || provider?.default_model || provider?.models[0] || "";
+  const efforts = useEffortLevels(provider?.kind, resolvedModel || undefined);
+  const effort = config?.settings.default_effort ?? null;
+
+  if (!config) return null;
+
+  const save = async (providerId: string, modelId: string, eff: EffortLevel | null) => {
+    try {
+      await api.settingsSet({
+        default_provider_id: providerId,
+        default_model: modelId,
+        default_effort: eff,
+      });
+      await refreshConfig();
+    } catch (e) {
+      toast("error", `${e}`);
+    }
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="grid gap-4 sm:grid-cols-2">
+        <div>
+          <div className="mb-1.5 text-sm font-medium">Provider</div>
+          <select
+            className={inputClass}
+            value={defProviderId ?? ""}
+            onChange={(e) => save(e.target.value, "", null)}
+          >
+            <option value="">None — remember last used</option>
+            {config.providers.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <div className="mb-1.5 text-sm font-medium">Model</div>
+          <select
+            className={inputClass}
+            value={defModel ?? ""}
+            disabled={!provider}
+            onChange={(e) => save(defProviderId ?? "", e.target.value, effort)}
+          >
+            <option value="">Provider default</option>
+            {(provider?.models ?? []).map((m) => (
+              <option key={m} value={m}>
+                {m}
+              </option>
+            ))}
+          </select>
+        </div>
+      </div>
+      {provider && efforts.length > 0 && (
+        <div>
+          <div className="mb-1.5 text-sm font-medium">Reasoning effort</div>
+          <div className="flex flex-wrap gap-1">
+            <EffortPill
+              selected={effort === null}
+              label="Default"
+              onClick={() => save(defProviderId ?? "", defModel ?? "", null)}
+            />
+            {efforts.map((level) => (
+              <EffortPill
+                key={level}
+                selected={effort === level}
+                label={EFFORT_LABELS[level]}
+                onClick={() => save(defProviderId ?? "", defModel ?? "", level)}
+              />
+            ))}
+          </div>
+          <p className="mt-1.5 text-xs text-slate-400">
+            Applies to {resolvedModel || "the provider's default model"}.
+          </p>
+        </div>
+      )}
+    </div>
   );
 }
 

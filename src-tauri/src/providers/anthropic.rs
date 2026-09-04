@@ -53,7 +53,11 @@ impl AnthropicProvider {
                         );
                     }
                 }
-                Msg::ToolResult { call_id, text, is_error } => {
+                Msg::ToolResult {
+                    call_id,
+                    text,
+                    is_error,
+                } => {
                     // tool results are user messages in Anthropic's protocol;
                     // consecutive results must share one user message
                     let block = json!({
@@ -66,7 +70,10 @@ impl AnthropicProvider {
                         if last["role"] == "user" {
                             if let Some(arr) = last["content"].as_array_mut() {
                                 // only merge when the last block is also a tool_result
-                                if arr.last().and_then(|b| b.get("type")).and_then(|t| t.as_str())
+                                if arr
+                                    .last()
+                                    .and_then(|b| b.get("type"))
+                                    .and_then(|t| t.as_str())
                                     == Some("tool_result")
                                 {
                                     arr.push(block);
@@ -111,7 +118,12 @@ impl AnthropicProvider {
         }
     }
 
-    fn build_body(system: &str, wire_msgs: Vec<Value>, tools: &[ToolDef], opts: &ChatOptions) -> Value {
+    fn build_body(
+        system: &str,
+        wire_msgs: Vec<Value>,
+        tools: &[ToolDef],
+        opts: &ChatOptions,
+    ) -> Value {
         let mut body = json!({
             "model": opts.model,
             "max_tokens": opts.max_tokens.unwrap_or(8192),
@@ -233,8 +245,10 @@ impl LlmProvider for AnthropicProvider {
                             }
                         }
                         Some("input_json_delta") => {
-                            let frag =
-                                delta.get("partial_json").and_then(|t| t.as_str()).unwrap_or("");
+                            let frag = delta
+                                .get("partial_json")
+                                .and_then(|t| t.as_str())
+                                .unwrap_or("");
                             let index =
                                 v.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
                             if frag.is_empty() {
@@ -264,9 +278,12 @@ impl LlmProvider for AnthropicProvider {
         .await?;
 
         if let Some(u) = usage_in {
-            tx.send(ProviderEvent::Usage { input: Some(u), output: usage_out })
-                .await
-                .ok();
+            tx.send(ProviderEvent::Usage {
+                input: Some(u),
+                output: usage_out,
+            })
+            .await
+            .ok();
         }
 
         Ok(match stop_reason.as_deref() {
@@ -306,8 +323,12 @@ mod tests {
     #[test]
     fn converts_messages() {
         let msgs = vec![
-            Msg::System { text: "be nice".into() },
-            Msg::User { text: "hello".into() },
+            Msg::System {
+                text: "be nice".into(),
+            },
+            Msg::User {
+                text: "hello".into(),
+            },
             Msg::Assistant {
                 text: "let me check".into(),
                 tool_calls: vec![super::super::ToolCall {
@@ -316,7 +337,11 @@ mod tests {
                     arguments: json!({"path": "a.txt"}),
                 }],
             },
-            Msg::ToolResult { call_id: "t1".into(), text: "data".into(), is_error: true },
+            Msg::ToolResult {
+                call_id: "t1".into(),
+                text: "data".into(),
+                is_error: true,
+            },
         ];
         let (system, wire) = AnthropicProvider::messages_to_wire(&msgs);
         assert_eq!(system, "be nice");
@@ -335,15 +360,35 @@ mod tests {
             Msg::Assistant {
                 text: String::new(),
                 tool_calls: vec![
-                    super::super::ToolCall { id: "a".into(), name: "x".into(), arguments: json!({}) },
-                    super::super::ToolCall { id: "b".into(), name: "y".into(), arguments: json!({}) },
+                    super::super::ToolCall {
+                        id: "a".into(),
+                        name: "x".into(),
+                        arguments: json!({}),
+                    },
+                    super::super::ToolCall {
+                        id: "b".into(),
+                        name: "y".into(),
+                        arguments: json!({}),
+                    },
                 ],
             },
-            Msg::ToolResult { call_id: "a".into(), text: "1".into(), is_error: false },
-            Msg::ToolResult { call_id: "b".into(), text: "2".into(), is_error: false },
+            Msg::ToolResult {
+                call_id: "a".into(),
+                text: "1".into(),
+                is_error: false,
+            },
+            Msg::ToolResult {
+                call_id: "b".into(),
+                text: "2".into(),
+                is_error: false,
+            },
         ];
         let (_, wire2) = AnthropicProvider::messages_to_wire(&msgs2);
-        assert_eq!(wire2.len(), 3, "tool results must merge into one user message");
+        assert_eq!(
+            wire2.len(),
+            3,
+            "tool results must merge into one user message"
+        );
         assert_eq!(wire2[2]["content"].as_array().unwrap().len(), 2);
     }
 

@@ -64,6 +64,14 @@ export interface AppSettings {
   roots: string[];
   max_tool_iterations: number;
   show_reasoning: boolean;
+  /** Working directory for chats and spawned stdio servers; null = home. */
+  working_dir: string | null;
+  /** Provider new chats start with; null = keep current behavior. */
+  default_provider_id: string | null;
+  /** Model new chats start with, only used with default_provider_id. */
+  default_model: string | null;
+  /** Reasoning effort new chats start with; null = model default. */
+  default_effort: EffortLevel | null;
 }
 
 export interface ConversationMeta {

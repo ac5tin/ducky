@@ -11,7 +11,7 @@ use rmcp::model::{
     PaginatedRequestParams, ProgressToken, ProtocolVersion, ReadResourceRequestParams,
     ReadResourceResult, Reference, RequestMetaObject, ServerNotification, SubscriptionFilter, Tool,
 };
-use rmcp::service::{ClientLifecycleMode, Peer, RunningService, RoleClient};
+use rmcp::service::{ClientLifecycleMode, Peer, RoleClient, RunningService};
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
 };
@@ -36,8 +36,12 @@ pub enum ServerStatus {
     Connected,
     /// The server answered 401/403: the user must authorise (OAuth) or fix
     /// their token.
-    NeedsAuth { detail: Option<String> },
-    Error { message: String },
+    NeedsAuth {
+        detail: Option<String>,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -108,11 +112,7 @@ impl ServerHandle {
 
     /// A cloneable handle for sending requests to the server, if connected.
     pub async fn peer(&self) -> Option<Peer<RoleClient>> {
-        self.service
-            .lock()
-            .await
-            .as_ref()
-            .map(|s| s.peer().clone())
+        self.service.lock().await.as_ref().map(|s| s.peer().clone())
     }
 
     pub async fn peer_info(&self) -> Option<Arc<rmcp::model::ServerPeerInfo>> {
@@ -141,7 +141,10 @@ impl ServerHandle {
     ) -> Result<ReadResourceResult, String> {
         let guard = self.service.lock().await;
         let service = guard.as_ref().ok_or("Server is not connected")?;
-        service.read_resource(params).await.map_err(|e| e.to_string())
+        service
+            .read_resource(params)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     /// MRTR-aware `prompts/get`.
@@ -174,7 +177,11 @@ enum BuiltTransport {
 }
 
 impl McpManager {
-    pub fn new(store: Arc<Store>, bridge: Arc<InteractiveBridge>, sink: Arc<dyn EventSink>) -> Self {
+    pub fn new(
+        store: Arc<Store>,
+        bridge: Arc<InteractiveBridge>,
+        sink: Arc<dyn EventSink>,
+    ) -> Self {
         Self {
             store,
             bridge,
@@ -267,7 +274,9 @@ impl McpManager {
                 if let Err(e) = crate::oauth::ensure_fresh_token(&self.store, &cfg).await {
                     self.set_status(
                         server_id,
-                        ServerStatus::NeedsAuth { detail: Some(e.to_string()) },
+                        ServerStatus::NeedsAuth {
+                            detail: Some(e.to_string()),
+                        },
                     );
                     return Ok(self.status(server_id));
                 }
@@ -332,7 +341,12 @@ impl McpManager {
                     self.set_status(server_id, ServerStatus::NeedsAuth { detail });
                     return Ok(self.status(server_id));
                 }
-                self.set_status(server_id, ServerStatus::Error { message: describe_init_error(&e) });
+                self.set_status(
+                    server_id,
+                    ServerStatus::Error {
+                        message: describe_init_error(&e),
+                    },
+                );
                 return Ok(self.status(server_id));
             }
         };
@@ -422,8 +436,23 @@ impl McpManager {
     fn build_transport(&self, cfg: &McpServerConfig) -> Result<BuiltTransport, String> {
         match &cfg.transport {
             McpTransport::Stdio { command, args, env } => {
+                let cwd = self
+                    .store
+                    .config
+                    .lock()
+                    .unwrap()
+                    .settings
+                    .effective_working_dir(&self.store.home_dir);
+                // servers get plain args (no shell), so expand a leading `~`
+                // ourselves — e.g. the built-in Filesystem suggestion
+                let expand =
+                    |s: &String| crate::config::expand_tilde(s, &self.store.home_dir).into_owned();
+                let args: Vec<String> = args.iter().map(&expand).collect();
+                let env: HashMap<String, String> =
+                    env.iter().map(|(k, v)| (k.clone(), expand(v))).collect();
+
                 let mut cmd = tokio::process::Command::new(command);
-                cmd.args(args).envs(env);
+                cmd.args(&args).envs(&env).current_dir(&cwd);
                 let (child, stderr) = TokioChildProcess::builder(cmd)
                     .stderr(std::process::Stdio::piped())
                     .spawn()
@@ -478,9 +507,9 @@ impl McpManager {
                     config = config.auth_header(format!("Bearer {token}"));
                 }
 
-                Ok(BuiltTransport::Http(StreamableHttpClientTransport::from_config(
-                    config,
-                )))
+                Ok(BuiltTransport::Http(
+                    StreamableHttpClientTransport::from_config(config),
+                ))
             }
         }
     }
@@ -769,10 +798,7 @@ impl McpManager {
     pub fn summary(&self, server_id: &str) -> ServerSummary {
         let cfg = {
             let cfg = self.store.config.lock().unwrap();
-            cfg.mcp_servers
-                .iter()
-                .find(|s| s.id == server_id)
-                .cloned()
+            cfg.mcp_servers.iter().find(|s| s.id == server_id).cloned()
         };
         let (name, enabled, transport_kind, detail) = match &cfg {
             Some(c) => (
@@ -926,8 +952,14 @@ fn describe_init_error(e: &rmcp::service::ClientInitializeError) -> String {
             server_supported,
         } => format!(
             "No compatible MCP protocol version (we support {:?}, server supports {:?}).",
-            client_supported.iter().map(|v| v.as_str()).collect::<Vec<_>>(),
-            server_supported.iter().map(|v| v.as_str()).collect::<Vec<_>>()
+            client_supported
+                .iter()
+                .map(|v| v.as_str())
+                .collect::<Vec<_>>(),
+            server_supported
+                .iter()
+                .map(|v| v.as_str())
+                .collect::<Vec<_>>()
         ),
         E::JsonRpcError(err) => format!("The server rejected the connection: {err}"),
         E::LegacyFallbackFailed { discover, fallback } => format!(
@@ -944,9 +976,11 @@ pub fn content_to_text(content: &[ContentBlock]) -> String {
     for block in content {
         match block {
             ContentBlock::Text(t) => parts.push(t.text.clone()),
-            ContentBlock::Image(img) => {
-                parts.push(format!("[image: {} ({} bytes)]", img.mime_type, img.data.len()))
-            }
+            ContentBlock::Image(img) => parts.push(format!(
+                "[image: {} ({} bytes)]",
+                img.mime_type,
+                img.data.len()
+            )),
             ContentBlock::Audio(a) => parts.push(format!("[audio: {}]", a.mime_type)),
             ContentBlock::ResourceLink(link) => {
                 parts.push(format!("[resource link: {} — {}]", link.name, link.uri));

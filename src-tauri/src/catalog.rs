@@ -37,7 +37,10 @@ impl Catalog {
             .ok()
             .and_then(|raw| serde_json::from_str(&raw).ok());
         Self {
-            state: Mutex::new(CatalogState { index, fetched_at: None }),
+            state: Mutex::new(CatalogState {
+                index,
+                fetched_at: None,
+            }),
             cache_path: Some(cache_path.to_path_buf()),
         }
     }
@@ -205,10 +208,18 @@ fn provider_aliases(kind: &str) -> Vec<&'static str> {
 }
 
 fn provider_rank(pid: &str) -> usize {
-    ["zai", "zai-coding-plan", "zhipuai", "openai", "anthropic", "openrouter", "groq"]
-        .iter()
-        .position(|p| *p == pid)
-        .unwrap_or(usize::MAX)
+    [
+        "zai",
+        "zai-coding-plan",
+        "zhipuai",
+        "openai",
+        "anthropic",
+        "openrouter",
+        "groq",
+    ]
+    .iter()
+    .position(|p| *p == pid)
+    .unwrap_or(usize::MAX)
 }
 
 /// Lowercase id without vendor prefix ("openai/gpt-5") or local tag ("qwen3:8b").
@@ -307,8 +318,14 @@ mod tests {
     #[test]
     fn unknown_models_fall_back_to_defaults() {
         let index = fixture();
-        assert_eq!(lookup(&index, "ollama", "llama4:latest"), EffortLevel::default_levels());
-        assert_eq!(lookup(&index, "custom", "mystery-model"), EffortLevel::default_levels());
+        assert_eq!(
+            lookup(&index, "ollama", "llama4:latest"),
+            EffortLevel::default_levels()
+        );
+        assert_eq!(
+            lookup(&index, "custom", "mystery-model"),
+            EffortLevel::default_levels()
+        );
         assert_eq!(lookup(&index, "openai", ""), EffortLevel::default_levels());
     }
 
@@ -316,7 +333,10 @@ mod tests {
     fn custom_providers_match_by_bare_model_id() {
         let index = fixture();
         // vendor-prefixed id, unknown kind -> bare scan finds it
-        assert_eq!(lookup(&index, "custom", "zai-org/glm-5.2"), vec![EffortLevel::High, EffortLevel::Max]);
+        assert_eq!(
+            lookup(&index, "custom", "zai-org/glm-5.2"),
+            vec![EffortLevel::High, EffortLevel::Max]
+        );
         // canonical labs win over aggregator duplicates
         assert_eq!(lookup(&index, "custom", "gpt-5.5")[0], EffortLevel::None);
     }
@@ -325,7 +345,10 @@ mod tests {
     fn effort_level_serde_uses_models_dev_values() {
         let level: EffortLevel = serde_json::from_value(json!("xhigh")).unwrap();
         assert_eq!(level, EffortLevel::XHigh);
-        assert_eq!(serde_json::to_value(EffortLevel::Max).unwrap(), json!("max"));
+        assert_eq!(
+            serde_json::to_value(EffortLevel::Max).unwrap(),
+            json!("max")
+        );
         assert!(serde_json::from_value::<EffortLevel>(json!("bogus")).is_err());
     }
 
@@ -334,6 +357,9 @@ mod tests {
         let index = fixture();
         let json = serde_json::to_string(&index).unwrap();
         let back: Index = serde_json::from_str(&json).unwrap();
-        assert_eq!(lookup(&back, "zai", "glm-5.3"), lookup(&index, "zai", "glm-5.3"));
+        assert_eq!(
+            lookup(&back, "zai", "glm-5.3"),
+            lookup(&index, "zai", "glm-5.3")
+        );
     }
 }

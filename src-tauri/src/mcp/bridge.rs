@@ -5,11 +5,11 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use rmcp::ErrorData as McpError;
 use rmcp::model::{
     CreateMessageRequestParams, CreateMessageResult, ElicitRequestParams, ElicitResult,
     ElicitationAction, Role, SamplingMessage, SamplingMessageContentBlock,
 };
+use rmcp::ErrorData as McpError;
 use tokio::sync::oneshot;
 
 use crate::config::{ApprovalMode, SamplingMode, Store};
@@ -132,7 +132,10 @@ impl InteractiveBridge {
 
         let request_id = crate::config::Store::new_id();
         let (tx, rx) = oneshot::channel();
-        self.approvals.lock().unwrap().insert(request_id.clone(), tx);
+        self.approvals
+            .lock()
+            .unwrap()
+            .insert(request_id.clone(), tx);
         self.sink.emit(BackendEvent::ApprovalRequested {
             request_id: request_id.clone(),
             conversation_id: self.conversation_ctx_opt(),
@@ -168,12 +171,19 @@ impl InteractiveBridge {
     ) -> Result<ElicitResult, McpError> {
         let request_id = crate::config::Store::new_id();
         let (tx, rx) = oneshot::channel();
-        self.elicitations.lock().unwrap().insert(request_id.clone(), tx);
+        self.elicitations
+            .lock()
+            .unwrap()
+            .insert(request_id.clone(), tx);
 
         let (mode, message, schema, url) = match &request {
-            ElicitRequestParams::FormElicitationParams { message, requested_schema, .. } => {
-                let schema = serde_json::to_value(requested_schema)
-                    .unwrap_or(serde_json::json!({}));
+            ElicitRequestParams::FormElicitationParams {
+                message,
+                requested_schema,
+                ..
+            } => {
+                let schema =
+                    serde_json::to_value(requested_schema).unwrap_or(serde_json::json!({}));
                 ("form", message.clone(), Some(schema), None)
             }
             ElicitRequestParams::UrlElicitationParams { message, url, .. } => {
@@ -229,7 +239,10 @@ impl InteractiveBridge {
             SamplingMode::Ask => {
                 let request_id = crate::config::Store::new_id();
                 let (tx, rx) = oneshot::channel();
-                self.sampling_slots.lock().unwrap().insert(request_id.clone(), tx);
+                self.sampling_slots
+                    .lock()
+                    .unwrap()
+                    .insert(request_id.clone(), tx);
 
                 let messages: Vec<serde_json::Value> = params
                     .messages
@@ -276,7 +289,10 @@ impl InteractiveBridge {
             let text = sampling_message_text(m);
             match m.role {
                 Role::User => msgs.push(Msg::User { text }),
-                Role::Assistant => msgs.push(Msg::Assistant { text, tool_calls: Vec::new() }),
+                Role::Assistant => msgs.push(Msg::Assistant {
+                    text,
+                    tool_calls: Vec::new(),
+                }),
             }
         }
 
@@ -288,9 +304,7 @@ impl InteractiveBridge {
             effort: None,
         };
         let provider = backend.provider.clone();
-        let handle = tokio::spawn(async move {
-            provider.stream_chat(&msgs, &[], &opts, tx).await
-        });
+        let handle = tokio::spawn(async move { provider.stream_chat(&msgs, &[], &opts, tx).await });
         let mut text = String::new();
         while let Some(ev) = rx.recv().await {
             if let ProviderEvent::TextDelta(t) = ev {
@@ -353,9 +367,7 @@ fn sampling_message_text(m: &SamplingMessage) -> String {
             SamplingMessageContentBlock::Text(t) => Some(t.text.clone()),
             SamplingMessageContentBlock::Image(_) => Some("[image]".to_string()),
             SamplingMessageContentBlock::Audio(_) => Some("[audio]".to_string()),
-            SamplingMessageContentBlock::ToolUse(tu) => {
-                Some(format!("[tool call: {}]", tu.name))
-            }
+            SamplingMessageContentBlock::ToolUse(tu) => Some(format!("[tool call: {}]", tu.name)),
             SamplingMessageContentBlock::ToolResult(tr) => {
                 // best-effort: pull text out of the result content
                 let content = serde_json::to_value(&tr.content).unwrap_or_default();
@@ -373,10 +385,7 @@ fn sampling_message_text(m: &SamplingMessage) -> String {
 fn extract_text_from_json(v: &serde_json::Value) -> Option<String> {
     match v {
         serde_json::Value::Array(arr) => {
-            let texts: Vec<String> = arr
-                .iter()
-                .filter_map(extract_text_from_json)
-                .collect();
+            let texts: Vec<String> = arr.iter().filter_map(extract_text_from_json).collect();
             if texts.is_empty() {
                 None
             } else {
@@ -402,7 +411,7 @@ mod tests {
 
     fn bridge() -> Arc<InteractiveBridge> {
         let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::new(tmp.path()).unwrap());
+        let store = Arc::new(Store::new(tmp.path(), tmp.path().to_path_buf()).unwrap());
         // keep the tempdir alive by leaking in test scope
         std::mem::forget(tmp);
         Arc::new(InteractiveBridge::new(
@@ -415,14 +424,20 @@ mod tests {
     async fn approval_roundtrip() {
         let sink = Arc::new(CollectingSink::default());
         let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::new(tmp.path()).unwrap());
+        let store = Arc::new(Store::new(tmp.path(), tmp.path().to_path_buf()).unwrap());
         std::mem::forget(tmp);
         let b = Arc::new(InteractiveBridge::new(sink.clone(), store));
 
         let b2 = b.clone();
         let handle = tokio::spawn(async move {
-            b2.request_approval("srv", "Server", "read_file", &serde_json::json!({"p": 1}), None)
-                .await
+            b2.request_approval(
+                "srv",
+                "Server",
+                "read_file",
+                &serde_json::json!({"p": 1}),
+                None,
+            )
+            .await
         });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
