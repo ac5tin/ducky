@@ -546,14 +546,48 @@ impl Store {
             Secrets::default()
         };
 
-        Ok(Self {
+        let store = Self {
             config_path,
             secrets_path,
             conversations_dir,
             home_dir,
             config: Mutex::new(config),
             secrets: Mutex::new(secrets),
-        })
+        };
+        store.hydrate_empty_titles()?;
+        Ok(store)
+    }
+
+    fn hydrate_empty_titles(&self) -> anyhow::Result<()> {
+        let mut dirty = false;
+        {
+            let mut cfg = self.config.lock().unwrap();
+            for c in &mut cfg.conversations {
+                if !c.title.is_empty() {
+                    continue;
+                }
+                let Ok(raw) = std::fs::read_to_string(self.conversation_path(&c.id)) else {
+                    continue;
+                };
+                let Ok(payload) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                    continue;
+                };
+                let Some(title) = payload
+                    .get("meta")
+                    .and_then(|m| m.get("title"))
+                    .and_then(|t| t.as_str())
+                    .filter(|t| !t.is_empty())
+                else {
+                    continue;
+                };
+                c.title = title.to_string();
+                dirty = true;
+            }
+        }
+        if dirty {
+            self.save_config()?;
+        }
+        Ok(())
     }
 
     pub fn save_config(&self) -> anyhow::Result<()> {
@@ -654,6 +688,13 @@ impl Store {
             &self.conversation_path(&meta.id),
             &serde_json::to_string_pretty(&payload)?,
         )?;
+        {
+            let mut cfg = self.config.lock().unwrap();
+            if let Some(existing) = cfg.conversations.iter_mut().find(|c| c.id == meta.id) {
+                *existing = meta.clone();
+            }
+        }
+        self.save_config()?;
         Ok(())
     }
 
@@ -870,6 +911,65 @@ mod tests {
         assert_eq!(msgs2.len(), 1);
         store.delete_conversation("abc-123").unwrap();
         assert!(store.load_conversation("abc-123").is_none());
+    }
+
+    #[test]
+    fn save_conversation_writes_title_into_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(tmp.path(), tmp.path().to_path_buf()).unwrap();
+        let mut meta = ConversationMeta {
+            id: "abc-123".into(),
+            title: String::new(),
+            provider_id: "p".into(),
+            model: "m".into(),
+            effort: None,
+            created_at: "t".into(),
+            updated_at: "t".into(),
+        };
+        store
+            .config
+            .lock()
+            .unwrap()
+            .conversations
+            .push(meta.clone());
+        store.save_config().unwrap();
+        meta.title = "Hi".into();
+        store.save_conversation(&meta, &[]).unwrap();
+        let store2 = Store::new(tmp.path(), tmp.path().to_path_buf()).unwrap();
+        assert_eq!(store2.config.lock().unwrap().conversations[0].title, "Hi");
+    }
+
+    #[test]
+    fn store_new_hydrates_empty_title_from_transcript() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(tmp.path(), tmp.path().to_path_buf()).unwrap();
+        let meta = ConversationMeta {
+            id: "abc-123".into(),
+            title: "Hi".into(),
+            provider_id: "p".into(),
+            model: "m".into(),
+            effort: None,
+            created_at: "t".into(),
+            updated_at: "t".into(),
+        };
+        store
+            .config
+            .lock()
+            .unwrap()
+            .conversations
+            .push(ConversationMeta {
+                title: String::new(),
+                ..meta.clone()
+            });
+        store.save_config().unwrap();
+        store.save_conversation(&meta, &[]).unwrap();
+        {
+            let mut cfg = store.config.lock().unwrap();
+            cfg.conversations[0].title.clear();
+        }
+        store.save_config().unwrap();
+        let store2 = Store::new(tmp.path(), tmp.path().to_path_buf()).unwrap();
+        assert_eq!(store2.config.lock().unwrap().conversations[0].title, "Hi");
     }
 
     #[test]
