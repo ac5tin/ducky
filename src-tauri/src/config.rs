@@ -81,6 +81,7 @@ pub enum HttpAuth {
     /// A static bearer token supplied by the user.
     Bearer { token_ref: String },
     /// OAuth 2.1 (dynamic registration / PKCE) managed by Ducky.
+    #[serde(rename = "oauth")]
     OAuth,
 }
 
@@ -950,5 +951,15 @@ mod tests {
         assert_eq!(expand_tilde("~/notes", home), "/home/duck/notes");
         assert_eq!(expand_tilde("/plain/path", home), "/plain/path");
         assert_eq!(expand_tilde("~not-home", home), "~not-home");
+    }
+
+    #[test]
+    fn http_auth_oauth_wire_name_is_oauth() {
+        let v: HttpAuth = serde_json::from_str(r#"{"type":"oauth"}"#).unwrap();
+        assert!(matches!(v, HttpAuth::OAuth));
+        assert_eq!(
+            serde_json::to_value(HttpAuth::OAuth).unwrap(),
+            serde_json::json!({"type": "oauth"})
+        );
     }
 }

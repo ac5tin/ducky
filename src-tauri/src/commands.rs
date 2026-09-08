@@ -607,7 +607,10 @@ pub fn terminal_resize(
 /// Kill the conversation's terminal. Its exit is reported asynchronously via
 /// `terminal_closed`; the entry is removed by the waiter thread.
 #[tauri::command]
-pub fn terminal_close(state: State<'_, Arc<AppState>>, conversation_id: String) -> Result<(), String> {
+pub fn terminal_close(
+    state: State<'_, Arc<AppState>>,
+    conversation_id: String,
+) -> Result<(), String> {
     let session = state
         .terminals
         .lock()
@@ -760,6 +763,24 @@ pub async fn mcp_remove(state: State<'_, Arc<AppState>>, id: String) -> Result<(
         let mut c = state.store.config.lock().unwrap();
         c.mcp_servers.retain(|s| s.id != id);
     }
+    state
+        .store
+        .set_oauth_tokens(&id, None)
+        .map_err(|e| e.to_string())?;
+    state
+        .store
+        .set_oauth_client_secret(&id, None)
+        .map_err(|e| e.to_string())?;
+    {
+        state
+            .store
+            .secrets
+            .lock()
+            .unwrap()
+            .server_tokens
+            .remove(&id);
+    }
+    state.store.save_secrets().map_err(|e| e.to_string())?;
     state.store.save_config().map_err(|e| e.to_string())
 }
 

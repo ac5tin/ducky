@@ -233,11 +233,15 @@ pub async fn refresh_now(
         McpTransport::Http { url, .. } => url.clone(),
         _ => return Ok(()),
     };
-    let resource = canonical_resource(&mcp_url)
-        .map_err(|e| AuthFailure::Transient(e.to_string()))?;
-    let meta = discover_auth_server(&mcp_url, &tokens.issuer).await.map_err(|e| {
-        AuthFailure::Transient(format!("Reconnecting to the authorization server failed: {e}"))
-    })?;
+    let resource =
+        canonical_resource(&mcp_url).map_err(|e| AuthFailure::Transient(e.to_string()))?;
+    let meta = discover_auth_server(&mcp_url, &tokens.issuer)
+        .await
+        .map_err(|e| {
+            AuthFailure::Transient(format!(
+                "Reconnecting to the authorization server failed: {e}"
+            ))
+        })?;
 
     let Some(token_endpoint) = meta.token_endpoint.clone() else {
         return Err(AuthFailure::Transient(
@@ -284,7 +288,7 @@ pub async fn refresh_now(
         refresh_token: granted.refresh_token.or(Some(refresh_token)),
         expires_at_ms: granted
             .expires_in
-            .map(|s| chrono::Utc::now().timestamp_millis() + (s as i64 - 30) * 1000),
+            .map(|s| chrono::Utc::now().timestamp_millis() + (s - 30) * 1000),
         client_id: tokens.client_id.clone(),
         issuer: tokens.issuer.clone(),
         scopes: granted
@@ -337,7 +341,18 @@ pub async fn login(
         .clone()
         .ok_or("Authorization server has no token endpoint")?;
 
-    // 3. Obtain a client id (pre-registered or dynamic registration).
+    // 3. Bind first so dynamic registration sees the real loopback port
+    // (0 = OS-assigned).
+    let port = redirect_port(&cfg);
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .map_err(|e| {
+            format!("Could not listen on 127.0.0.1:{port} for the OAuth callback: {e}.")
+        })?;
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    let redirect_uri = format!("http://127.0.0.1:{port}/callback");
+
+    // 4. Obtain a client id (pre-registered or dynamic registration).
     let client_id = match &cfg.oauth_client_id {
         Some(id) => id.clone(),
         None => {
@@ -346,24 +361,9 @@ pub async fn login(
                      connector's advanced settings)"
                     .to_string()
             })?;
-            dynamic_register(&endpoint, redirect_port(&cfg)?).await?
+            dynamic_register(&endpoint, port).await?
         }
     };
-
-    // 4. Bind the loopback listener before starting the browser flow.
-    let port = redirect_port(&cfg)?;
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-        .await
-        .map_err(|e| {
-            format!(
-                "Could not listen on 127.0.0.1:{port} for the OAuth callback: {e}. \
-                 Try setting a different callback port in advanced settings."
-            )
-        })?;
-    let redirect_uri = format!(
-        "http://127.0.0.1:{}/callback",
-        listener.local_addr().map_err(|e| e.to_string())?.port()
-    );
 
     // 5. PKCE + state.
     let mut verifier_bytes = [0u8; 48];
@@ -453,7 +453,7 @@ pub async fn login(
         refresh_token: granted.refresh_token,
         expires_at_ms: granted
             .expires_in
-            .map(|s| chrono::Utc::now().timestamp_millis() + (s as i64 - 30) * 1000),
+            .map(|s| chrono::Utc::now().timestamp_millis() + (s - 30) * 1000),
         client_id,
         issuer: iss.unwrap_or(meta.issuer.clone()),
         scopes: granted
@@ -495,12 +495,8 @@ struct TokenResponse {
     scope: Option<String>,
 }
 
-fn redirect_port(cfg: &McpServerConfig) -> Result<u16, String> {
-    cfg.oauth_redirect_port.ok_or_else(|| {
-        "No callback port configured. Set one in the connector's advanced settings \
-         (any free port on 127.0.0.1)."
-            .to_string()
-    })
+fn redirect_port(cfg: &McpServerConfig) -> u16 {
+    cfg.oauth_redirect_port.unwrap_or(0)
 }
 
 /// Fetch Protected Resource Metadata for the MCP server, following the
@@ -740,8 +736,7 @@ fn is_definitive_rejection(status: reqwest::StatusCode, error_code: Option<&str>
         // rejection status is definitive (token endpoints normally answer 400,
         // and a 5xx is never the user's fault).
         _ => {
-            status == reqwest::StatusCode::UNAUTHORIZED
-                || status == reqwest::StatusCode::FORBIDDEN
+            status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN
         }
     }
 }
@@ -750,8 +745,7 @@ fn reauth_message(code: Option<&str>) -> String {
     match code {
         Some("invalid_grant") => "Your session expired — sign in again".to_string(),
         Some("invalid_client") => {
-            "This app is no longer registered with the server's sign-in — sign in again"
-                .to_string()
+            "This app is no longer registered with the server's sign-in — sign in again".to_string()
         }
         Some("invalid_scope") => {
             "The server needs different permissions — sign in again to grant them".to_string()
@@ -835,15 +829,28 @@ mod tests {
     fn classifies_token_errors() {
         use reqwest::StatusCode;
         // Definitive rejections: full re-authorization required.
-        assert!(is_definitive_rejection(StatusCode::BAD_REQUEST, Some("invalid_grant")));
-        assert!(is_definitive_rejection(StatusCode::BAD_REQUEST, Some("invalid_client")));
-        assert!(is_definitive_rejection(StatusCode::BAD_REQUEST, Some("invalid_scope")));
+        assert!(is_definitive_rejection(
+            StatusCode::BAD_REQUEST,
+            Some("invalid_grant")
+        ));
+        assert!(is_definitive_rejection(
+            StatusCode::BAD_REQUEST,
+            Some("invalid_client")
+        ));
+        assert!(is_definitive_rejection(
+            StatusCode::BAD_REQUEST,
+            Some("invalid_scope")
+        ));
         assert!(is_definitive_rejection(StatusCode::UNAUTHORIZED, None));
         // Transient: tokens must survive these.
-        assert!(!is_definitive_rejection(StatusCode::BAD_REQUEST, Some("slow_down")));
-        assert!(
-            !is_definitive_rejection(StatusCode::BAD_REQUEST, Some("temporarily_unavailable"))
-        );
+        assert!(!is_definitive_rejection(
+            StatusCode::BAD_REQUEST,
+            Some("slow_down")
+        ));
+        assert!(!is_definitive_rejection(
+            StatusCode::BAD_REQUEST,
+            Some("temporarily_unavailable")
+        ));
         assert!(!is_definitive_rejection(StatusCode::BAD_REQUEST, None));
         assert!(!is_definitive_rejection(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -854,10 +861,33 @@ mod tests {
     #[test]
     fn reads_token_error_codes() {
         assert_eq!(
-            token_error_code(r#"{"error":"invalid_grant","error_description":"expired"}"#).as_deref(),
+            token_error_code(r#"{"error":"invalid_grant","error_description":"expired"}"#)
+                .as_deref(),
             Some("invalid_grant")
         );
         assert_eq!(token_error_code("not json"), None);
         assert_eq!(token_error_code(r#"{"error":42}"#), None);
+    }
+
+    #[test]
+    fn callback_port_defaults_to_ephemeral() {
+        let cfg = McpServerConfig {
+            id: "s".into(),
+            name: "s".into(),
+            transport: McpTransport::Http {
+                url: "https://example.com/mcp".into(),
+                headers: HashMap::new(),
+            },
+            auth: HttpAuth::OAuth,
+            enabled: true,
+            auto_start: true,
+            oauth_client_id: None,
+            oauth_redirect_port: None,
+            created_at: "t".into(),
+        };
+        assert_eq!(redirect_port(&cfg), 0);
+        let mut cfg = cfg;
+        cfg.oauth_redirect_port = Some(6274);
+        assert_eq!(redirect_port(&cfg), 6274);
     }
 }
