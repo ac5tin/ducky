@@ -31,6 +31,8 @@ pub struct AppState {
     pub catalog: crate::catalog::Catalog,
     /// Cancellation tokens for conversations that are generating.
     pub runtimes: Mutex<HashMap<String, Arc<ConversationRuntime>>>,
+    /// Per-conversation PTY terminals (one shell per chat session).
+    pub terminals: crate::terminal::TerminalMap,
 }
 
 impl AppState {
@@ -56,6 +58,7 @@ impl AppState {
             agent,
             catalog,
             runtimes: Mutex::new(HashMap::new()),
+            terminals: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 }

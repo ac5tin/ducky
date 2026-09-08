@@ -310,6 +310,9 @@ pub struct Secrets {
     /// server id -> OAuth token set
     #[serde(default)]
     pub oauth_tokens: HashMap<String, OAuthTokens>,
+    /// server id -> pre-registered OAuth client secret (confidential clients)
+    #[serde(default)]
+    pub oauth_client_secrets: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -600,6 +603,29 @@ impl Store {
             }
             None => {
                 s.oauth_tokens.remove(id);
+            }
+        }
+        drop(s);
+        self.save_secrets()
+    }
+
+    pub fn oauth_client_secret(&self, id: &str) -> Option<String> {
+        self.secrets
+            .lock()
+            .unwrap()
+            .oauth_client_secrets
+            .get(id)
+            .cloned()
+    }
+
+    pub fn set_oauth_client_secret(&self, id: &str, secret: Option<&str>) -> anyhow::Result<()> {
+        let mut s = self.secrets.lock().unwrap();
+        match secret {
+            Some(k) if !k.is_empty() => {
+                s.oauth_client_secrets.insert(id.to_string(), k.to_string());
+            }
+            _ => {
+                s.oauth_client_secrets.remove(id);
             }
         }
         drop(s);

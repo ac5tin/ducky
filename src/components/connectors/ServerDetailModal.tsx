@@ -19,6 +19,8 @@ export function ServerDetailModal({
   const [tab, setTab] = useState<Tab>("tools");
   const [resourceText, setResourceText] = useState<{ uri: string; text: string } | null>(null);
   const [promptResult, setPromptResult] = useState<string | null>(null);
+  const [auth, setAuth] = useState<string | null>(null);
+  const [authBusy, setAuthBusy] = useState(false);
   const summary = servers.find((s) => s.id === serverId) ?? null;
 
   useEffect(() => {
@@ -26,6 +28,8 @@ export function ServerDetailModal({
     setTab("tools");
     setResourceText(null);
     setPromptResult(null);
+    setAuth(null);
+    api.mcpHasAuth(serverId).then(setAuth).catch(() => {});
   }, [serverId]);
 
   if (!serverId || !summary) return null;
@@ -33,6 +37,52 @@ export function ServerDetailModal({
   const st = summary.status;
   const statusKind =
     st === "connected" ? "connected" : typeof st === "object" ? ("needs_auth" in st ? "needs_auth" : "error") : st;
+  const needsAuth = typeof st === "object" && "needs_auth" in st;
+  const authReason = needsAuth ? (st.needs_auth.reason ?? "missing") : null;
+  const authText =
+    auth === "oauth"
+      ? "Signed in with OAuth"
+      : auth === "oauth_missing"
+        ? "Not signed in (OAuth)"
+        : auth === "bearer"
+          ? "Bearer token set"
+          : auth === "bearer_missing"
+            ? "Bearer token missing"
+            : "No authentication";
+
+  const refetchAuth = () => {
+    if (!serverId) return;
+    api.mcpHasAuth(serverId).then(setAuth).catch(() => {});
+  };
+
+  const signIn = async () => {
+    if (!serverId) return;
+    setAuthBusy(true);
+    try {
+      await api.mcpOauthLogin(serverId);
+      await refreshServer(serverId).catch(() => {});
+    } catch (e) {
+      toast("error", `${e}`);
+    } finally {
+      setAuthBusy(false);
+      refetchAuth();
+    }
+  };
+
+  const signOut = async () => {
+    if (!serverId) return;
+    setAuthBusy(true);
+    try {
+      await api.mcpOauthLogout(serverId);
+      await api.mcpDisconnect(serverId);
+      await refreshServer(serverId).catch(() => {});
+    } catch (e) {
+      toast("error", `${e}`);
+    } finally {
+      setAuthBusy(false);
+      refetchAuth();
+    }
+  };
 
   const refresh = async () => {
     try {
@@ -227,6 +277,39 @@ export function ServerDetailModal({
 
       {tab === "info" && (
         <div className="space-y-3 text-sm">
+          {summary.transport_kind === "http" && (
+            <div className="rounded-xl bg-slate-50 p-3 dark:bg-slate-800">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+                    Authentication
+                  </div>
+                  <div className="mt-0.5 text-xs">{authText}</div>
+                  {needsAuth && st.needs_auth.detail && (
+                    <p className="mt-1 text-xs leading-relaxed text-slate-500 dark:text-slate-400">
+                      {st.needs_auth.detail}
+                    </p>
+                  )}
+                </div>
+                <div className="flex shrink-0 items-center gap-1.5">
+                  {(needsAuth || auth === "oauth_missing") && (
+                    <Button variant="primary" disabled={authBusy} onClick={signIn}>
+                      {authBusy
+                        ? "Waiting for sign-in…"
+                        : authReason === "missing"
+                          ? "Sign in"
+                          : "Re-authenticate"}
+                    </Button>
+                  )}
+                  {auth === "oauth" && (
+                    <Button variant="secondary" disabled={authBusy} onClick={signOut}>
+                      Sign out
+                    </Button>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
           <InfoRow label="Status" value={statusKind} />
           <InfoRow label="Protocol version" value={summary.protocol_version ?? "—"} />
           <InfoRow

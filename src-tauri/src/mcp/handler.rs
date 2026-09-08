@@ -6,10 +6,10 @@ use std::sync::Arc;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
     ClientCapabilities, ClientInfo, CreateMessageRequestParams, CreateMessageResult,
-    ElicitRequestParams, ElicitResult, ElicitationCapability, FormElicitationCapability,
-    Implementation, ListRootsResult, LoggingMessageNotificationParam, NumberOrString,
-    ProgressNotificationParam, ProgressToken, ResourceUpdatedNotificationParam, Root,
-    RootsCapabilities, SamplingCapability, UrlElicitationCapability,
+    ElicitRequestParams, ElicitResult, ElicitationCapability, ExtensionCapabilities,
+    FormElicitationCapability, Implementation, ListRootsResult, LoggingMessageNotificationParam,
+    NumberOrString, ProgressNotificationParam, ProgressToken, ResourceUpdatedNotificationParam,
+    Root, RootsCapabilities, SamplingCapability, UrlElicitationCapability,
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleClient};
 use rmcp::ErrorData as McpError;
@@ -139,6 +139,14 @@ impl ClientHandler for DuckyClientHandler {
         elicitation.form = Some(FormElicitationCapability::default());
         elicitation.url = Some(UrlElicitationCapability::default());
         capabilities.elicitation = Some(elicitation);
+
+        // Opt in to the official tasks extension (SEP-2663): tools may return
+        // task handles that Ducky polls via tasks/get.
+        let mut extensions = ExtensionCapabilities::new();
+        if let Ok(tasks) = serde_json::from_value(serde_json::json!({})) {
+            extensions.insert("io.modelcontextprotocol/tasks".to_string(), tasks);
+        }
+        capabilities.extensions = Some(extensions);
 
         ClientInfo::new(
             capabilities,

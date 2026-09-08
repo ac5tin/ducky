@@ -7,10 +7,22 @@ import { Icon, StatusDot } from "../icons";
 import { AddConnectorModal } from "./AddConnectorModal";
 import { ServerDetailModal } from "./ServerDetailModal";
 
+function authReason(s: ServerSummary["status"]): "missing" | "expired" | "scope" | null {
+  return typeof s === "object" && "needs_auth" in s ? (s.needs_auth.reason ?? "missing") : null;
+}
+
 function statusLabel(s: ServerSummary["status"]): { text: string; kind: string } {
   if (s === "connected") return { text: "Connected", kind: "connected" };
   if (s === "connecting") return { text: "Connecting…", kind: "connecting" };
-  if (typeof s === "object" && "needs_auth" in s) return { text: "Sign in required", kind: "needs_auth" };
+  if (typeof s === "object" && "needs_auth" in s) {
+    const text =
+      s.needs_auth.reason === "expired"
+        ? "Session expired"
+        : s.needs_auth.reason === "scope"
+          ? "Additional permission needed"
+          : "Sign in required";
+    return { text, kind: "needs_auth" };
+  }
   if (typeof s === "object" && "error" in s) return { text: "Error", kind: "error" };
   return { text: "Disconnected", kind: "disconnected" };
 }
@@ -48,9 +60,10 @@ export function ConnectorsView() {
 
   const signIn = async (s: ServerSummary) => {
     try {
-      await api.mcpOauthLogin(s.id);
       toast("info", "Complete the sign-in in your browser — Ducky will reconnect.");
-      setTimeout(() => refreshServers().catch(() => {}), 3000);
+      await api.mcpOauthLogin(s.id);
+      await refreshServers();
+      toast("success", `${s.name} is signed in and reconnected.`);
     } catch (e) {
       toast("error", `${e}`);
     }
@@ -122,7 +135,7 @@ export function ConnectorsView() {
                 <div className="flex shrink-0 items-center gap-1.5">
                   {needsAuth && s.enabled && (
                     <Button variant="primary" onClick={() => signIn(s)}>
-                      Sign in
+                      {authReason(s.status) === "missing" ? "Sign in" : "Re-authenticate"}
                     </Button>
                   )}
                   {!needsAuth && s.enabled && (

@@ -381,6 +381,10 @@ pub fn conversation_create(
 
 #[tauri::command]
 pub fn conversation_delete(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
+    // drop any live terminal with the conversation
+    if let Some(session) = state.terminals.lock().unwrap().get(&id).cloned() {
+        session.kill();
+    }
     state
         .store
         .delete_conversation(&id)
@@ -523,6 +527,96 @@ pub fn chat_cancel(state: State<'_, Arc<AppState>>, conversation_id: String) {
         rt.ct.cancel();
     }
     state.bridge.cancel_for_conversation(&conversation_id);
+}
+
+// ---------------------------------------------------------------------------
+// Per-conversation terminal
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct TerminalCreated {
+    /// Always true on success; exists so the UI can distinguish a fresh spawn
+    /// from a reattach without extra commands.
+    pub running: bool,
+    /// Base64 of buffered output since the session started ("" when fresh).
+    pub scrollback: String,
+    /// Live `terminal_output` events with `seq <` this are already contained
+    /// in `scrollback` and must not be written to the emulator again.
+    pub last_seq: u64,
+}
+
+/// Attach to the conversation's terminal, spawning a login shell in the
+/// app's working directory if none is running yet.
+#[tauri::command]
+pub fn terminal_create(
+    state: State<'_, Arc<AppState>>,
+    conversation_id: String,
+) -> Result<TerminalCreated, String> {
+    let cwd = {
+        let c = state.store.config.lock().unwrap();
+        c.settings.effective_working_dir(&state.store.home_dir)
+    };
+    let session = crate::terminal::get_or_spawn(
+        &conversation_id,
+        &cwd,
+        state.sink.clone(),
+        state.terminals.clone(),
+    )?;
+    use base64::Engine as _;
+    let (bytes, last_seq) = session.snapshot();
+    Ok(TerminalCreated {
+        running: true,
+        scrollback: base64::engine::general_purpose::STANDARD.encode(bytes),
+        last_seq,
+    })
+}
+
+#[tauri::command]
+pub fn terminal_write(
+    state: State<'_, Arc<AppState>>,
+    conversation_id: String,
+    data: String,
+) -> Result<(), String> {
+    let session = state
+        .terminals
+        .lock()
+        .unwrap()
+        .get(&conversation_id)
+        .cloned()
+        .ok_or("No terminal running for this conversation")?;
+    session.write(&data)
+}
+
+#[tauri::command]
+pub fn terminal_resize(
+    state: State<'_, Arc<AppState>>,
+    conversation_id: String,
+    cols: u16,
+    rows: u16,
+) -> Result<(), String> {
+    let session = state
+        .terminals
+        .lock()
+        .unwrap()
+        .get(&conversation_id)
+        .cloned()
+        .ok_or("No terminal running for this conversation")?;
+    session.resize(cols, rows)
+}
+
+/// Kill the conversation's terminal. Its exit is reported asynchronously via
+/// `terminal_closed`; the entry is removed by the waiter thread.
+#[tauri::command]
+pub fn terminal_close(state: State<'_, Arc<AppState>>, conversation_id: String) -> Result<(), String> {
+    let session = state
+        .terminals
+        .lock()
+        .unwrap()
+        .get(&conversation_id)
+        .cloned()
+        .ok_or("No terminal running for this conversation")?;
+    session.kill();
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -835,7 +929,12 @@ pub async fn mcp_oauth_login(
     state: State<'_, Arc<AppState>>,
     id: String,
 ) -> Result<(), String> {
-    crate::oauth::login(app, state.store.clone(), state.sink.clone(), id).await
+    crate::oauth::login(app, state.store.clone(), state.sink.clone(), id.clone()).await?;
+    // Sign-in succeeded: wake any chat tool calls waiting for auth, then
+    // (re)connect the server. Status events drive the UI from here.
+    state.manager.notify_auth_completed(&id);
+    let _ = state.manager.connect(&id).await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -890,6 +989,7 @@ pub fn mcp_set_oauth_config(
     state: State<'_, Arc<AppState>>,
     id: String,
     client_id: Option<String>,
+    client_secret: Option<String>,
     redirect_port: Option<u16>,
 ) -> Result<(), String> {
     {
@@ -904,7 +1004,16 @@ pub fn mcp_set_oauth_config(
         };
         s.oauth_redirect_port = redirect_port;
     }
-    state.store.save_config().map_err(|e| e.to_string())
+    state
+        .store
+        .set_oauth_client_secret(
+            &id,
+            client_secret
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty()),
+        )
+        .map_err(|e| e.to_string())
 }
 
 // App version for the About panel

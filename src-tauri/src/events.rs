@@ -72,11 +72,14 @@ pub enum BackendEvent {
         messages: Vec<serde_json::Value>,
         max_tokens: Option<u32>,
     },
-    /// Connection state of an MCP server changed.
+    /// Connection state of an MCP server changed. For `needs_auth`, `reason`
+    /// is one of `missing | expired | scope`.
     ServerStatus {
         server_id: String,
         status: String,
         detail: Option<String>,
+        #[serde(default)]
+        reason: Option<String>,
     },
     /// Something on a server changed and lists should be refetched.
     ServerDataChanged { server_id: String, what: String },
@@ -88,8 +91,30 @@ pub enum BackendEvent {
         total: Option<f64>,
         message: Option<String>,
     },
+    /// Live status of a server-side task (MCP tasks extension). `status` is
+    /// one of `working | input_required | completed | failed | cancelled`.
+    TaskUpdate {
+        conversation_id: Option<String>,
+        tool_call_id: Option<String>,
+        task_id: String,
+        status: String,
+        status_message: Option<String>,
+    },
     /// A subscribed resource changed.
     ResourceUpdated { server_id: String, uri: String },
+    /// Raw PTY output for a conversation terminal, base64-encoded. `seq`
+    /// orders chunks within a session; output with `seq < last_seq` from
+    /// `terminal_create` is already contained in the returned scrollback.
+    TerminalOutput {
+        conversation_id: String,
+        data: String,
+        seq: u64,
+    },
+    /// The terminal's shell exited and its session was torn down.
+    TerminalClosed {
+        conversation_id: String,
+        exit_code: Option<i32>,
+    },
 }
 
 /// Abstraction over the Tauri event emitter so the MCP layer can be tested.

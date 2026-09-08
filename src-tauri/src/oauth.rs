@@ -9,7 +9,7 @@
 //! - Refresh-token handling
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use base64::Engine;
 use rand::RngCore;
@@ -17,7 +17,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::config::{McpServerConfig, McpTransport, OAuthTokens, Store};
+use crate::config::{HttpAuth, McpServerConfig, McpTransport, OAuthTokens, Store};
 
 // ---------------------------------------------------------------------------
 // Metadata documents
@@ -77,51 +77,208 @@ fn canonical_resource(url: &str) -> anyhow::Result<String> {
 // Entry points
 // ---------------------------------------------------------------------------
 
-/// Refresh the stored access token if it is expired. Returns Err when the
-/// user must sign in again.
-pub async fn ensure_fresh_token(store: &Arc<Store>, cfg: &McpServerConfig) -> Result<(), String> {
-    let Some(tokens) = store.oauth_tokens(&cfg.id) else {
-        return Err("Not signed in".to_string());
-    };
-    let fresh = tokens
+/// Why an OAuth session cannot be used right now.
+#[derive(Debug, Clone)]
+pub enum AuthFailure {
+    /// The user must (re-)authorize in the browser. Per the MCP authorization
+    /// spec, an invalid or expired refresh token requires restarting the full
+    /// authorization flow. Stored tokens, if any, have been cleared.
+    ReauthRequired(String),
+    /// A temporary failure (network, server 5xx, throttling). Tokens were
+    /// kept; the caller may retry later.
+    Transient(String),
+}
+
+impl std::fmt::Display for AuthFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReauthRequired(m) | Self::Transient(m) => write!(f, "{m}"),
+        }
+    }
+}
+
+/// Per-server refresh mutex so concurrent 401s share one refresh round-trip
+/// instead of racing refresh-token rotation against the token endpoint.
+fn refresh_guard(server_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static GUARDS: std::sync::OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+        std::sync::OnceLock::new();
+    let map = GUARDS.get_or_init(|| Mutex::new(HashMap::new()));
+    map.lock()
+        .unwrap()
+        .entry(server_id.to_string())
+        .or_default()
+        .clone()
+}
+
+fn token_is_fresh(tokens: &OAuthTokens) -> bool {
+    tokens
         .expires_at_ms
         .map(|exp| exp > chrono::Utc::now().timestamp_millis() + 60_000)
-        .unwrap_or(true);
-    if fresh {
+        .unwrap_or(true)
+}
+
+/// True when the token expires within `lead_ms` (or has unknown expiry).
+fn token_expires_within(tokens: &OAuthTokens, lead_ms: i64) -> bool {
+    tokens
+        .expires_at_ms
+        .map(|exp| exp <= chrono::Utc::now().timestamp_millis() + lead_ms)
+        .unwrap_or(true)
+}
+
+/// Keep stored OAuth tokens fresh: refresh anything close to expiry so
+/// long-lived sessions never send a stale token. Runs for the process
+/// lifetime.
+pub async fn refresh_loop(manager: Arc<crate::mcp::manager::McpManager>) {
+    let store = manager.store().clone();
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        let candidates: Vec<McpServerConfig> = {
+            let cfg = store.config.lock().unwrap();
+            cfg.mcp_servers
+                .iter()
+                .filter(|s| {
+                    s.enabled
+                        && matches!(s.transport, McpTransport::Http { .. })
+                        && matches!(s.auth, HttpAuth::OAuth)
+                })
+                .cloned()
+                .collect()
+        };
+        for cfg in candidates {
+            use crate::mcp::manager::ServerStatus;
+            if matches!(manager.status(&cfg.id), ServerStatus::NeedsAuth { .. }) {
+                // Waiting on the user; stop hammering the token endpoint.
+                continue;
+            }
+            let Some(tokens) = store.oauth_tokens(&cfg.id) else {
+                continue;
+            };
+            if !token_expires_within(&tokens, 5 * 60_000) {
+                continue;
+            }
+            match refresh_now(&store, &cfg, &tokens).await {
+                Ok(()) => {}
+                Err(AuthFailure::ReauthRequired(detail)) => {
+                    manager.mark_needs_auth(
+                        &cfg.id,
+                        crate::mcp::manager::AuthReason::Expired,
+                        Some(detail),
+                    );
+                }
+                Err(AuthFailure::Transient(e)) => {
+                    tracing::warn!(
+                        server = %cfg.name,
+                        "background token refresh failed: {e}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Refresh the stored access token if it is (nearly) expired. Returns
+/// `AuthFailure::ReauthRequired` when the user must sign in again and
+/// `AuthFailure::Transient` for retryable failures.
+pub async fn ensure_fresh_token(
+    store: &Arc<Store>,
+    cfg: &McpServerConfig,
+) -> Result<(), AuthFailure> {
+    let Some(tokens) = store.oauth_tokens(&cfg.id) else {
+        return Err(AuthFailure::ReauthRequired("Not signed in".to_string()));
+    };
+    if token_is_fresh(&tokens) {
         return Ok(());
     }
-    let Some(refresh_token) = tokens.refresh_token.clone() else {
-        return Err("Session expired — sign in again".to_string());
-    };
 
+    // Single-flight: waiters re-check the store afterwards because the winner
+    // publishes rotated tokens through the secrets store.
+    let guard = refresh_guard(&cfg.id);
+    let _held = guard.lock().await;
+    let Some(tokens) = store.oauth_tokens(&cfg.id) else {
+        return Err(AuthFailure::ReauthRequired("Not signed in".to_string()));
+    };
+    if token_is_fresh(&tokens) {
+        return Ok(());
+    }
+    refresh_now(store, cfg, &tokens).await
+}
+
+/// Unconditionally refresh the stored tokens. Used by the transport wrapper
+/// when the server has just rejected an access token (401) that may still
+/// look fresh locally.
+pub async fn refresh_now(
+    store: &Arc<Store>,
+    cfg: &McpServerConfig,
+    tokens: &OAuthTokens,
+) -> Result<(), AuthFailure> {
+    let guard = refresh_guard(&cfg.id);
+    let _held = guard.lock().await;
+
+    // Another refresh may have completed while waiting for the guard.
+    if let Some(current) = store.oauth_tokens(&cfg.id) {
+        if current.access_token != tokens.access_token {
+            return Ok(());
+        }
+    } else {
+        return Err(AuthFailure::ReauthRequired("Not signed in".to_string()));
+    }
+
+    let Some(refresh_token) = tokens.refresh_token.clone() else {
+        store.set_oauth_tokens(&cfg.id, None).ok();
+        return Err(AuthFailure::ReauthRequired(
+            "Session expired — sign in again".to_string(),
+        ));
+    };
     let mcp_url = match &cfg.transport {
         McpTransport::Http { url, .. } => url.clone(),
         _ => return Ok(()),
     };
-    let resource = canonical_resource(&mcp_url).map_err(|e| e.to_string())?;
-    let meta = discover_auth_server(&mcp_url, &tokens.issuer).await?;
+    let resource = canonical_resource(&mcp_url)
+        .map_err(|e| AuthFailure::Transient(e.to_string()))?;
+    let meta = discover_auth_server(&mcp_url, &tokens.issuer).await.map_err(|e| {
+        AuthFailure::Transient(format!("Reconnecting to the authorization server failed: {e}"))
+    })?;
 
     let Some(token_endpoint) = meta.token_endpoint.clone() else {
-        return Err("Authorization server has no token endpoint".into());
+        return Err(AuthFailure::Transient(
+            "Authorization server has no token endpoint".to_string(),
+        ));
     };
 
-    let params: HashMap<&str, &str> = HashMap::from([
+    let secret = store.oauth_client_secret(&cfg.id);
+    let mut params: HashMap<&str, &str> = HashMap::from([
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token.as_str()),
         ("client_id", tokens.client_id.as_str()),
         ("resource", resource.as_str()),
     ]);
+    if let Some(secret) = &secret {
+        params.insert("client_secret", secret.as_str());
+    }
     let response = client()
         .post(&token_endpoint)
         .form(&params)
         .send()
         .await
-        .map_err(|e| format!("Token refresh failed: {e}"))?;
+        .map_err(|e| AuthFailure::Transient(format!("Token refresh failed: {e}")))?;
+
     if !response.status().is_success() {
-        store.set_oauth_tokens(&cfg.id, None).ok();
-        return Err("Session expired — sign in again".to_string());
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        let code = token_error_code(&body);
+        if is_definitive_rejection(status, code.as_deref()) {
+            store.set_oauth_tokens(&cfg.id, None).ok();
+            return Err(AuthFailure::ReauthRequired(reauth_message(code.as_deref())));
+        }
+        return Err(AuthFailure::Transient(format!(
+            "Token refresh failed ({status}); Ducky will retry — {}",
+            truncate(&body, 160)
+        )));
     }
-    let granted: TokenResponse = response.json().await.map_err(|e| e.to_string())?;
+    let granted: TokenResponse = response
+        .json()
+        .await
+        .map_err(|e| AuthFailure::Transient(e.to_string()))?;
     let updated = OAuthTokens {
         access_token: granted.access_token,
         refresh_token: granted.refresh_token.or(Some(refresh_token)),
@@ -137,7 +294,7 @@ pub async fn ensure_fresh_token(store: &Arc<Store>, cfg: &McpServerConfig) -> Re
     };
     store
         .set_oauth_tokens(&cfg.id, Some(updated))
-        .map_err(|e| e.to_string())
+        .map_err(|e| AuthFailure::Transient(e.to_string()))
 }
 
 /// Run the full browser-based authorization flow for a server.
@@ -217,10 +374,29 @@ pub async fn login(
     let state = crate::config::Store::new_id();
     let resource = canonical_resource(&mcp_url).map_err(|e| e.to_string())?;
 
-    // scope selection: challenge scope first, else scopes_supported
-    let scope = scope
+    // scope selection: challenge scope first, else scopes_supported; add
+    // `offline_access` when the authorization server offers it so refresh
+    // tokens are issued where possible.
+    let mut scope = scope
         .or_else(|| prm.scopes_supported.clone().map(|s| s.join(" ")))
         .or_else(|| meta.scopes_supported.clone().map(|s| s.join(" ")));
+    if meta
+        .scopes_supported
+        .as_ref()
+        .is_some_and(|s| s.iter().any(|sc| sc == "offline_access"))
+    {
+        let has_it = scope
+            .as_deref()
+            .map(|s| s.split(' ').any(|sc| sc == "offline_access"))
+            .unwrap_or(false);
+        if !has_it {
+            scope = Some(match scope {
+                Some(s) => format!("{s} offline_access"),
+                None => "offline_access".to_string(),
+            });
+        }
+    }
+    let scope = scope;
 
     // 6. Open the browser.
     let mut auth_url = url::Url::parse(&authorization_endpoint).map_err(|e| e.to_string())?;
@@ -248,7 +424,8 @@ pub async fn login(
         .map_err(|e| format!("Authorization failed: {e}"))?;
 
     // 8. Exchange the code for tokens.
-    let params: HashMap<&str, &str> = HashMap::from([
+    let client_secret = store.oauth_client_secret(&server_id);
+    let mut params: HashMap<&str, &str> = HashMap::from([
         ("grant_type", "authorization_code"),
         ("code", code.as_str()),
         ("redirect_uri", redirect_uri.as_str()),
@@ -256,6 +433,9 @@ pub async fn login(
         ("code_verifier", verifier.as_str()),
         ("resource", resource.as_str()),
     ]);
+    if let Some(secret) = &client_secret {
+        params.insert("client_secret", secret.as_str());
+    }
     let response = client()
         .post(&token_endpoint)
         .form(&params)
@@ -289,6 +469,7 @@ pub async fn login(
         server_id,
         status: "connecting".into(),
         detail: None,
+        reason: None,
     });
     Ok(())
 }
@@ -536,6 +717,49 @@ async fn wait_for_callback(
 // Parsing helpers
 // ---------------------------------------------------------------------------
 
+/// Extract the `error` code from an RFC 6749 §5.2 token endpoint error body.
+fn token_error_code(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("error")?
+        .as_str()
+        .map(String::from)
+}
+
+/// True when the authorization server definitively rejected the client or the
+/// refresh token: the only remedy is a full re-authorization. Everything else
+/// (network hiccups, 5xx, throttling) is transient and must not clear tokens.
+fn is_definitive_rejection(status: reqwest::StatusCode, error_code: Option<&str>) -> bool {
+    match error_code {
+        Some("invalid_grant") | Some("invalid_client") | Some("invalid_scope") => true,
+        Some("temporarily_unavailable")
+        | Some("slow_down")
+        | Some("authorization_pending")
+        | Some("server_error") => false,
+        // Unknown codes and unparseable bodies: only an explicit client
+        // rejection status is definitive (token endpoints normally answer 400,
+        // and a 5xx is never the user's fault).
+        _ => {
+            status == reqwest::StatusCode::UNAUTHORIZED
+                || status == reqwest::StatusCode::FORBIDDEN
+        }
+    }
+}
+
+fn reauth_message(code: Option<&str>) -> String {
+    match code {
+        Some("invalid_grant") => "Your session expired — sign in again".to_string(),
+        Some("invalid_client") => {
+            "This app is no longer registered with the server's sign-in — sign in again"
+                .to_string()
+        }
+        Some("invalid_scope") => {
+            "The server needs different permissions — sign in again to grant them".to_string()
+        }
+        _ => "Sign in again".to_string(),
+    }
+}
+
 fn parse_www_authenticate_param(header: &str, name: &str) -> Option<String> {
     let idx = header.find(&format!("{name}="))?;
     let rest = header[idx + name.len() + 1..].trim_start();
@@ -605,5 +829,35 @@ mod tests {
         let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(Sha256::digest(verifier.as_bytes()));
         assert_eq!(challenge.len(), 43);
+    }
+
+    #[test]
+    fn classifies_token_errors() {
+        use reqwest::StatusCode;
+        // Definitive rejections: full re-authorization required.
+        assert!(is_definitive_rejection(StatusCode::BAD_REQUEST, Some("invalid_grant")));
+        assert!(is_definitive_rejection(StatusCode::BAD_REQUEST, Some("invalid_client")));
+        assert!(is_definitive_rejection(StatusCode::BAD_REQUEST, Some("invalid_scope")));
+        assert!(is_definitive_rejection(StatusCode::UNAUTHORIZED, None));
+        // Transient: tokens must survive these.
+        assert!(!is_definitive_rejection(StatusCode::BAD_REQUEST, Some("slow_down")));
+        assert!(
+            !is_definitive_rejection(StatusCode::BAD_REQUEST, Some("temporarily_unavailable"))
+        );
+        assert!(!is_definitive_rejection(StatusCode::BAD_REQUEST, None));
+        assert!(!is_definitive_rejection(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Some("invalid_request")
+        ));
+    }
+
+    #[test]
+    fn reads_token_error_codes() {
+        assert_eq!(
+            token_error_code(r#"{"error":"invalid_grant","error_description":"expired"}"#).as_deref(),
+            Some("invalid_grant")
+        );
+        assert_eq!(token_error_code("not json"), None);
+        assert_eq!(token_error_code(r#"{"error":42}"#), None);
     }
 }

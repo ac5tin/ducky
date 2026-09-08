@@ -5,12 +5,16 @@ import { Markdown } from "../Markdown";
 import { ToolCallCard } from "./ToolCallCard";
 import { ModelPicker } from "./ModelPicker";
 import { WorkingDirChip } from "./WorkingDirChip";
+import { TerminalPanel } from "./TerminalPanel";
 
 export function ChatView() {
   const items = useStore((s) => s.items);
   const streaming = useStore((s) => s.streaming);
   const activeId = useStore((s) => s.activeConversationId);
   const newConversation = useStore((s) => s.newConversation);
+  const toggleTerminal = useStore((s) => s.toggleTerminal);
+  const terminalOpen = useStore((s) => !!s.activeConversationId && s.terminalOpenIds.has(s.activeConversationId));
+  const terminalHeight = useStore((s) => s.terminalHeight);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [showJump, setShowJump] = useState(false);
 
@@ -35,6 +39,18 @@ export function ChatView() {
         <div className="flex min-w-0 items-center gap-1">
           <ModelPicker />
           <WorkingDirChip />
+          <button
+            className={`rounded-lg p-1.5 transition ${
+              terminalOpen
+                ? "bg-sky-50 text-sky-600 dark:bg-sky-950/60 dark:text-sky-400"
+                : "text-slate-400 hover:bg-slate-100 hover:text-slate-600 dark:hover:bg-slate-800 dark:hover:text-slate-300"
+            }`}
+            aria-label="Toggle terminal"
+            title="Toggle terminal"
+            onClick={() => toggleTerminal()}
+          >
+            <Icon name="terminal" className="h-4 w-4" />
+          </button>
         </div>
         {streaming && (
           <span className="flex items-center gap-1.5 text-xs text-slate-400">
@@ -62,7 +78,8 @@ export function ChatView() {
 
       {showJump && (
         <button
-          className="absolute bottom-28 right-6 rounded-full border border-slate-200 bg-white p-2 shadow-md transition hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-800"
+          className="absolute right-6 rounded-full border border-slate-200 bg-white p-2 shadow-md transition hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-800"
+          style={{ bottom: terminalOpen ? terminalHeight + 116 : 112 }}
           aria-label="Jump to latest"
           onClick={() => {
             const el = scrollRef.current;
@@ -72,6 +89,8 @@ export function ChatView() {
           <Icon name="chevron" className="h-4 w-4" />
         </button>
       )}
+
+      {terminalOpen && activeId && <TerminalPanel conversationId={activeId} />}
 
       <Composer />
     </div>

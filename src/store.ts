@@ -1,8 +1,10 @@
 // Global app store: state, backend event wiring, and actions.
 import { create } from "zustand";
 import * as api from "./api";
+import { dispatchTerminalEvent } from "./terminalBus";
 import type {
   AppConfig,
+  AuthReason,
   BackendEvent,
   ConnectorSuggestion,
   EffortLevel,
@@ -106,6 +108,11 @@ interface StoreState {
   streaming: boolean;
   busyConversationIds: Set<string>;
 
+  /** Conversations whose terminal panel is open; the PTY lives in the backend. */
+  terminalOpenIds: Set<string>;
+  /** Terminal panel height in px (shared across conversations). */
+  terminalHeight: number;
+
   approvals: ApprovalRequest[];
   elicitations: ElicitationRequest[];
   samplings: SamplingRequest[];
@@ -129,6 +136,9 @@ interface StoreState {
 
   send: (text: string) => Promise<void>;
   stop: () => void;
+
+  toggleTerminal: (id?: string) => void;
+  setTerminalHeight: (height: number) => void;
 
   respondApproval: (requestId: string, decision: "allow_once" | "always_allow" | "deny") => Promise<void>;
   respondElicitation: (
@@ -195,6 +205,9 @@ export const useStore = create<StoreState>((set, get) => ({
   items: [],
   streaming: false,
   busyConversationIds: new Set(),
+
+  terminalOpenIds: new Set(),
+  terminalHeight: 300,
 
   approvals: [],
   elicitations: [],
@@ -296,6 +309,11 @@ export const useStore = create<StoreState>((set, get) => ({
 
   async deleteConversation(id) {
     await api.conversationDelete(id);
+    set((s) => {
+      const terminalOpenIds = new Set(s.terminalOpenIds);
+      terminalOpenIds.delete(id);
+      return { terminalOpenIds };
+    });
     const state = get();
     if (state.activeConversationId === id) {
       set({ activeConversationId: null, items: [] });
@@ -336,6 +354,23 @@ export const useStore = create<StoreState>((set, get) => ({
   stop() {
     const id = get().activeConversationId;
     if (id) api.chatCancel(id).catch(() => {});
+  },
+
+  toggleTerminal(id) {
+    const target = id ?? get().activeConversationId;
+    if (!target) return;
+    set((s) => {
+      const next = new Set(s.terminalOpenIds);
+      if (next.has(target)) next.delete(target);
+      else next.add(target);
+      return { terminalOpenIds: next };
+    });
+  },
+
+  setTerminalHeight(height) {
+    const min = 120;
+    const max = Math.max(min, Math.round(window.innerHeight * 0.7));
+    set({ terminalHeight: Math.min(max, Math.max(min, Math.round(height))) });
   },
 
   async respondApproval(requestId, decision) {
@@ -471,11 +506,42 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
           ...(idx >= 0 ? (items[idx] as ToolItem).state : {}),
           ...stripEvent(event),
         };
+        if (event.status === "running") {
+          // a fresh attempt invalidates progress from any previous task run
+          delete state.task;
+        }
         if (idx >= 0) {
           items[idx] = { kind: "tool", id: event.tool_call_id, state };
         } else {
           items.push({ kind: "tool", id: event.tool_call_id, state });
         }
+        return { items };
+      });
+      break;
+    }
+    case "task_update": {
+      // Live progress for a server-side task during a tool call; the tool
+      // call's own status is driven by tool_call_update events.
+      if (!event.tool_call_id) return;
+      if (event.conversation_id && event.conversation_id !== get().activeConversationId) return;
+      set((s) => {
+        const items = [...s.items];
+        const idx = items.findIndex(
+          (item) => item.kind === "tool" && item.id === event.tool_call_id,
+        );
+        if (idx < 0) return {};
+        const item = items[idx] as ToolItem;
+        items[idx] = {
+          ...item,
+          state: {
+            ...item.state,
+            task: {
+              task_id: event.task_id,
+              status: event.status,
+              status_message: event.status_message,
+            },
+          },
+        };
         return { items };
       });
       break;
@@ -532,7 +598,7 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
           srv.id === event.server_id
             ? {
                 ...srv,
-                status: statusFromEvent(event.status, event.detail),
+                status: statusFromEvent(event.status, event.detail, event.reason),
               }
             : srv,
         ),
@@ -560,6 +626,11 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
     case "resource_updated":
       // surfaced via the connector inspector on refresh; no global state needed
       break;
+    case "terminal_output":
+    case "terminal_closed":
+      // high-frequency / panel-local: handled by TerminalPanel via the bus
+      dispatchTerminalEvent(event);
+      break;
   }
 }
 
@@ -578,14 +649,18 @@ function stripEvent(event: Extract<BackendEvent, { type: "tool_call_update" }>):
   };
 }
 
-function statusFromEvent(status: string, detail?: string): ServerSummary["status"] {
+function statusFromEvent(
+  status: string,
+  detail?: string,
+  reason?: AuthReason,
+): ServerSummary["status"] {
   switch (status) {
     case "connected":
       return "connected";
     case "connecting":
       return "connecting";
     case "needs_auth":
-      return { needs_auth: { detail: detail ?? null } };
+      return { needs_auth: { detail: detail ?? null, reason: reason ?? null } };
     case "error":
       return { error: { message: detail ?? "Connection failed" } };
     default:

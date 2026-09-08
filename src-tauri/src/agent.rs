@@ -513,27 +513,73 @@ impl Agent {
                 }
             };
             if !matches!(status, crate::mcp::manager::ServerStatus::Connected) {
-                let message =
-                    format!("The MCP server for this tool is not connected (status: {status:?}).");
-                self.emit_tool_update(
-                    conversation_id,
-                    &call.id,
-                    "error",
-                    serde_json::json!({ "result_text": message, "is_error": true }),
-                );
-                return format!("Error: {message}");
+                // A sign-in wall gets an inline re-auth card; the call
+                // continues automatically once the user signs in. Anything
+                // else is a plain failure.
+                match self
+                    .await_reauth(conversation_id, &call.id, &entry, &server_title, ct)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(e) => {
+                        self.emit_tool_update(
+                            conversation_id,
+                            &call.id,
+                            "error",
+                            serde_json::json!({ "result_text": e, "is_error": true }),
+                        );
+                        return format!("Error: {e}");
+                    }
+                }
             }
         }
 
-        let result = tokio::select! {
-            _ = ct.cancelled() => Err("cancelled by user".to_string()),
-            r = self.manager.call_tool(
-                &entry.server_id,
-                &entry.name,
-                call.arguments.clone(),
-                Some(call.id.clone()),
-            ) => r,
+        // Live progress for server-side tasks (tasks extension).
+        let sink = self.sink.clone();
+        let conversation = conversation_id.to_string();
+        let tool_call_id = call.id.clone();
+        let on_task = move |snapshot: crate::mcp::manager::TaskSnapshot| {
+            sink.emit(crate::events::BackendEvent::TaskUpdate {
+                conversation_id: Some(conversation.clone()),
+                tool_call_id: Some(tool_call_id.clone()),
+                task_id: snapshot.task_id,
+                status: snapshot.status,
+                status_message: snapshot.status_message,
+            });
         };
+
+        let attempt = || async {
+            tokio::select! {
+                _ = ct.cancelled() => Err("cancelled by user".to_string()),
+                r = self.manager.call_tool(
+                    &entry.server_id,
+                    &entry.name,
+                    call.arguments.clone(),
+                    Some(call.id.clone()),
+                    Some(&on_task),
+                    ct.clone(),
+                ) => r,
+            }
+        };
+
+        let mut result = attempt().await;
+
+        // The server hit an auth wall mid-session: offer inline sign-in and
+        // retry the call once.
+        if result.is_err()
+            && matches!(
+                self.manager.status(&entry.server_id),
+                crate::mcp::manager::ServerStatus::NeedsAuth { .. }
+            )
+        {
+            match self
+                .await_reauth(conversation_id, &call.id, &entry, &server_title, ct)
+                .await
+            {
+                Ok(()) => result = attempt().await,
+                Err(e) => result = Err(e),
+            }
+        }
 
         match result {
             Ok(result) => {
@@ -569,6 +615,52 @@ impl Agent {
                     serde_json::json!({ "result_text": e, "is_error": true }),
                 );
                 format!("Error: {e}")
+            }
+        }
+    }
+
+    /// Surface an inline sign-in card and wait (bounded) for the user to
+    /// complete browser sign-in, then make sure the server is connected again.
+    async fn await_reauth(
+        &self,
+        conversation_id: &str,
+        tool_call_id: &str,
+        entry: &crate::mcp::manager::ToolEntry,
+        server_title: &str,
+        ct: &CancellationToken,
+    ) -> Result<(), String> {
+        let generation = self.manager.auth_generation(&entry.server_id);
+        self.emit_tool_update(
+            conversation_id,
+            tool_call_id,
+            "needs_auth",
+            serde_json::json!({
+                "server": entry.server_id,
+                "server_title": server_title,
+            }),
+        );
+        tokio::select! {
+            _ = ct.cancelled() => return Err("cancelled by user".to_string()),
+            r = self.manager.wait_for_auth(
+                &entry.server_id,
+                generation,
+                std::time::Duration::from_secs(5 * 60),
+            ) => r?,
+        }
+        // Sign-in completed and the login command reconnects, but make sure
+        // (connect is idempotent).
+        match self.manager.status(&entry.server_id) {
+            crate::mcp::manager::ServerStatus::Connected => Ok(()),
+            _ => {
+                let status = self.manager.connect(&entry.server_id).await?;
+                if matches!(status, crate::mcp::manager::ServerStatus::Connected) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "Signed in, but {server_title} could not be reached. Open it on the \
+                         Connectors page for details."
+                    ))
+                }
             }
         }
     }

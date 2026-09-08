@@ -115,11 +115,13 @@ export interface ConnectorSuggestion {
 // MCP server view
 // ---------------------------------------------------------------------------
 
+export type AuthReason = "missing" | "expired" | "scope";
+
 export type ServerStatus =
   | "disconnected"
   | "connecting"
   | "connected"
-  | { needs_auth: { detail: string | null } }
+  | { needs_auth: { detail: string | null; reason?: AuthReason | null } }
   | { error: { message: string } };
 
 export interface ToolEntry {
@@ -173,9 +175,18 @@ export type RawMessage =
 // Backend events
 // ---------------------------------------------------------------------------
 
+export type TaskStatus = "working" | "input_required" | "completed" | "failed" | "cancelled";
+
 export interface ToolCallState {
   tool_call_id: string;
-  status: "pending_approval" | "running" | "awaiting_input" | "done" | "denied" | "error";
+  status:
+    | "pending_approval"
+    | "running"
+    | "awaiting_input"
+    | "needs_auth"
+    | "done"
+    | "denied"
+    | "error";
   server?: string;
   server_title?: string;
   tool?: string;
@@ -184,6 +195,8 @@ export interface ToolCallState {
   structured?: any;
   content?: ContentBlockValue[];
   is_error?: boolean;
+  /** Live progress of a server-side task (MCP tasks extension). */
+  task?: { task_id: string; status: TaskStatus; status_message?: string | null };
 }
 
 export type ContentBlockValue =
@@ -231,8 +244,23 @@ export type BackendEvent =
       messages: any[];
       max_tokens?: number;
     }
-  | { type: "server_status"; server_id: string; status: string; detail?: string }
+  | {
+      type: "server_status";
+      server_id: string;
+      status: string;
+      detail?: string;
+      /** For `needs_auth`: why sign-in is required. */
+      reason?: AuthReason;
+    }
   | { type: "server_data_changed"; server_id: string; what: string }
+  | {
+      type: "task_update";
+      conversation_id: string | null;
+      tool_call_id: string | null;
+      task_id: string;
+      status: TaskStatus;
+      status_message: string | null;
+    }
   | {
       type: "progress";
       conversation_id?: string;
@@ -241,7 +269,27 @@ export type BackendEvent =
       total?: number;
       message?: string;
     }
-  | { type: "resource_updated"; server_id: string; uri: string };
+  | { type: "resource_updated"; server_id: string; uri: string }
+  | {
+      type: "terminal_output";
+      conversation_id: string;
+      /** base64-encoded PTY bytes */
+      data: string;
+      seq: number;
+    }
+  | { type: "terminal_closed"; conversation_id: string; exit_code: number | null };
+
+// ---------------------------------------------------------------------------
+// Terminal
+// ---------------------------------------------------------------------------
+
+/** Response of terminal_create: PTY is live, plus buffered output (base64). */
+export interface TerminalCreated {
+  running: boolean;
+  scrollback: string;
+  /** Live terminal_output events with seq < last_seq are already in scrollback. */
+  last_seq: number;
+}
 
 // ---------------------------------------------------------------------------
 // Schema types for elicitation forms

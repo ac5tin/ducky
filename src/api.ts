@@ -12,6 +12,7 @@ import type {
   ProviderPreset,
   RawMessage,
   ServerSummary,
+  TerminalCreated,
   ToolRule,
 } from "./types";
 
@@ -126,6 +127,22 @@ export const chatCancel = (conversationId: string) =>
   invoke<void>("chat_cancel", { conversationId });
 
 // ---------------------------------------------------------------------------
+// Per-conversation terminal
+// ---------------------------------------------------------------------------
+
+export const terminalCreate = (conversationId: string) =>
+  invoke<TerminalCreated>("terminal_create", { conversationId });
+
+export const terminalWrite = (conversationId: string, data: string) =>
+  invoke<void>("terminal_write", { conversationId, data });
+
+export const terminalResize = (conversationId: string, cols: number, rows: number) =>
+  invoke<void>("terminal_resize", { conversationId, cols, rows });
+
+export const terminalClose = (conversationId: string) =>
+  invoke<void>("terminal_close", { conversationId });
+
+// ---------------------------------------------------------------------------
 // Interactive responses
 // ---------------------------------------------------------------------------
 
@@ -208,5 +225,6 @@ export const mcpHasAuth = (id: string) => invoke<string>("mcp_has_auth", { id })
 export const mcpSetOauthConfig = (
   id: string,
   clientId: string | null,
+  clientSecret: string | null,
   redirectPort: number | null,
-) => invoke<void>("mcp_set_oauth_config", { id, clientId, redirectPort });
+) => invoke<void>("mcp_set_oauth_config", { id, clientId, clientSecret, redirectPort });

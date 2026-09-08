@@ -28,6 +28,7 @@ export function AddConnectorModal({ open, onClose }: { open: boolean; onClose: (
   const [authKind, setAuthKind] = useState<"none" | "bearer" | "oauth">("none");
   const [bearerToken, setBearerToken] = useState("");
   const [oauthClientId, setOauthClientId] = useState("");
+  const [oauthSecret, setOauthSecret] = useState("");
   const [oauthPort, setOauthPort] = useState("");
 
   // import tab
@@ -44,6 +45,7 @@ export function AddConnectorModal({ open, onClose }: { open: boolean; onClose: (
     setAuthKind("none");
     setBearerToken("");
     setOauthClientId("");
+    setOauthSecret("");
     setOauthPort("");
     setImportText("");
     setPreview([]);
@@ -134,6 +136,7 @@ export function AddConnectorModal({ open, onClose }: { open: boolean; onClose: (
         await api.mcpSetOauthConfig(
           cfg.id,
           oauthClientId.trim() || null,
+          oauthSecret.trim() || null,
           oauthPort.trim() ? Number(oauthPort.trim()) : null,
         );
       }
@@ -337,6 +340,13 @@ export function AddConnectorModal({ open, onClose }: { open: boolean; onClose: (
                   value={oauthPort}
                   onChange={(e) => setOauthPort(e.target.value)}
                   placeholder="Callback port (optional)"
+                />
+                <input
+                  className={inputClass + " col-span-2"}
+                  type="password"
+                  value={oauthSecret}
+                  onChange={(e) => setOauthSecret(e.target.value)}
+                  placeholder="Client secret (optional — only for pre-registered confidential clients)"
                 />
               </div>
             </div>

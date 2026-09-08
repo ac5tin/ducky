@@ -10,6 +10,7 @@ pub mod mcp;
 pub mod oauth;
 pub mod providers;
 pub mod state;
+pub mod terminal;
 
 use std::sync::Arc;
 
@@ -53,6 +54,12 @@ pub fn run() {
             tauri::async_runtime::spawn(async move {
                 manager.connect_enabled().await;
             });
+            // Keep OAuth access tokens fresh so long-lived sessions never
+            // send a stale token.
+            let manager = app_state.manager.clone();
+            tauri::async_runtime::spawn(async move {
+                crate::oauth::refresh_loop(manager).await;
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -74,6 +81,10 @@ pub fn run() {
             commands::effort_levels,
             commands::chat_send,
             commands::chat_cancel,
+            commands::terminal_create,
+            commands::terminal_write,
+            commands::terminal_resize,
+            commands::terminal_close,
             commands::approval_respond,
             commands::elicitation_respond,
             commands::sampling_respond,

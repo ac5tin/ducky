@@ -4,12 +4,16 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, CompleteRequestParams, CompleteResult, ContentBlock,
-    GetPromptRequestParams, GetPromptResult, JsonObject, ListToolsResult, NumberOrString,
-    PaginatedRequestParams, ProgressToken, ProtocolVersion, ReadResourceRequestParams,
-    ReadResourceResult, Reference, RequestMetaObject, ServerNotification, SubscriptionFilter, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams,
+    CompleteRequestParams, CompleteResult, ContentBlock, GetPromptRequestParams, GetPromptResult,
+    GetTaskParams, InputRequest, InputRequests, InputResponses, JsonObject, ListToolsResult,
+    ListRootsResult, NumberOrString, PaginatedRequestParams, ProgressToken, ProtocolVersion, Root,
+    ReadResourceRequestParams, ReadResourceResult, Reference, RequestMetaObject,
+    ServerNotification, SubscriptionFilter, TaskPayload, TaskStatus, Tool, UpdateTaskParams,
+    DEFAULT_MRTR_MAX_ROUNDS,
 };
 use rmcp::service::{ClientLifecycleMode, Peer, RoleClient, RunningService};
 use rmcp::transport::streamable_http_client::{
@@ -17,8 +21,10 @@ use rmcp::transport::streamable_http_client::{
 };
 use rmcp::transport::TokioChildProcess;
 use serde::Serialize;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+use super::auth_client::{AuthHttpClient, AuthNotifier};
 use super::bridge::InteractiveBridge;
 use super::handler::DuckyClientHandler;
 use crate::config::{HttpAuth, McpServerConfig, McpTransport, Store};
@@ -27,6 +33,28 @@ use crate::events::{BackendEvent, EventSink};
 // ---------------------------------------------------------------------------
 // Public view types (serialised to the webview)
 // ---------------------------------------------------------------------------
+
+/// Why a server needs (re-)authorization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthReason {
+    /// No stored session — sign in for the first time.
+    Missing,
+    /// The stored session was rejected (expired/revoked refresh token).
+    Expired,
+    /// The server demands additional scopes (step-up authorization).
+    Scope,
+}
+
+impl AuthReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AuthReason::Missing => "missing",
+            AuthReason::Expired => "expired",
+            AuthReason::Scope => "scope",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -38,6 +66,8 @@ pub enum ServerStatus {
     /// their token.
     NeedsAuth {
         detail: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<AuthReason>,
     },
     Error {
         message: String,
@@ -78,6 +108,26 @@ pub struct ServerSummary {
     pub logs: Vec<String>,
 }
 
+/// Progress snapshot of a server-side task (MCP tasks extension), surfaced
+/// to the chat while a tool call runs.
+#[derive(Debug, Clone, Serialize)]
+pub struct TaskSnapshot {
+    pub task_id: String,
+    pub status: String,
+    pub status_message: Option<String>,
+}
+
+fn task_status_str(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Working => "working",
+        TaskStatus::InputRequired => "input_required",
+        TaskStatus::Completed => "completed",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Cancelled => "cancelled",
+        _ => "working",
+    }
+}
+
 /// Everything we know about a connected server.
 #[derive(Default)]
 pub struct ServerData {
@@ -93,6 +143,8 @@ pub struct ServerData {
 
 pub struct ServerHandle {
     pub cfg: McpServerConfig,
+    store: Arc<Store>,
+    bridge: Arc<InteractiveBridge>,
     service: tokio::sync::Mutex<Option<RunningService<RoleClient, DuckyClientHandler>>>,
     pub data: Mutex<ServerData>,
     pub ct: CancellationToken,
@@ -156,24 +208,308 @@ impl ServerHandle {
         let service = guard.as_ref().ok_or("Server is not connected")?;
         service.get_prompt(params).await.map_err(|e| e.to_string())
     }
+
+    /// `tools/call` with MRTR input rounds and full tasks-extension support:
+    /// when the server materializes a task, poll `tasks/get` (honoring its
+    /// poll interval) and surface progress through `on_task`. Cancellation is
+    /// cooperative and sends `tasks/cancel`.
+    pub async fn call_tool_with_tasks(
+        &self,
+        mut params: CallToolRequestParams,
+        on_task: &(dyn Fn(TaskSnapshot) + Send + Sync),
+        ct: &CancellationToken,
+    ) -> Result<CallToolResult, String> {
+        let guard = self.service.lock().await;
+        let service = guard.as_ref().ok_or("Server is not connected")?;
+        let peer = service.peer().clone();
+
+        let mut state_only_rounds = 0usize;
+        for _round in 0..DEFAULT_MRTR_MAX_ROUNDS {
+            let response = {
+                let call = peer.call_tool_once(params.clone());
+                tokio::select! {
+                    _ = ct.cancelled() => return Err("cancelled by user".to_string()),
+                    r = call => r.map_err(|e| e.to_string())?,
+                }
+            };
+            match response {
+                CallToolResponse::Complete(result) => return Ok(result),
+                CallToolResponse::Task(task) => {
+                    return self
+                        .poll_task(&peer, task.task.task_id, on_task, ct)
+                        .await;
+                }
+                CallToolResponse::InputRequired(result) => {
+                    let had_requests = result
+                        .input_requests
+                        .as_ref()
+                        .is_some_and(|r| !r.is_empty());
+                    if !had_requests && result.request_state.is_none() {
+                        return Err("The server sent an invalid input_required response".into());
+                    }
+                    let responses = self
+                        .fulfill_input_requests(result.input_requests.unwrap_or_default())
+                        .await?;
+                    if had_requests {
+                        state_only_rounds = 0;
+                    } else {
+                        // Server asked us to wait on request state alone.
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        state_only_rounds += 1;
+                    }
+                    params.input_responses = (!responses.is_empty()).then_some(responses);
+                    params.request_state = result.request_state;
+                }
+                _ => return Err("The server returned an unexpected response".to_string()),
+            }
+        }
+        Err(format!(
+            "The server kept asking for input without completing the call \
+             ({DEFAULT_MRTR_MAX_ROUNDS} rounds)"
+        ))
+    }
+
+    /// Poll a server-side task to completion.
+    async fn poll_task(
+        &self,
+        peer: &Peer<RoleClient>,
+        task_id: String,
+        on_task: &(dyn Fn(TaskSnapshot) + Send + Sync),
+        ct: &CancellationToken,
+    ) -> Result<CallToolResult, String> {
+        // Generous ceiling; a server TTL usually ends the task sooner.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30 * 60);
+        let mut interval = Duration::from_millis(500);
+        let mut last_status = String::new();
+        let mut last_message: Option<String> = None;
+        loop {
+            if tokio::time::Instant::now() >= deadline {
+                let _ = peer
+                    .cancel_task(CancelTaskParams::new(task_id.clone()))
+                    .await;
+                return Err("The task did not finish within 30 minutes".into());
+            }
+            let result = {
+                let call = peer.get_task(GetTaskParams::new(task_id.clone()));
+                tokio::select! {
+                    _ = ct.cancelled() => {
+                        let _ = peer.cancel_task(CancelTaskParams::new(task_id.clone())).await;
+                        return Err("cancelled by user".to_string());
+                    }
+                    r = call => r.map_err(|e| e.to_string())?,
+                }
+            };
+            let detailed = result.task;
+            if let Some(hint) = detailed.task.poll_interval_ms {
+                interval = Duration::from_millis(hint.clamp(200, 15_000));
+            }
+            let status = task_status_str(detailed.status());
+            let message = detailed.task.status_message.clone();
+            if status != last_status || message != last_message {
+                on_task(TaskSnapshot {
+                    task_id: task_id.clone(),
+                    status: status.to_string(),
+                    status_message: message.clone(),
+                });
+                last_status = status.to_string();
+                last_message = message;
+            }
+            match detailed.payload {
+                TaskPayload::Working => {}
+                TaskPayload::InputRequired { input_requests } => {
+                    let responses = self.fulfill_input_requests(input_requests).await?;
+                    peer.update_task(UpdateTaskParams::new(task_id.clone(), responses))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                TaskPayload::Completed { result } => {
+                    return serde_json::from_value::<CallToolResult>(
+                        serde_json::Value::Object(result),
+                    )
+                    .map_err(|e| format!("The server returned an invalid task result: {e}"));
+                }
+                TaskPayload::Failed { error } => {
+                    let message = error
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("unknown error");
+                    return Err(format!("The server reported the task failed: {message}"));
+                }
+                TaskPayload::Cancelled => {
+                    return Err("The task was cancelled".into());
+                }
+                _ => {}
+            }
+            tokio::select! {
+                _ = ct.cancelled() => {
+                    let _ = peer.cancel_task(CancelTaskParams::new(task_id.clone())).await;
+                    return Err("cancelled by user".to_string());
+                }
+                _ = tokio::time::sleep(interval) => {}
+            }
+        }
+    }
+
+    /// Answer server-initiated input requests (elicitation / sampling / roots)
+    /// through the interactive bridge.
+    async fn fulfill_input_requests(
+        &self,
+        requests: InputRequests,
+    ) -> Result<InputResponses, String> {
+        let mut out = InputResponses::new();
+        for (key, request) in requests {
+            let value = match request {
+                InputRequest::Elicitation(req) => {
+                    let result = self
+                        .bridge
+                        .run_elicitation(&self.cfg.id, &self.cfg.name, req.params)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    serde_json::to_value(result).map_err(|e| e.to_string())?
+                }
+                InputRequest::CreateMessage(req) => {
+                    let result = self
+                        .bridge
+                        .run_sampling(&self.cfg.id, &self.cfg.name, &req.params)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    serde_json::to_value(result).map_err(|e| e.to_string())?
+                }
+                InputRequest::ListRoots(_) => {
+                    let roots = self.store.config.lock().unwrap().settings.roots.clone();
+                    let list = roots
+                        .into_iter()
+                        .map(|path| {
+                            let mut root = Root::new(format!("file://{path}"));
+                            root.name = std::path::Path::new(&path)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string());
+                            root
+                        })
+                        .collect();
+                    serde_json::to_value(ListRootsResult::new(list))
+                        .map_err(|e| e.to_string())?
+                }
+                _ => {
+                    return Err(
+                        "The server requested an unsupported kind of input".to_string()
+                    )
+                }
+            };
+            out.insert(key, value);
+        }
+        Ok(out)
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Manager
 // ---------------------------------------------------------------------------
 
+/// Shared auth-state plumbing. The HTTP transport wrapper (running in any
+/// task) reports re-auth requirements here, and the login command signals
+/// completion here so chat tool calls can resume.
+struct AuthCoordinator {
+    sink: Arc<dyn EventSink>,
+    statuses: Arc<Mutex<HashMap<String, ServerStatus>>>,
+    auth_gens: Mutex<HashMap<String, watch::Sender<u64>>>,
+}
+
+impl AuthCoordinator {
+    fn emit_status(
+        &self,
+        server_id: &str,
+        status: &str,
+        detail: Option<String>,
+        reason: Option<AuthReason>,
+    ) {
+        self.sink.emit(BackendEvent::ServerStatus {
+            server_id: server_id.to_string(),
+            status: status.to_string(),
+            detail,
+            reason: reason.map(|r| r.as_str().to_string()),
+        });
+    }
+
+    /// Flip a connected/connecting server to `needs_auth` (e.g. a mid-session
+    /// 401). Never clobbers a terminal state or an in-flight transition.
+    fn notify_needs_auth(&self, server_id: &str, reason: AuthReason, detail: Option<String>) {
+        {
+            let mut statuses = self.statuses.lock().unwrap();
+            if !matches!(
+                statuses.get(server_id),
+                Some(ServerStatus::Connected) | Some(ServerStatus::Connecting)
+            ) {
+                return;
+            }
+            statuses.insert(
+                server_id.to_string(),
+                ServerStatus::NeedsAuth {
+                    detail: detail.clone(),
+                    reason: Some(reason),
+                },
+            );
+        }
+        self.emit_status(server_id, "needs_auth", detail, Some(reason));
+    }
+
+    fn auth_generation(&self, server_id: &str) -> u64 {
+        let gens = self.auth_gens.lock().unwrap();
+        gens.get(server_id)
+            .map(|tx| *tx.borrow())
+            .unwrap_or(0)
+    }
+
+    /// Bump the auth generation: everyone waiting for sign-in resumes.
+    fn notify_auth_completed(&self, server_id: &str) {
+        let tx = {
+            let mut gens = self.auth_gens.lock().unwrap();
+            gens.entry(server_id.to_string())
+                .or_insert_with(|| watch::channel(0u64).0)
+                .clone()
+        };
+        let _ = tx.send(tx.borrow().wrapping_add(1));
+    }
+
+    /// Resolve once sign-in completes (generation advances past `previous`).
+    async fn wait_for_auth(
+        &self,
+        server_id: &str,
+        previous: u64,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let mut rx = {
+            let mut gens = self.auth_gens.lock().unwrap();
+            gens.entry(server_id.to_string())
+                .or_insert_with(|| watch::channel(0u64).0)
+                .subscribe()
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if *rx.borrow_and_update() > previous {
+                return Ok(());
+            }
+            tokio::time::timeout_at(deadline, rx.changed())
+                .await
+                .map_err(|_| "Timed out waiting for sign-in".to_string())?
+                .map_err(|e| e.to_string())?;
+        }
+    }
+}
+
 pub struct McpManager {
     store: Arc<Store>,
     bridge: Arc<InteractiveBridge>,
     sink: Arc<dyn EventSink>,
     handles: Mutex<HashMap<String, Arc<ServerHandle>>>,
-    statuses: Mutex<HashMap<String, ServerStatus>>,
+    statuses: Arc<Mutex<HashMap<String, ServerStatus>>>,
+    auth: Arc<AuthCoordinator>,
 }
 
 /// A transport ready to be served, in either flavour.
 enum BuiltTransport {
     Stdio(TokioChildProcess),
-    Http(StreamableHttpClientTransport<reqwest::Client>),
+    Http(StreamableHttpClientTransport<AuthHttpClient>),
 }
 
 impl McpManager {
@@ -182,12 +518,19 @@ impl McpManager {
         bridge: Arc<InteractiveBridge>,
         sink: Arc<dyn EventSink>,
     ) -> Self {
+        let statuses = Arc::new(Mutex::new(HashMap::new()));
+        let auth = Arc::new(AuthCoordinator {
+            sink: sink.clone(),
+            statuses: statuses.clone(),
+            auth_gens: Mutex::new(HashMap::new()),
+        });
         Self {
             store,
             bridge,
             sink,
             handles: Mutex::new(HashMap::new()),
-            statuses: Mutex::new(HashMap::new()),
+            statuses,
+            auth,
         }
     }
 
@@ -201,18 +544,45 @@ impl McpManager {
         };
         let detail = match &status {
             ServerStatus::Error { message } => Some(message.clone()),
-            ServerStatus::NeedsAuth { detail } => detail.clone(),
+            ServerStatus::NeedsAuth { detail, .. } => detail.clone(),
+            _ => None,
+        };
+        let reason = match &status {
+            ServerStatus::NeedsAuth { reason, .. } => *reason,
             _ => None,
         };
         self.statuses
             .lock()
             .unwrap()
             .insert(server_id.to_string(), status);
-        self.sink.emit(BackendEvent::ServerStatus {
-            server_id: server_id.to_string(),
-            status: status_str.to_string(),
-            detail,
-        });
+        self.auth
+            .emit_status(server_id, status_str, detail, reason);
+    }
+
+    /// Entry point for the transport wrapper and the background refresher:
+    /// a connected server hit an auth wall mid-session.
+    pub fn mark_needs_auth(&self, server_id: &str, reason: AuthReason, detail: Option<String>) {
+        self.auth.notify_needs_auth(server_id, reason, detail);
+    }
+
+    /// Current auth generation, for `wait_for_auth`.
+    pub fn auth_generation(&self, server_id: &str) -> u64 {
+        self.auth.auth_generation(server_id)
+    }
+
+    /// Called after a successful OAuth login so waiters can resume.
+    pub fn notify_auth_completed(&self, server_id: &str) {
+        self.auth.notify_auth_completed(server_id);
+    }
+
+    /// Wait until sign-in completes for a server (or time out).
+    pub async fn wait_for_auth(
+        &self,
+        server_id: &str,
+        previous: u64,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        self.auth.wait_for_auth(server_id, previous, timeout).await
     }
 
     pub fn status(&self, server_id: &str) -> ServerStatus {
@@ -222,6 +592,11 @@ impl McpManager {
             .get(server_id)
             .cloned()
             .unwrap_or(ServerStatus::Disconnected)
+    }
+
+    /// Shared config/secrets store.
+    pub fn store(&self) -> &Arc<Store> {
+        &self.store
     }
 
     pub fn get(&self, server_id: &str) -> Option<Arc<ServerHandle>> {
@@ -271,14 +646,28 @@ impl McpManager {
         // Make sure OAuth tokens are fresh (no-op for other auth modes).
         if let McpTransport::Http { .. } = &cfg.transport {
             if let HttpAuth::OAuth = &cfg.auth {
+                let had_tokens = self.store.oauth_tokens(server_id).is_some();
                 if let Err(e) = crate::oauth::ensure_fresh_token(&self.store, &cfg).await {
-                    self.set_status(
-                        server_id,
-                        ServerStatus::NeedsAuth {
-                            detail: Some(e.to_string()),
-                        },
-                    );
-                    return Ok(self.status(server_id));
+                    match e {
+                        crate::oauth::AuthFailure::ReauthRequired(detail) => {
+                            self.set_status(
+                                server_id,
+                                ServerStatus::NeedsAuth {
+                                    detail: Some(detail),
+                                    reason: Some(if had_tokens {
+                                        AuthReason::Expired
+                                    } else {
+                                        AuthReason::Missing
+                                    }),
+                                },
+                            );
+                            return Ok(self.status(server_id));
+                        }
+                        crate::oauth::AuthFailure::Transient(message) => {
+                            self.set_status(server_id, ServerStatus::Error { message });
+                            return Ok(self.status(server_id));
+                        }
+                    }
                 }
             }
         }
@@ -337,8 +726,15 @@ impl McpManager {
             Ok(s) => s,
             Err(e) => {
                 if e.is_authorization_required() {
-                    let detail = e.auth_challenge().map(summarise_challenge);
-                    self.set_status(server_id, ServerStatus::NeedsAuth { detail });
+                    let challenge = e.auth_challenge().unwrap_or_default();
+                    let (detail, reason) = summarise_challenge(&challenge);
+                    self.set_status(
+                        server_id,
+                        ServerStatus::NeedsAuth {
+                            detail: Some(detail),
+                            reason: Some(reason),
+                        },
+                    );
                     return Ok(self.status(server_id));
                 }
                 self.set_status(
@@ -353,6 +749,8 @@ impl McpManager {
 
         let handle = Arc::new(ServerHandle {
             cfg: cfg.clone(),
+            store: self.store.clone(),
+            bridge: self.bridge.clone(),
             service: tokio::sync::Mutex::new(Some(service)),
             data: Mutex::new(ServerData::default()),
             ct: ct.clone(),
@@ -405,11 +803,8 @@ impl McpManager {
             .lock()
             .unwrap()
             .insert(server_id.to_string(), ServerStatus::Disconnected);
-        self.sink.emit(BackendEvent::ServerStatus {
-            server_id: server_id.to_string(),
-            status: "disconnected".into(),
-            detail: None,
-        });
+        self.auth
+            .emit_status(server_id, "disconnected", None, None);
     }
 
     /// Connect every enabled server that is not already connected.
@@ -496,19 +891,23 @@ impl McpManager {
                     custom.insert(name, value);
                 }
                 config = config.custom_headers(custom);
+                // Session ids can expire server-side; re-initialize instead
+                // of failing the request.
+                config = config.reinit_on_expired_session(true);
 
-                // attach bearer credentials when available
-                let token = match &cfg.auth {
-                    HttpAuth::Bearer { .. } => self.store.server_token(&cfg.id),
-                    HttpAuth::OAuth => self.store.oauth_tokens(&cfg.id).map(|t| t.access_token),
-                    HttpAuth::None => None,
-                };
-                if let Some(token) = token {
-                    config = config.auth_header(format!("Bearer {token}"));
-                }
-
+                // Credentials are resolved per request by the wrapper; when
+                // the server rejects them mid-session the wrapper reports
+                // back through the coordinator.
+                let auth = self.auth.clone();
+                let server_id = cfg.id.clone();
+                let notify: AuthNotifier = Arc::new(move |reason, detail| {
+                    auth.notify_needs_auth(&server_id, reason, detail);
+                });
                 Ok(BuiltTransport::Http(
-                    StreamableHttpClientTransport::from_config(config),
+                    StreamableHttpClientTransport::with_client(
+                        AuthHttpClient::new(cfg.clone(), self.store.clone(), notify),
+                        config,
+                    ),
                 ))
             }
         }
@@ -667,13 +1066,16 @@ impl McpManager {
     // -- operations ----------------------------------------------------------
 
     /// Call a tool on a server. MRTR (elicitation/sampling during the call)
-    /// is handled inside rmcp via the interactive bridge.
+    /// and the tasks extension (server-side async work) are handled here;
+    /// task progress is surfaced through `on_task`.
     pub async fn call_tool(
         &self,
         server_id: &str,
         tool_name: &str,
         arguments: serde_json::Value,
         progress_token: Option<String>,
+        on_task: Option<&(dyn Fn(TaskSnapshot) + Send + Sync)>,
+        ct: CancellationToken,
     ) -> Result<CallToolResult, String> {
         let handle = self
             .get(server_id)
@@ -693,7 +1095,12 @@ impl McpManager {
                 NumberOrString::String(token.into()),
             )));
         }
-        handle.call_tool_mrtr(params).await
+        let noop = |_: TaskSnapshot| {};
+        let on_task: &(dyn Fn(TaskSnapshot) + Send + Sync) = match on_task {
+            Some(cb) => cb,
+            None => &noop,
+        };
+        handle.call_tool_with_tasks(params, on_task, &ct).await
     }
 
     pub async fn read_resource(
@@ -929,14 +1336,20 @@ fn serialize_all<T: Serialize>(items: &[T]) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn summarise_challenge(challenge: &str) -> String {
+fn summarise_challenge(challenge: &str) -> (String, AuthReason) {
     let lower = challenge.to_lowercase();
     if lower.contains("insufficient_scope") {
-        format!(
-            "The server needs additional permissions. Sign in again to grant them. ({challenge})"
+        (
+            format!(
+                "The server needs additional permissions. Sign in again to grant them. ({challenge})"
+            ),
+            AuthReason::Scope,
         )
     } else {
-        "This server requires you to sign in before connecting.".to_string()
+        (
+            "This server requires you to sign in before connecting.".to_string(),
+            AuthReason::Missing,
+        )
     }
 }
 
