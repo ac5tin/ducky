@@ -95,6 +95,7 @@ pub enum StopReason {
 }
 
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct ChatOptions {
     pub model: String,
     pub max_tokens: Option<u32>,
@@ -103,16 +104,6 @@ pub struct ChatOptions {
     pub effort: Option<crate::config::EffortLevel>,
 }
 
-impl Default for ChatOptions {
-    fn default() -> Self {
-        Self {
-            model: String::new(),
-            max_tokens: None,
-            temperature: None,
-            effort: None,
-        }
-    }
-}
 
 #[async_trait]
 pub trait LlmProvider: Send + Sync {

@@ -342,7 +342,7 @@ impl InteractiveBridge {
             .or_else(|| provider_cfg.models.first().cloned())
             .unwrap_or_default();
         Some(SamplingBackend {
-            provider: build_provider(&provider_cfg, key.as_deref()),
+            provider: build_provider(provider_cfg, key.as_deref()),
             model,
         })
     }

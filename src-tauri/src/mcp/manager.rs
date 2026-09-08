@@ -727,7 +727,7 @@ impl McpManager {
             Err(e) => {
                 if e.is_authorization_required() {
                     let challenge = e.auth_challenge().unwrap_or_default();
-                    let (detail, reason) = summarise_challenge(&challenge);
+                    let (detail, reason) = summarise_challenge(challenge);
                     self.set_status(
                         server_id,
                         ServerStatus::NeedsAuth {
@@ -795,7 +795,7 @@ impl McpManager {
             }
             h.ct.cancel();
             let service = h.service.lock().await.take();
-            if let Some(mut service) = service {
+            if let Some(service) = service {
                 let _ = service.cancel().await;
             }
         }

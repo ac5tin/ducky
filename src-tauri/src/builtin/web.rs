@@ -188,7 +188,7 @@ fn parse_ddg_results(html: &str, max_results: usize) -> Vec<(String, String, Str
 fn extract_anchors(html: &str, marker: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let lower = html.to_ascii_lowercase();
-    let needle = format!("<a ");
+    let needle = "<a ".to_string();
     let mut search_from = 0;
     while let Some(rel) = lower[search_from..].find(&needle) {
         let tag_start = search_from + rel;
