@@ -57,7 +57,7 @@ export function ConnectorsView() {
       const result = await api.mcpConnect(s.id);
       await refreshServers();
       if (result === "needs_auth") {
-        toast("info", `${s.name} needs you to sign in.`);
+        await signIn(s);
       } else if (result === "error") {
         toast(
           "error",

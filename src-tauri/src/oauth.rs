@@ -189,17 +189,6 @@ pub async fn ensure_fresh_token(
     if token_is_fresh(&tokens) {
         return Ok(());
     }
-
-    // Single-flight: waiters re-check the store afterwards because the winner
-    // publishes rotated tokens through the secrets store.
-    let guard = refresh_guard(&cfg.id);
-    let _held = guard.lock().await;
-    let Some(tokens) = store.oauth_tokens(&cfg.id) else {
-        return Err(AuthFailure::ReauthRequired("Not signed in".to_string()));
-    };
-    if token_is_fresh(&tokens) {
-        return Ok(());
-    }
     refresh_now(store, cfg, &tokens).await
 }
 
@@ -499,6 +488,42 @@ fn redirect_port(cfg: &McpServerConfig) -> u16 {
     cfg.oauth_redirect_port.unwrap_or(0)
 }
 
+fn callback_success_html() -> &'static str {
+    concat!(
+        "<!DOCTYPE html>\n",
+        "<html lang=\"en\">\n",
+        "<head>\n",
+        "<meta charset=\"utf-8\">\n",
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n",
+        "<title>Signed in \u{2014} Ducky</title>\n",
+        "<style>\n",
+        ":root{--bg:#f8fafc;--card:#fff;--border:#e2e8f0;--text:#0f172a;--muted:#64748b;--accent:#0ea5e9;--ok:#22c55e;--ok-ring:#bbf7d0}\n",
+        "@media(prefers-color-scheme:dark){:root{--bg:#0f172a;--card:#1e293b;--border:#334155;--text:#f8fafc;--muted:#94a3b8;--ok-ring:#14532d}}\n",
+        "*{box-sizing:border-box}html,body{height:100%;margin:0}\n",
+        "body{font-family:ui-sans-serif,system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);display:grid;place-items:center;padding:24px}\n",
+        "main{width:min(100%,28rem);background:var(--card);border:1px solid var(--border);border-radius:1.25rem;padding:2.5rem 2rem;text-align:center;box-shadow:0 10px 15px -3px rgb(15 23 42 / 0.08)}\n",
+        ".mark{width:3.5rem;height:3.5rem;margin:0 auto 1.25rem;border-radius:999px;background:var(--ok-ring);display:grid;place-items:center}\n",
+        ".mark svg{width:1.75rem;height:1.75rem}h1{margin:0 0 .5rem;font-size:1.375rem;letter-spacing:-.02em}p{margin:0;color:var(--muted);line-height:1.5}\n",
+        ".brand{margin-top:1.75rem;font-size:.75rem;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--accent)}\n",
+        "</style>\n",
+        "</head>\n",
+        "<body>\n",
+        "<main>\n",
+        "<div class=\"mark\" aria-hidden=\"true\">\n",
+        "<svg viewBox=\"0 0 24 24\" fill=\"none\">\n",
+        "<circle cx=\"12\" cy=\"12\" r=\"12\" fill=\"#22c55e\"/>\n",
+        "<path d=\"M7 12.5l3.2 3.2L17 8.8\" stroke=\"#fff\" stroke-width=\"2.2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"/>\n",
+        "</svg>\n",
+        "</div>\n",
+        "<h1>You're signed in</h1>\n",
+        "<p>You can close this tab and return to Ducky.</p>\n",
+        "<div class=\"brand\">Ducky</div>\n",
+        "</main>\n",
+        "</body>\n",
+        "</html>\n",
+    )
+}
+
 /// Fetch Protected Resource Metadata for the MCP server, following the
 /// `WWW-Authenticate` challenge first and well-known paths as fallback.
 async fn discover_resource(
@@ -698,7 +723,7 @@ async fn wait_for_callback(
         return Err("No authorization code in the redirect".into());
     };
 
-    let body = "You're signed in! You can close this window and return to Ducky.";
+    let body = callback_success_html();
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
@@ -889,5 +914,54 @@ mod tests {
         let mut cfg = cfg;
         cfg.oauth_redirect_port = Some(6274);
         assert_eq!(redirect_port(&cfg), 6274);
+    }
+
+    #[tokio::test]
+    async fn ensure_fresh_token_expired_does_not_deadlock() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::new(tmp.path(), tmp.path().to_path_buf()).unwrap());
+        let cfg = McpServerConfig {
+            id: "s".into(),
+            name: "s".into(),
+            transport: McpTransport::Http {
+                url: "http://127.0.0.1:1/mcp".into(),
+                headers: HashMap::new(),
+            },
+            auth: HttpAuth::OAuth,
+            enabled: true,
+            auto_start: true,
+            oauth_client_id: None,
+            oauth_redirect_port: None,
+            created_at: "t".into(),
+        };
+        store
+            .set_oauth_tokens(
+                "s",
+                Some(OAuthTokens {
+                    access_token: "a".into(),
+                    refresh_token: Some("r".into()),
+                    expires_at_ms: Some(1),
+                    client_id: "c".into(),
+                    issuer: "http://127.0.0.1:1".into(),
+                    scopes: vec![],
+                }),
+            )
+            .unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            ensure_fresh_token(&store, &cfg),
+        )
+        .await;
+        assert!(result.is_ok(), "deadlocked on refresh_guard");
+    }
+
+    #[test]
+    fn callback_success_html_is_a_full_page() {
+        let html = callback_success_html();
+        assert!(html.contains("<!DOCTYPE html>"));
+        assert!(html.contains("<title>Signed in \u{2014} Ducky</title>"));
+        assert!(html.contains("You're signed in"));
+        assert!(html.contains("You can close this tab and return to Ducky."));
     }
 }
