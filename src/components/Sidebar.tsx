@@ -1,3 +1,4 @@
+import { useRef, useState } from "react";
 import { useStore } from "../store";
 import { Icon } from "./icons";
 
@@ -9,7 +10,19 @@ export function Sidebar() {
   const openConversation = useStore((s) => s.openConversation);
   const newConversation = useStore((s) => s.newConversation);
   const deleteConversation = useStore((s) => s.deleteConversation);
+  const renameConversation = useStore((s) => s.renameConversation);
   const version = useStore((s) => s.version);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [draft, setDraft] = useState("");
+  const skipBlur = useRef(false);
+
+  const commitRename = (id: string, current: string) => {
+    const trimmed = draft.trim();
+    if (trimmed && trimmed !== (current || "")) {
+      renameConversation(id, trimmed).catch((e) => console.error(e));
+    }
+    setEditingId(null);
+  };
 
   const conversations = [...(config?.conversations ?? [])].sort((a, b) =>
     b.updated_at.localeCompare(a.updated_at),
@@ -43,8 +56,8 @@ export function Sidebar() {
         </div>
         {conversations.length === 0 && (
           <p className="px-2 py-2 text-xs leading-relaxed text-slate-400">
-            No chats yet. Start one above — your assistant can use connected tools right
-            away.
+            No chats yet. Start one above — your assistant can use connected
+            tools right away.
           </p>
         )}
         {conversations.map((c) => (
@@ -56,17 +69,58 @@ export function Sidebar() {
                 : "hover:bg-slate-200/60 dark:hover:bg-slate-800"
             }`}
           >
+            {editingId === c.id ? (
+              <input
+                autoFocus
+                className="min-w-0 flex-1 rounded bg-white px-1 text-sm outline-none ring-1 ring-sky-400 dark:bg-slate-900"
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                onClick={(e) => e.stopPropagation()}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    skipBlur.current = true;
+                    commitRename(c.id, c.title);
+                  } else if (e.key === "Escape") {
+                    skipBlur.current = true;
+                    setEditingId(null);
+                  }
+                }}
+                onBlur={() => {
+                  if (skipBlur.current) {
+                    skipBlur.current = false;
+                    return;
+                  }
+                  commitRename(c.id, c.title);
+                }}
+              />
+            ) : (
+              <button
+                className="min-w-0 flex-1 truncate text-left"
+                onClick={() =>
+                  openConversation(c.id).catch((e) => console.error(e))
+                }
+                title={c.title || "Untitled chat"}
+              >
+                {c.title || "Untitled chat"}
+              </button>
+            )}
             <button
-              className="min-w-0 flex-1 truncate text-left"
-              onClick={() => openConversation(c.id).catch((e) => console.error(e))}
-              title={c.title || "Untitled chat"}
+              className="hidden shrink-0 rounded p-1 text-slate-400 hover:bg-slate-200 hover:text-slate-700 group-hover:block dark:hover:bg-slate-700 dark:hover:text-slate-200"
+              aria-label="Rename chat"
+              onClick={() => {
+                setEditingId(c.id);
+                setDraft(c.title);
+              }}
             >
-              {c.title || "Untitled chat"}
+              <Icon name="pencil" className="h-3.5 w-3.5" />
             </button>
             <button
               className="hidden shrink-0 rounded p-1 text-slate-400 hover:bg-rose-100 hover:text-rose-600 group-hover:block dark:hover:bg-rose-950"
               aria-label="Delete chat"
-              onClick={() => deleteConversation(c.id).catch((e) => console.error(e))}
+              onClick={() =>
+                deleteConversation(c.id).catch((e) => console.error(e))
+              }
             >
               <Icon name="trash" className="h-3.5 w-3.5" />
             </button>

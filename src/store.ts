@@ -78,7 +78,10 @@ export type View = "chat" | "connectors" | "settings" | "onboarding";
 // Shared init promise: concurrent init() calls (StrictMode double-effect) must
 // not register a second backend listener, or every delta is handled twice.
 let initPromise: Promise<void> | null = null;
-const media = typeof window !== "undefined" ? window.matchMedia("(prefers-color-scheme: dark)") : null;
+const media =
+  typeof window !== "undefined"
+    ? window.matchMedia("(prefers-color-scheme: dark)")
+    : null;
 
 function applyTheme(theme: "system" | "light" | "dark") {
   if (typeof document === "undefined") return;
@@ -131,6 +134,7 @@ interface StoreState {
   openConversation: (id: string) => Promise<void>;
   newConversation: () => Promise<void>;
   deleteConversation: (id: string) => Promise<void>;
+  renameConversation: (id: string, title: string) => Promise<void>;
   setActiveModel: (providerId: string, model: string) => Promise<void>;
   setActiveEffort: (effort: EffortLevel | null) => Promise<void>;
 
@@ -140,7 +144,10 @@ interface StoreState {
   toggleTerminal: (id?: string) => void;
   setTerminalHeight: (height: number) => void;
 
-  respondApproval: (requestId: string, decision: "allow_once" | "always_allow" | "deny") => Promise<void>;
+  respondApproval: (
+    requestId: string,
+    decision: "allow_once" | "always_allow" | "deny",
+  ) => Promise<void>;
   respondElicitation: (
     requestId: string,
     action: "accept" | "decline" | "cancel",
@@ -151,7 +158,10 @@ interface StoreState {
   activeProvider: () => ProviderConfig | null;
 }
 
-function rawToItems(raw: RawMessage[], toolStates: Map<string, ToolCallState>): ChatItem[] {
+function rawToItems(
+  raw: RawMessage[],
+  toolStates: Map<string, ToolCallState>,
+): ChatItem[] {
   const items: ChatItem[] = [];
   for (const msg of raw) {
     if (msg.kind === "user") {
@@ -169,7 +179,15 @@ function rawToItems(raw: RawMessage[], toolStates: Map<string, ToolCallState>): 
           tool: call.name,
           args: call.arguments,
         };
-        items.push({ kind: "tool", id: call.id, state: { ...state, tool: state.tool ?? call.name, args: state.args ?? call.arguments } });
+        items.push({
+          kind: "tool",
+          id: call.id,
+          state: {
+            ...state,
+            tool: state.tool ?? call.name,
+            args: state.args ?? call.arguments,
+          },
+        });
       }
     } else if (msg.kind === "tool_result") {
       // attach result to the matching tool card if it has none yet
@@ -179,7 +197,10 @@ function rawToItems(raw: RawMessage[], toolStates: Map<string, ToolCallState>): 
           if (!item.state.result_text) {
             item.state.result_text = msg.text;
             item.state.is_error = msg.is_error;
-            if (item.state.status === "pending_approval" || item.state.status === "running") {
+            if (
+              item.state.status === "pending_approval" ||
+              item.state.status === "running"
+            ) {
               item.state.status = msg.is_error ? "error" : "done";
             }
           }
@@ -229,7 +250,10 @@ export const useStore = create<StoreState>((set, get) => ({
           servers: boot.server_summaries,
           version: info.version,
           homeDir: boot.home_dir ?? "",
-          view: boot.config.onboarding_complete && boot.config.providers.length > 0 ? "chat" : "onboarding",
+          view:
+            boot.config.onboarding_complete && boot.config.providers.length > 0
+              ? "chat"
+              : "onboarding",
         });
       })().catch((e) => {
         initPromise = null;
@@ -307,6 +331,11 @@ export const useStore = create<StoreState>((set, get) => ({
     set({ activeConversationId: meta.id, items: [], view: "chat" });
   },
 
+  async renameConversation(id, title) {
+    await api.conversationRename(id, title);
+    await get().refreshConfig();
+  },
+
   async deleteConversation(id) {
     await api.conversationDelete(id);
     set((s) => {
@@ -374,17 +403,23 @@ export const useStore = create<StoreState>((set, get) => ({
   },
 
   async respondApproval(requestId, decision) {
-    set((s) => ({ approvals: s.approvals.filter((a) => a.request_id !== requestId) }));
+    set((s) => ({
+      approvals: s.approvals.filter((a) => a.request_id !== requestId),
+    }));
     await api.approvalRespond(requestId, decision);
   },
 
   async respondElicitation(requestId, action, content) {
-    set((s) => ({ elicitations: s.elicitations.filter((e) => e.request_id !== requestId) }));
+    set((s) => ({
+      elicitations: s.elicitations.filter((e) => e.request_id !== requestId),
+    }));
     await api.elicitationRespond(requestId, action, content);
   },
 
   async respondSampling(requestId, approve) {
-    set((s) => ({ samplings: s.samplings.filter((x) => x.request_id !== requestId) }));
+    set((s) => ({
+      samplings: s.samplings.filter((x) => x.request_id !== requestId),
+    }));
     await api.samplingRespond(requestId, approve);
   },
 
@@ -392,7 +427,9 @@ export const useStore = create<StoreState>((set, get) => ({
     const { config, activeConversationId } = get();
     if (!config) return null;
     if (activeConversationId) {
-      const conv = config.conversations.find((c) => c.id === activeConversationId);
+      const conv = config.conversations.find(
+        (c) => c.id === activeConversationId,
+      );
       const provider = config.providers.find((p) => p.id === conv?.provider_id);
       if (provider) return provider;
     }
@@ -462,13 +499,17 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
       if (event.conversation_id !== get().activeConversationId) return;
       set((s) => {
         const items = s.items.map((item) =>
-          item.kind === "assistant" && item.streaming ? { ...item, streaming: false } : item,
+          item.kind === "assistant" && item.streaming
+            ? { ...item, streaming: false }
+            : item,
         );
         const busy = new Set(s.busyConversationIds);
         busy.delete(event.conversation_id);
         return { items, streaming: false, busyConversationIds: busy };
       });
-      get().refreshConfig().catch(() => {});
+      get()
+        .refreshConfig()
+        .catch(() => {});
       break;
     }
     case "chat_error": {
@@ -480,7 +521,11 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
         const items = [...s.items];
         const last = items[items.length - 1];
         if (last?.kind === "assistant" && last.streaming) {
-          items[items.length - 1] = { ...last, streaming: false, error: event.error };
+          items[items.length - 1] = {
+            ...last,
+            streaming: false,
+            error: event.error,
+          };
         } else {
           items.push({
             kind: "assistant",
@@ -523,7 +568,11 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
       // Live progress for a server-side task during a tool call; the tool
       // call's own status is driven by tool_call_update events.
       if (!event.tool_call_id) return;
-      if (event.conversation_id && event.conversation_id !== get().activeConversationId) return;
+      if (
+        event.conversation_id &&
+        event.conversation_id !== get().activeConversationId
+      )
+        return;
       set((s) => {
         const items = [...s.items];
         const idx = items.findIndex(
@@ -598,7 +647,11 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
           srv.id === event.server_id
             ? {
                 ...srv,
-                status: statusFromEvent(event.status, event.detail, event.reason),
+                status: statusFromEvent(
+                  event.status,
+                  event.detail,
+                  event.reason,
+                ),
               }
             : srv,
         ),
@@ -614,11 +667,15 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
         const line = what.slice(4);
         set((s) => ({
           servers: s.servers.map((srv) =>
-            srv.id === server_id ? { ...srv, logs: [...srv.logs, line].slice(-300) } : srv,
+            srv.id === server_id
+              ? { ...srv, logs: [...srv.logs, line].slice(-300) }
+              : srv,
           ),
         }));
       } else {
-        get().refreshServer(server_id).catch(() => {});
+        get()
+          .refreshServer(server_id)
+          .catch(() => {});
       }
       break;
     }
@@ -634,7 +691,9 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
   }
 }
 
-function stripEvent(event: Extract<BackendEvent, { type: "tool_call_update" }>): ToolCallState {
+function stripEvent(
+  event: Extract<BackendEvent, { type: "tool_call_update" }>,
+): ToolCallState {
   return {
     tool_call_id: event.tool_call_id,
     status: event.status,
