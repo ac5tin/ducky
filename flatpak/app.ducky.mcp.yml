@@ -1,0 +1,39 @@
+id: app.ducky.mcp
+runtime: org.gnome.Platform
+runtime-version: "47"
+sdk: org.gnome.Sdk
+command: ducky
+finish-args:
+  - --share=network
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --filesystem=home
+  - --talk-name=org.freedesktop.Notifications
+modules:
+  - name: ducky
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 ducky /app/bin/ducky
+      - install -Dm644 app.ducky.mcp.desktop /app/share/applications/app.ducky.mcp.desktop
+      - install -Dm644 app.ducky.mcp.metainfo.xml /app/share/metainfo/app.ducky.mcp.metainfo.xml
+      - install -Dm644 ducky.svg /app/share/icons/hicolor/scalable/apps/app.ducky.mcp.svg
+      - install -Dm644 32x32.png /app/share/icons/hicolor/32x32/apps/app.ducky.mcp.png
+      - install -Dm644 128x128.png /app/share/icons/hicolor/128x128/apps/app.ducky.mcp.png
+      - install -Dm644 icon.png /app/share/icons/hicolor/512x512/apps/app.ducky.mcp.png
+    sources:
+      - type: file
+        path: ducky
+      - type: file
+        path: app.ducky.mcp.desktop
+      - type: file
+        path: app.ducky.mcp.metainfo.xml
+      - type: file
+        path: ducky.svg
+      - type: file
+        path: 32x32.png
+      - type: file
+        path: 128x128.png
+      - type: file
+        path: icon.png
