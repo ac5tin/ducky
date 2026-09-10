@@ -199,6 +199,19 @@ pub enum ToolRule {
     Deny,
 }
 
+/// Default open/closed state of MCP tool-call argument and result panels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolDetailsMode {
+    /// Open while a call is in progress; closed when loading a finished call.
+    #[default]
+    Auto,
+    /// Start closed. The user can still expand one card.
+    Collapsed,
+    /// Start open, including finished calls.
+    Expanded,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     pub theme: Theme,
@@ -213,6 +226,9 @@ pub struct AppSettings {
     pub max_tool_iterations: u32,
     /// Show reasoning tokens when a provider streams them.
     pub show_reasoning: bool,
+    /// Default open/closed state of MCP tool input and output.
+    #[serde(default)]
+    pub tool_details: ToolDetailsMode,
     /// Working directory for chats and spawned stdio servers.
     /// `None` means the machine's home directory.
     #[serde(default)]
@@ -240,6 +256,7 @@ impl Default for AppSettings {
             roots: Vec::new(),
             max_tool_iterations: 25,
             show_reasoning: false,
+            tool_details: ToolDetailsMode::Auto,
             working_dir: None,
             default_provider_id: None,
             default_model: None,
@@ -1042,6 +1059,25 @@ mod tests {
         assert_eq!(cfg.settings.default_provider_id, None);
         assert_eq!(cfg.settings.default_model, None);
         assert_eq!(cfg.settings.default_effort, None);
+    }
+
+    #[test]
+    fn config_without_tool_details_defaults_to_auto() {
+        // old config.json files predate the tool_details field
+        let json = r#"{
+            "version": 1,
+            "settings": {
+                "theme": "dark",
+                "tool_approval": "always_ask",
+                "sampling": "ask",
+                "tool_rules": {},
+                "roots": [],
+                "max_tool_iterations": 25,
+                "show_reasoning": false
+            }
+        }"#;
+        let cfg: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.settings.tool_details, ToolDetailsMode::Auto);
     }
 
     #[test]

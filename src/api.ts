@@ -8,6 +8,7 @@ import type {
   ConversationMeta,
   EffortLevel,
   McpServerConfig,
+  ToolDetailsMode,
   ProviderConfig,
   ProviderPreset,
   RawMessage,
@@ -84,6 +85,7 @@ export const settingsSet = (settings: {
   sampling?: "ask" | "auto_approve" | "deny";
   max_tool_iterations?: number;
   show_reasoning?: boolean;
+  tool_details?: ToolDetailsMode;
   roots?: string[];
   working_dir?: string | null;
   default_provider_id?: string;

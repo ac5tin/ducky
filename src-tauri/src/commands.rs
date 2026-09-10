@@ -250,6 +250,9 @@ pub async fn settings_set(
         if let Some(v) = settings.show_reasoning {
             c.settings.show_reasoning = v;
         }
+        if let Some(v) = settings.tool_details {
+            c.settings.tool_details = v;
+        }
         if let Some(v) = settings.roots {
             c.settings.roots = v;
         }
@@ -322,6 +325,7 @@ pub struct AppSettingsPatch {
     pub sampling: Option<config::SamplingMode>,
     pub max_tool_iterations: Option<u32>,
     pub show_reasoning: Option<bool>,
+    pub tool_details: Option<config::ToolDetailsMode>,
     pub roots: Option<Vec<String>>,
     pub working_dir: Option<String>,
     pub default_provider_id: Option<String>,
@@ -1073,5 +1077,15 @@ mod tests {
 
         let set: AppSettingsPatch = serde_json::from_str(r#"{"default_effort": "high"}"#).unwrap();
         assert_eq!(set.default_effort, Some(Some(config::EffortLevel::High)));
+    }
+
+    #[test]
+    fn tool_details_patch_deserializes() {
+        let keep: AppSettingsPatch = serde_json::from_str("{}").unwrap();
+        assert_eq!(keep.tool_details, None);
+
+        let set: AppSettingsPatch =
+            serde_json::from_str(r#"{"tool_details": "collapsed"}"#).unwrap();
+        assert_eq!(set.tool_details, Some(config::ToolDetailsMode::Collapsed));
     }
 }

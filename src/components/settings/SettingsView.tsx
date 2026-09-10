@@ -315,6 +315,55 @@ export function SettingsView() {
             </div>
             <div>
               <div className="mb-1.5 text-sm font-medium">
+                MCP tool input and output
+              </div>
+              <p className="mb-2 text-xs text-slate-400">
+                You can still click a card to show or hide it.
+              </p>
+              <div className="space-y-2">
+                {(
+                  [
+                    [
+                      "auto",
+                      "Auto",
+                      "Open while a call runs; closed when you load a finished call.",
+                    ],
+                    ["collapsed", "Always hide", "Start closed."],
+                    [
+                      "expanded",
+                      "Always show",
+                      "Start open, including finished calls.",
+                    ],
+                  ] as const
+                ).map(([value, label, hint]) => (
+                  <label
+                    key={value}
+                    className={`flex cursor-pointer items-start gap-3 rounded-xl border p-3.5 transition ${
+                      (settings.tool_details ?? "auto") === value
+                        ? "border-sky-500 bg-sky-50/60 dark:bg-sky-950/30"
+                        : "border-slate-200 dark:border-slate-700"
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      className="mt-1"
+                      checked={(settings.tool_details ?? "auto") === value}
+                      onChange={() =>
+                        patch({ tool_details: value }).catch((e) =>
+                          toast("error", `${e}`),
+                        )
+                      }
+                    />
+                    <span>
+                      <span className="block text-sm font-medium">{label}</span>
+                      <span className="text-xs text-slate-400">{hint}</span>
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </div>
+            <div>
+              <div className="mb-1.5 text-sm font-medium">
                 Tool-call rounds per message
               </div>
               <input
