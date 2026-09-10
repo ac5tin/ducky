@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use tokio_util::sync::CancellationToken;
+
 use crate::agent::{Agent, ConversationRuntime};
 use crate::config::Store;
 use crate::events::{BackendEvent, EventSink};
@@ -29,8 +31,10 @@ pub struct AppState {
     pub agent: Arc<Agent>,
     /// models.dev catalog for per-model effort levels.
     pub catalog: crate::catalog::Catalog,
-    /// Cancellation tokens for conversations that are generating.
+    /// Cancellation tokens for conversations that are generating a reply.
     pub runtimes: Mutex<HashMap<String, Arc<ConversationRuntime>>>,
+    /// Cancellation tokens for in-flight chat-title generation.
+    pub title_runtimes: Mutex<HashMap<String, CancellationToken>>,
     /// Per-conversation PTY terminals (one shell per chat session).
     pub terminals: crate::terminal::TerminalMap,
 }
@@ -58,6 +62,7 @@ impl AppState {
             agent,
             catalog,
             runtimes: Mutex::new(HashMap::new()),
+            title_runtimes: Mutex::new(HashMap::new()),
             terminals: Arc::new(Mutex::new(HashMap::new())),
         })
     }

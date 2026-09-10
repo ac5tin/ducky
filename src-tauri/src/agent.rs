@@ -694,18 +694,166 @@ impl Agent {
                 .find(|c| c.id == conversation_id)
                 .ok_or("conversation missing")?;
             meta.updated_at = chrono::Utc::now().to_rfc3339();
-            if meta.title.is_empty() {
-                if let Some(Msg::User { text, .. }) =
-                    history.iter().find(|m| matches!(m, Msg::User { .. }))
-                {
-                    meta.title = text.chars().take(48).collect();
-                }
-            }
             meta.clone()
         };
         let payload: Vec<serde_json::Value> = history.iter().map(|m| m.as_json()).collect();
         self.store
             .save_conversation(&meta, &payload)
             .map_err(|e| e.to_string())
+    }
+
+    fn current_title(&self, conversation_id: &str) -> String {
+        self.store
+            .config
+            .lock()
+            .unwrap()
+            .conversations
+            .iter()
+            .find(|c| c.id == conversation_id)
+            .map(|c| c.title.clone())
+            .unwrap_or_default()
+    }
+
+    /// Generate a title from `user_text`. Does not write into chat history.
+    /// `force` overwrites an existing title; auto-gen does not.
+    pub async fn generate_title(
+        &self,
+        conversation_id: &str,
+        user_text: &str,
+        force: bool,
+        ct: CancellationToken,
+    ) {
+        if ct.is_cancelled() {
+            self.sink.emit(BackendEvent::TitleUpdated {
+                conversation_id: conversation_id.to_string(),
+                title: self.current_title(conversation_id),
+            });
+            return;
+        }
+        self.sink.emit(BackendEvent::TitleGenerating {
+            conversation_id: conversation_id.to_string(),
+        });
+
+        let generated = self.stream_title(conversation_id, user_text, &ct).await;
+        if ct.is_cancelled() {
+            self.sink.emit(BackendEvent::TitleUpdated {
+                conversation_id: conversation_id.to_string(),
+                title: self.current_title(conversation_id),
+            });
+            return;
+        }
+
+        let title = match generated {
+            Ok(raw) => {
+                let s = crate::title::sanitize_title(&raw);
+                if s.is_empty() {
+                    crate::title::fallback_title(user_text)
+                } else {
+                    s
+                }
+            }
+            Err(_) => crate::title::fallback_title(user_text),
+        };
+
+        let kept = {
+            let mut cfg = self.store.config.lock().unwrap();
+            let Some(meta) = cfg
+                .conversations
+                .iter_mut()
+                .find(|c| c.id == conversation_id)
+            else {
+                return;
+            };
+            if !force && !meta.title.is_empty() {
+                Some(meta.title.clone())
+            } else {
+                meta.title = title.clone();
+                None
+            }
+        };
+        let title = match kept {
+            Some(existing) => existing,
+            None => {
+                let _ = self.store.save_config();
+                title
+            }
+        };
+        self.sink.emit(BackendEvent::TitleUpdated {
+            conversation_id: conversation_id.to_string(),
+            title,
+        });
+    }
+
+    async fn stream_title(
+        &self,
+        conversation_id: &str,
+        user_text: &str,
+        ct: &CancellationToken,
+    ) -> Result<String, String> {
+        let (settings, meta) = {
+            let cfg = self.store.config.lock().unwrap();
+            let meta = cfg
+                .conversations
+                .iter()
+                .find(|c| c.id == conversation_id)
+                .cloned()
+                .ok_or("conversation missing")?;
+            (cfg.settings.clone(), meta)
+        };
+        let resolved = crate::title::resolve_title_model(&settings, &meta);
+        let (provider, default_model, _) = self.provider_for(&resolved.provider_id)?;
+        let model = if resolved.model.is_empty() {
+            default_model
+        } else {
+            resolved.model
+        };
+        let options = crate::providers::ChatOptions {
+            model,
+            max_tokens: Some(64),
+            temperature: Some(0.3),
+            effort: resolved.effort,
+        };
+        let messages = vec![
+            Msg::System {
+                text:
+                    "Write a short chat title (max 8 words). Reply with the title only. No quotes."
+                        .into(),
+            },
+            Msg::User {
+                text: user_text.to_string(),
+                ts: None,
+            },
+        ];
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ProviderEvent>(64);
+        let call = provider.stream_chat(&messages, &[], &options, tx);
+        let mut text = String::new();
+        let mut call = std::pin::pin!(call);
+        let mut stop_ok = false;
+        loop {
+            tokio::select! {
+                biased;
+                _ = ct.cancelled() => return Err("cancelled".into()),
+                ev = rx.recv() => {
+                    match ev {
+                        Some(ProviderEvent::TextDelta(t)) => text.push_str(&t),
+                        Some(_) => {}
+                        None => break,
+                    }
+                }
+                result = &mut call => {
+                    result.map_err(|e| e.to_string())?;
+                    stop_ok = true;
+                }
+            }
+        }
+        while let Ok(ev) = rx.try_recv() {
+            if let ProviderEvent::TextDelta(t) = ev {
+                text.push_str(&t);
+            }
+        }
+        if !stop_ok {
+            return Err("The provider stream ended unexpectedly".into());
+        }
+        Ok(text)
     }
 }

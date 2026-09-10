@@ -183,6 +183,11 @@ pub fn provider_delete(state: State<'_, Arc<AppState>>, id: String) -> Result<()
             c.settings.default_model = None;
             c.settings.default_effort = None;
         }
+        if c.settings.title_provider_id.as_deref() == Some(id.as_str()) {
+            c.settings.title_provider_id = None;
+            c.settings.title_model = None;
+            c.settings.title_effort = None;
+        }
     }
     state
         .store
@@ -290,6 +295,22 @@ pub async fn settings_set(
         if let Some(v) = settings.default_effort {
             c.settings.default_effort = v;
         }
+        if let Some(v) = settings.title_provider_id {
+            let v = if v.trim().is_empty() { None } else { Some(v) };
+            if let Some(id) = &v {
+                if !c.providers.iter().any(|p| &p.id == id) {
+                    return Err(format!("Unknown provider {id}"));
+                }
+            }
+            c.settings.title_provider_id = v;
+        }
+        if let Some(v) = settings.title_model {
+            let v = if v.trim().is_empty() { None } else { Some(v) };
+            c.settings.title_model = v;
+        }
+        if let Some(v) = settings.title_effort {
+            c.settings.title_effort = v;
+        }
     }
     state.store.save_config().map_err(|e| e.to_string())?;
 
@@ -332,6 +353,10 @@ pub struct AppSettingsPatch {
     pub default_model: Option<String>,
     #[serde(default, deserialize_with = "deserialize_clearable")]
     pub default_effort: Option<Option<config::EffortLevel>>,
+    pub title_provider_id: Option<String>,
+    pub title_model: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_clearable")]
+    pub title_effort: Option<Option<config::EffortLevel>>,
 }
 
 #[tauri::command]
@@ -385,6 +410,7 @@ pub fn conversation_create(
 
 #[tauri::command]
 pub fn conversation_delete(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
+    cancel_title_gen(&state, &id);
     // drop any live terminal with the conversation
     if let Some(session) = state.terminals.lock().unwrap().get(&id).cloned() {
         session.kill();
@@ -401,6 +427,7 @@ pub fn conversation_rename(
     id: String,
     title: String,
 ) -> Result<(), String> {
+    cancel_title_gen(&state, &id);
     {
         let mut c = state.store.config.lock().unwrap();
         let Some(meta) = c.conversations.iter_mut().find(|c| c.id == id) else {
@@ -479,6 +506,26 @@ pub fn conversation_get(
         .ok_or_else(|| "Conversation not found".to_string())
 }
 
+fn cancel_title_gen(state: &AppState, id: &str) {
+    if let Some(ct) = state.title_runtimes.lock().unwrap().remove(id) {
+        ct.cancel();
+    }
+}
+
+fn spawn_title_gen(state: Arc<AppState>, id: String, user_text: String, force: bool) {
+    cancel_title_gen(&state, &id);
+    let ct = CancellationToken::new();
+    state
+        .title_runtimes
+        .lock()
+        .unwrap()
+        .insert(id.clone(), ct.clone());
+    tokio::spawn(async move {
+        state.agent.generate_title(&id, &user_text, force, ct).await;
+        state.title_runtimes.lock().unwrap().remove(&id);
+    });
+}
+
 // ---------------------------------------------------------------------------
 // Chat
 // ---------------------------------------------------------------------------
@@ -494,14 +541,18 @@ pub async fn chat_send(
     }
 
     // conversation meta → provider/model
-    let (provider_id, model) = {
+    let (provider_id, model, title_empty) = {
         let c = state.store.config.lock().unwrap();
         let meta = c
             .conversations
             .iter()
             .find(|c| c.id == conversation_id)
             .ok_or("Unknown conversation")?;
-        (meta.provider_id.clone(), meta.model.clone())
+        (
+            meta.provider_id.clone(),
+            meta.model.clone(),
+            meta.title.is_empty(),
+        )
     };
 
     // existing history
@@ -510,6 +561,7 @@ pub async fn chat_send(
         .load_conversation(&conversation_id)
         .map(|(_, msgs)| msgs.iter().filter_map(Msg::from_json).collect())
         .unwrap_or_default();
+    let auto_title = history.is_empty() && title_empty;
 
     let ct = CancellationToken::new();
     {
@@ -521,6 +573,14 @@ pub async fn chat_send(
     }
 
     let app_state = state.inner().clone();
+    if auto_title {
+        spawn_title_gen(
+            app_state.clone(),
+            conversation_id.clone(),
+            text.clone(),
+            false,
+        );
+    }
     let conversation_id_task = conversation_id.clone();
     tokio::spawn(async move {
         app_state
@@ -541,6 +601,32 @@ pub fn chat_cancel(state: State<'_, Arc<AppState>>, conversation_id: String) {
         rt.ct.cancel();
     }
     state.bridge.cancel_for_conversation(&conversation_id);
+}
+
+#[tauri::command]
+pub fn conversation_generate_title(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<(), String> {
+    let user_text = state
+        .store
+        .load_conversation(&id)
+        .ok_or("Unknown conversation")?
+        .1
+        .iter()
+        .filter_map(Msg::from_json)
+        .find_map(|m| match m {
+            Msg::User { text, .. } => Some(text),
+            _ => None,
+        })
+        .ok_or_else(|| "Send a message first".to_string())?;
+    spawn_title_gen(state.inner().clone(), id, user_text, true);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn conversation_cancel_title(state: State<'_, Arc<AppState>>, id: String) {
+    cancel_title_gen(&state, &id);
 }
 
 // ---------------------------------------------------------------------------
@@ -1077,6 +1163,18 @@ mod tests {
 
         let set: AppSettingsPatch = serde_json::from_str(r#"{"default_effort": "high"}"#).unwrap();
         assert_eq!(set.default_effort, Some(Some(config::EffortLevel::High)));
+    }
+
+    #[test]
+    fn title_effort_patch_is_tristate() {
+        let keep: AppSettingsPatch = serde_json::from_str("{}").unwrap();
+        assert_eq!(keep.title_effort, None);
+
+        let clear: AppSettingsPatch = serde_json::from_str(r#"{"title_effort": null}"#).unwrap();
+        assert_eq!(clear.title_effort, Some(None));
+
+        let set: AppSettingsPatch = serde_json::from_str(r#"{"title_effort": "low"}"#).unwrap();
+        assert_eq!(set.title_effort, Some(Some(config::EffortLevel::Low)));
     }
 
     #[test]

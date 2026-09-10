@@ -11,6 +11,7 @@ pub mod oauth;
 pub mod providers;
 pub mod state;
 pub mod terminal;
+pub mod title;
 
 use std::sync::Arc;
 
@@ -75,6 +76,8 @@ pub fn run() {
             commands::conversation_create,
             commands::conversation_delete,
             commands::conversation_rename,
+            commands::conversation_generate_title,
+            commands::conversation_cancel_title,
             commands::conversation_set_model,
             commands::conversation_set_effort,
             commands::conversation_get,

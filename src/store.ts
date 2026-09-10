@@ -112,6 +112,7 @@ interface StoreState {
   items: ChatItem[];
   streaming: boolean;
   busyConversationIds: Set<string>;
+  titleGeneratingIds: Set<string>;
   /** Last provider token usage per conversation. */
   usageByConversation: Record<string, { input?: number; output?: number }>;
 
@@ -139,6 +140,8 @@ interface StoreState {
   newConversation: () => Promise<void>;
   deleteConversation: (id: string) => Promise<void>;
   renameConversation: (id: string, title: string) => Promise<void>;
+  generateTitle: (id: string) => Promise<void>;
+  cancelTitle: (id: string) => Promise<void>;
   setActiveModel: (providerId: string, model: string) => Promise<void>;
   setActiveEffort: (effort: EffortLevel | null) => Promise<void>;
 
@@ -236,6 +239,7 @@ export const useStore = create<StoreState>((set, get) => ({
   items: [],
   streaming: false,
   busyConversationIds: new Set(),
+  titleGeneratingIds: new Set(),
   usageByConversation: {},
 
   terminalOpenIds: new Set(),
@@ -290,7 +294,16 @@ export const useStore = create<StoreState>((set, get) => ({
   async refreshConfig() {
     const config = await api.getConfig();
     applyTheme(config.settings.theme);
-    set({ config });
+    set((s) => ({
+      config: {
+        ...config,
+        conversations: config.conversations.map((c) => {
+          if (c.title) return c;
+          const local = s.config?.conversations.find((x) => x.id === c.id);
+          return local?.title ? { ...c, title: local.title } : c;
+        }),
+      },
+    }));
   },
 
   async refreshServers() {
@@ -347,12 +360,41 @@ export const useStore = create<StoreState>((set, get) => ({
     await get().refreshConfig();
   },
 
+  async generateTitle(id) {
+    set((s) => {
+      const titleGeneratingIds = new Set(s.titleGeneratingIds);
+      titleGeneratingIds.add(id);
+      return { titleGeneratingIds };
+    });
+    try {
+      await api.conversationGenerateTitle(id);
+    } catch (e) {
+      set((s) => {
+        const titleGeneratingIds = new Set(s.titleGeneratingIds);
+        titleGeneratingIds.delete(id);
+        return { titleGeneratingIds };
+      });
+      get().toast("error", `${e}`);
+    }
+  },
+
+  async cancelTitle(id) {
+    set((s) => {
+      const titleGeneratingIds = new Set(s.titleGeneratingIds);
+      titleGeneratingIds.delete(id);
+      return { titleGeneratingIds };
+    });
+    await api.conversationCancelTitle(id).catch(() => {});
+  },
+
   async deleteConversation(id) {
     await api.conversationDelete(id);
     set((s) => {
       const terminalOpenIds = new Set(s.terminalOpenIds);
       terminalOpenIds.delete(id);
-      return { terminalOpenIds };
+      const titleGeneratingIds = new Set(s.titleGeneratingIds);
+      titleGeneratingIds.delete(id);
+      return { terminalOpenIds, titleGeneratingIds };
     });
     const state = get();
     if (state.activeConversationId === id) {
@@ -378,6 +420,9 @@ export const useStore = create<StoreState>((set, get) => ({
   async send(text) {
     const id = get().activeConversationId;
     if (!id || get().streaming) return;
+    const untitled =
+      get().items.every((i) => i.kind !== "user") &&
+      !get().config?.conversations.find((c) => c.id === id)?.title;
     set((s) => ({
       items: [
         ...s.items,
@@ -390,12 +435,19 @@ export const useStore = create<StoreState>((set, get) => ({
       ],
       streaming: true,
       busyConversationIds: new Set([...s.busyConversationIds, id]),
+      titleGeneratingIds: untitled
+        ? new Set([...s.titleGeneratingIds, id])
+        : s.titleGeneratingIds,
     }));
     try {
       await api.chatSend(id, text);
     } catch (e) {
       get().toast("error", `${e}`);
-      set(() => ({ streaming: false }));
+      set((s) => {
+        const titleGeneratingIds = new Set(s.titleGeneratingIds);
+        titleGeneratingIds.delete(id);
+        return { streaming: false, titleGeneratingIds };
+      });
     }
   },
 
@@ -722,6 +774,32 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
       // high-frequency / panel-local: handled by TerminalPanel via the bus
       dispatchTerminalEvent(event);
       break;
+    case "title_generating": {
+      set((s) => {
+        const titleGeneratingIds = new Set(s.titleGeneratingIds);
+        titleGeneratingIds.add(event.conversation_id);
+        return { titleGeneratingIds };
+      });
+      break;
+    }
+    case "title_updated": {
+      set((s) => {
+        const titleGeneratingIds = new Set(s.titleGeneratingIds);
+        titleGeneratingIds.delete(event.conversation_id);
+        const config = s.config
+          ? {
+              ...s.config,
+              conversations: s.config.conversations.map((c) =>
+                c.id === event.conversation_id
+                  ? { ...c, title: event.title }
+                  : c,
+              ),
+            }
+          : s.config;
+        return { titleGeneratingIds, config };
+      });
+      break;
+    }
   }
 }
 

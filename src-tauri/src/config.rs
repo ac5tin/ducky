@@ -244,6 +244,16 @@ pub struct AppSettings {
     /// Reasoning effort new chats start with. `None` = model default.
     #[serde(default)]
     pub default_effort: Option<EffortLevel>,
+    /// Provider used to generate chat titles. `None` = the chat's provider.
+    #[serde(default)]
+    pub title_provider_id: Option<String>,
+    /// Model used to generate chat titles. Only honored with `title_provider_id`.
+    #[serde(default)]
+    pub title_model: Option<String>,
+    /// Reasoning effort for title generation. `None` = model default when a
+    /// title provider is set; the chat's effort when title provider is unset.
+    #[serde(default)]
+    pub title_effort: Option<EffortLevel>,
 }
 
 impl Default for AppSettings {
@@ -261,6 +271,9 @@ impl Default for AppSettings {
             default_provider_id: None,
             default_model: None,
             default_effort: None,
+            title_provider_id: None,
+            title_model: None,
+            title_effort: None,
         }
     }
 }
@@ -700,17 +713,24 @@ impl Store {
         meta: &ConversationMeta,
         messages: &[serde_json::Value],
     ) -> anyhow::Result<()> {
+        let meta = {
+            let mut cfg = self.config.lock().unwrap();
+            if let Some(existing) = cfg.conversations.iter_mut().find(|c| c.id == meta.id) {
+                let mut next = meta.clone();
+                if next.title.is_empty() && !existing.title.is_empty() {
+                    next.title = existing.title.clone();
+                }
+                *existing = next.clone();
+                next
+            } else {
+                meta.clone()
+            }
+        };
         let payload = serde_json::json!({ "meta": meta, "messages": messages });
         write_private(
             &self.conversation_path(&meta.id),
             &serde_json::to_string_pretty(&payload)?,
         )?;
-        {
-            let mut cfg = self.config.lock().unwrap();
-            if let Some(existing) = cfg.conversations.iter_mut().find(|c| c.id == meta.id) {
-                *existing = meta.clone();
-            }
-        }
         self.save_config()?;
         Ok(())
     }
@@ -957,6 +977,31 @@ mod tests {
     }
 
     #[test]
+    fn save_conversation_keeps_existing_title_when_incoming_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(tmp.path(), tmp.path().to_path_buf()).unwrap();
+        let mut meta = ConversationMeta {
+            id: "abc-123".into(),
+            title: "Hi".into(),
+            provider_id: "p".into(),
+            model: "m".into(),
+            effort: None,
+            created_at: "t".into(),
+            updated_at: "t".into(),
+        };
+        store
+            .config
+            .lock()
+            .unwrap()
+            .conversations
+            .push(meta.clone());
+        store.save_conversation(&meta, &[]).unwrap();
+        meta.title.clear();
+        store.save_conversation(&meta, &[]).unwrap();
+        assert_eq!(store.config.lock().unwrap().conversations[0].title, "Hi");
+    }
+
+    #[test]
     fn store_new_hydrates_empty_title_from_transcript() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::new(tmp.path(), tmp.path().to_path_buf()).unwrap();
@@ -1059,6 +1104,9 @@ mod tests {
         assert_eq!(cfg.settings.default_provider_id, None);
         assert_eq!(cfg.settings.default_model, None);
         assert_eq!(cfg.settings.default_effort, None);
+        assert_eq!(cfg.settings.title_provider_id, None);
+        assert_eq!(cfg.settings.title_model, None);
+        assert_eq!(cfg.settings.title_effort, None);
     }
 
     #[test]

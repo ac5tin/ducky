@@ -92,6 +92,10 @@ export const settingsSet = (settings: {
   default_model?: string;
   /** null clears the default effort; undefined leaves it unchanged. */
   default_effort?: EffortLevel | null;
+  title_provider_id?: string;
+  title_model?: string;
+  /** null clears title effort; undefined leaves it unchanged. */
+  title_effort?: EffortLevel | null;
 }) => invoke<void>("settings_set", { settings });
 
 export const toolRuleSet = (key: string, rule: ToolRule | null) =>
@@ -109,6 +113,12 @@ export const conversationDelete = (id: string) =>
 
 export const conversationRename = (id: string, title: string) =>
   invoke<void>("conversation_rename", { id, title });
+
+export const conversationGenerateTitle = (id: string) =>
+  invoke<void>("conversation_generate_title", { id });
+
+export const conversationCancelTitle = (id: string) =>
+  invoke<void>("conversation_cancel_title", { id });
 
 export const conversationSetModel = (
   id: string,

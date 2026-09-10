@@ -98,6 +98,13 @@ export function SettingsView() {
           <DefaultModelSection />
         </Section>
 
+        <Section
+          title="Chat title model"
+          description="After the first message, this model names the chat. Same as the chat uses that chat's model and effort."
+        >
+          <TitleModelSection />
+        </Section>
+
         {/* Permissions */}
         <Section
           title="Tool permissions"
@@ -563,6 +570,105 @@ function DefaultModelSection() {
                 selected={effort === level}
                 label={EFFORT_LABELS[level]}
                 onClick={() => save(defProviderId ?? "", defModel ?? "", level)}
+              />
+            ))}
+          </div>
+          <p className="mt-1.5 text-xs text-slate-400">
+            Applies to {resolvedModel || "the provider's default model"}.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TitleModelSection() {
+  const config = useStore((s) => s.config);
+  const refreshConfig = useStore((s) => s.refreshConfig);
+  const toast = useStore((s) => s.toast);
+
+  const providerId = config?.settings.title_provider_id ?? null;
+  const modelId = config?.settings.title_model ?? null;
+  const provider = providerId
+    ? (config?.providers.find((p) => p.id === providerId) ?? null)
+    : null;
+  const resolvedModel =
+    (provider && modelId) ||
+    provider?.default_model ||
+    provider?.models[0] ||
+    "";
+  const efforts = useEffortLevels(provider?.kind, resolvedModel || undefined);
+  const effort = config?.settings.title_effort ?? null;
+
+  if (!config) return null;
+
+  const save = async (
+    nextProviderId: string,
+    nextModelId: string,
+    eff: EffortLevel | null,
+  ) => {
+    try {
+      await api.settingsSet({
+        title_provider_id: nextProviderId,
+        title_model: nextModelId,
+        title_effort: eff,
+      });
+      await refreshConfig();
+    } catch (e) {
+      toast("error", `${e}`);
+    }
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="grid gap-4 sm:grid-cols-2">
+        <div>
+          <div className="mb-1.5 text-sm font-medium">Provider</div>
+          <select
+            className={inputClass}
+            value={providerId ?? ""}
+            onChange={(e) => save(e.target.value, "", null)}
+          >
+            <option value="">Same as the chat</option>
+            {config.providers.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <div className="mb-1.5 text-sm font-medium">Model</div>
+          <select
+            className={inputClass}
+            value={modelId ?? ""}
+            disabled={!provider}
+            onChange={(e) => save(providerId ?? "", e.target.value, effort)}
+          >
+            <option value="">Provider default</option>
+            {(provider?.models ?? []).map((m) => (
+              <option key={m} value={m}>
+                {m}
+              </option>
+            ))}
+          </select>
+        </div>
+      </div>
+      {provider && efforts.length > 0 && (
+        <div>
+          <div className="mb-1.5 text-sm font-medium">Reasoning effort</div>
+          <div className="flex flex-wrap gap-1">
+            <EffortPill
+              selected={effort === null}
+              label="Default"
+              onClick={() => save(providerId ?? "", modelId ?? "", null)}
+            />
+            {efforts.map((level) => (
+              <EffortPill
+                key={level}
+                selected={effort === level}
+                label={EFFORT_LABELS[level]}
+                onClick={() => save(providerId ?? "", modelId ?? "", level)}
               />
             ))}
           </div>

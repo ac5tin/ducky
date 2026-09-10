@@ -121,6 +121,13 @@ pub enum BackendEvent {
         conversation_id: String,
         exit_code: Option<i32>,
     },
+    /// Chat title generation started.
+    TitleGenerating { conversation_id: String },
+    /// Chat title generation finished (empty title = cancelled or still untitled).
+    TitleUpdated {
+        conversation_id: String,
+        title: String,
+    },
 }
 
 /// Abstraction over the Tauri event emitter so the MCP layer can be tested.
