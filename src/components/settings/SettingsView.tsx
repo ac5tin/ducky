@@ -5,7 +5,11 @@ import * as api from "../../api";
 import type { EffortLevel, ProviderConfig } from "../../types";
 import { Button, Field, Modal, inputClass } from "../modals/Modal";
 import { Icon } from "../icons";
-import { EFFORT_LABELS, EffortPill, useEffortLevels } from "../chat/effortLevels";
+import {
+  EFFORT_LABELS,
+  EffortPill,
+  useEffortLevels,
+} from "../chat/effortLevels";
 
 export function SettingsView() {
   const config = useStore((s) => s.config);
@@ -14,7 +18,9 @@ export function SettingsView() {
   const refreshConfig = useStore((s) => s.refreshConfig);
   const toast = useStore((s) => s.toast);
   const setView = useStore((s) => s.setView);
-  const [editingProvider, setEditingProvider] = useState<ProviderConfig | null>(null);
+  const [editingProvider, setEditingProvider] = useState<ProviderConfig | null>(
+    null,
+  );
   const [addingProvider, setAddingProvider] = useState(false);
 
   if (!config) return null;
@@ -59,7 +65,10 @@ export function SettingsView() {
                   </div>
                 </div>
                 <div className="flex shrink-0 gap-1.5">
-                  <Button variant="secondary" onClick={() => setEditingProvider(p)}>
+                  <Button
+                    variant="secondary"
+                    onClick={() => setEditingProvider(p)}
+                  >
                     Edit
                   </Button>
                   <Button
@@ -97,9 +106,21 @@ export function SettingsView() {
           <div className="space-y-2">
             {(
               [
-                ["always_ask", "Ask before every tool", "Safest. You approve each tool call with its arguments."],
-                ["auto_approve_read_only", "Auto-approve read-only tools", "Tools the server marks as read-only run automatically; the rest ask."],
-                ["auto_approve_all", "Auto-approve everything", "Nothing asks. Only comfortable with fully trusted servers."],
+                [
+                  "always_ask",
+                  "Ask before every tool",
+                  "Safest. You approve each tool call with its arguments.",
+                ],
+                [
+                  "auto_approve_read_only",
+                  "Auto-approve read-only tools",
+                  "Tools the server marks as read-only run automatically; the rest ask.",
+                ],
+                [
+                  "auto_approve_all",
+                  "Auto-approve everything",
+                  "Nothing asks. Only comfortable with fully trusted servers.",
+                ],
               ] as const
             ).map(([value, label, hint]) => (
               <label
@@ -114,7 +135,11 @@ export function SettingsView() {
                   type="radio"
                   className="mt-1"
                   checked={settings.tool_approval === value}
-                  onChange={() => patch({ tool_approval: value }).catch((e) => toast("error", `${e}`))}
+                  onChange={() =>
+                    patch({ tool_approval: value }).catch((e) =>
+                      toast("error", `${e}`),
+                    )
+                  }
                 />
                 <span>
                   <span className="block text-sm font-medium">{label}</span>
@@ -127,14 +152,16 @@ export function SettingsView() {
           <div className="mt-4">
             <div className="mb-1.5 text-sm font-medium">Sampling requests</div>
             <p className="mb-2 text-xs text-slate-400">
-              Some servers ask your model to help them (e.g. to summarise). Decide if
-              that's OK.
+              Some servers ask your model to help them (e.g. to summarise).
+              Decide if that's OK.
             </p>
             <select
               className={inputClass}
               value={settings.sampling}
               onChange={(e) =>
-                patch({ sampling: e.target.value as any }).catch((err) => toast("error", `${err}`))
+                patch({ sampling: e.target.value as any }).catch((err) =>
+                  toast("error", `${err}`),
+                )
               }
             >
               <option value="ask">Ask me each time</option>
@@ -188,7 +215,10 @@ export function SettingsView() {
           <div className="space-y-2">
             <div className="flex items-center justify-between gap-3 rounded-xl bg-slate-50 px-3 py-2 text-sm dark:bg-slate-800">
               <span className="flex min-w-0 items-center gap-2">
-                <Icon name="folder" className="h-4 w-4 shrink-0 text-slate-400" />
+                <Icon
+                  name="folder"
+                  className="h-4 w-4 shrink-0 text-slate-400"
+                />
                 <span className="truncate font-mono">
                   {settings.working_dir ?? homeDir}
                 </span>
@@ -208,7 +238,9 @@ export function SettingsView() {
                 <Button
                   variant="ghost"
                   onClick={() =>
-                    patch({ working_dir: null }).catch((e) => toast("error", `${e}`))
+                    patch({ working_dir: null }).catch((e) =>
+                      toast("error", `${e}`),
+                    )
                   }
                 >
                   Reset to home folder
@@ -229,14 +261,19 @@ export function SettingsView() {
         >
           <div className="space-y-2">
             {settings.roots.map((r) => (
-              <div key={r} className="flex items-center justify-between rounded-xl bg-slate-50 px-3 py-2 text-sm dark:bg-slate-800">
+              <div
+                key={r}
+                className="flex items-center justify-between rounded-xl bg-slate-50 px-3 py-2 text-sm dark:bg-slate-800"
+              >
                 <span className="flex items-center gap-2">
                   <Icon name="folder" className="h-4 w-4 text-slate-400" />
                   {r}
                 </span>
                 <button
                   className="text-slate-400 hover:text-rose-600"
-                  onClick={() => patch({ roots: settings.roots.filter((x) => x !== r) })}
+                  onClick={() =>
+                    patch({ roots: settings.roots.filter((x) => x !== r) })
+                  }
                 >
                   <Icon name="x" className="h-4 w-4" />
                 </button>
@@ -246,7 +283,10 @@ export function SettingsView() {
               variant="secondary"
               onClick={async () => {
                 const path = await open({ directory: true });
-                if (typeof path === "string" && !settings.roots.includes(path)) {
+                if (
+                  typeof path === "string" &&
+                  !settings.roots.includes(path)
+                ) {
                   await patch({ roots: [...settings.roots, path] });
                 }
               }}
@@ -261,7 +301,9 @@ export function SettingsView() {
         <Section title="Advanced">
           <div className="space-y-4">
             <div>
-              <div className="mb-1.5 text-sm font-medium">Show the AI's reasoning as it streams</div>
+              <div className="mb-1.5 text-sm font-medium">
+                Show the AI's reasoning as it streams
+              </div>
               <label className="flex items-center gap-2 text-sm">
                 <input
                   type="checkbox"
@@ -272,7 +314,9 @@ export function SettingsView() {
               </label>
             </div>
             <div>
-              <div className="mb-1.5 text-sm font-medium">Tool-call rounds per message</div>
+              <div className="mb-1.5 text-sm font-medium">
+                Tool-call rounds per message
+              </div>
               <input
                 className={inputClass + " w-32"}
                 type="number"
@@ -280,9 +324,9 @@ export function SettingsView() {
                 max={100}
                 value={settings.max_tool_iterations}
                 onChange={(e) =>
-                  patch({ max_tool_iterations: Number(e.target.value) || 25 }).catch((err) =>
-                    toast("error", `${err}`),
-                  )
+                  patch({
+                    max_tool_iterations: Number(e.target.value) || 25,
+                  }).catch((err) => toast("error", `${err}`))
                 }
               />
               <p className="mt-1 text-xs text-slate-400">
@@ -315,8 +359,8 @@ export function SettingsView() {
             </p>
             <p>MCP specification: 2026-07-28 (full client support).</p>
             <p>
-              Built with Rust + Tauri 2. Your keys and tokens stay on this computer, in a
-              private file only Ducky reads.
+              Built with Rust + Tauri 2. Your keys and tokens stay on this
+              computer, in a private file only Ducky reads.
             </p>
           </div>
         </Section>
@@ -330,12 +374,19 @@ export function SettingsView() {
         />
       )}
       {addingProvider && (
-        <Modal open onClose={() => setAddingProvider(false)} title="Add a provider">
+        <Modal
+          open
+          onClose={() => setAddingProvider(false)}
+          title="Add a provider"
+        >
           <p className="text-sm leading-relaxed text-slate-500 dark:text-slate-400">
             The guided wizard picks the right settings for each provider.
           </p>
           <div className="mt-4 flex justify-end gap-2">
-            <Button variant="secondary" onClick={() => setAddingProvider(false)}>
+            <Button
+              variant="secondary"
+              onClick={() => setAddingProvider(false)}
+            >
               Cancel
             </Button>
             <Button
@@ -366,7 +417,9 @@ function Section({
     <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
       <h2 className="font-semibold">{title}</h2>
       {description && (
-        <p className="mb-4 mt-1 max-w-2xl text-xs leading-relaxed text-slate-400">{description}</p>
+        <p className="mb-4 mt-1 max-w-2xl text-xs leading-relaxed text-slate-400">
+          {description}
+        </p>
       )}
       {description ? children : <div className="mt-4">{children}</div>}
     </section>
@@ -385,13 +438,20 @@ function DefaultModelSection() {
     : null;
   // the model new chats would actually resolve to — effort pills reflect it
   const resolvedModel =
-    (provider && defModel) || provider?.default_model || provider?.models[0] || "";
+    (provider && defModel) ||
+    provider?.default_model ||
+    provider?.models[0] ||
+    "";
   const efforts = useEffortLevels(provider?.kind, resolvedModel || undefined);
   const effort = config?.settings.default_effort ?? null;
 
   if (!config) return null;
 
-  const save = async (providerId: string, modelId: string, eff: EffortLevel | null) => {
+  const save = async (
+    providerId: string,
+    modelId: string,
+    eff: EffortLevel | null,
+  ) => {
     try {
       await api.settingsSet({
         default_provider_id: providerId,
@@ -525,10 +585,18 @@ function ProviderEditorModal({
     <Modal open onClose={onClose} title={`Edit ${provider.name}`} wide>
       <div className="space-y-4">
         <Field label="Name">
-          <input className={inputClass} value={name} onChange={(e) => setName(e.target.value)} />
+          <input
+            className={inputClass}
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+          />
         </Field>
         <Field label="Base URL">
-          <input className={inputClass} value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} />
+          <input
+            className={inputClass}
+            value={baseUrl}
+            onChange={(e) => setBaseUrl(e.target.value)}
+          />
         </Field>
         <Field label="API key" hint="Leave blank to keep the saved key.">
           <input
@@ -541,7 +609,11 @@ function ProviderEditorModal({
         </Field>
         <Field label="Default model">
           {models.length > 0 ? (
-            <select className={inputClass} value={model} onChange={(e) => setModel(e.target.value)}>
+            <select
+              className={inputClass}
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+            >
               <option value="">(none)</option>
               {models.map((m) => (
                 <option key={m} value={m}>
@@ -550,7 +622,12 @@ function ProviderEditorModal({
               ))}
             </select>
           ) : (
-            <input className={inputClass} value={model} onChange={(e) => setModel(e.target.value)} placeholder="model-id" />
+            <input
+              className={inputClass}
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+              placeholder="model-id"
+            />
           )}
         </Field>
         <div className="flex items-center justify-between">
