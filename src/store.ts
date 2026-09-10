@@ -79,9 +79,9 @@ export type View = "chat" | "connectors" | "settings" | "onboarding";
 // not register a second backend listener, or every delta is handled twice.
 let initPromise: Promise<void> | null = null;
 const media =
-  typeof window !== "undefined"
-    ? window.matchMedia("(prefers-color-scheme: dark)")
-    : null;
+  typeof window === "undefined"
+    ? null
+    : window.matchMedia("(prefers-color-scheme: dark)");
 
 function applyTheme(theme: "system" | "light" | "dark") {
   if (typeof document === "undefined") return;
@@ -298,7 +298,7 @@ export const useStore = create<StoreState>((set, get) => ({
   },
 
   async openConversation(id) {
-    set({ activeConversationId: id, items: [] });
+    set({ activeConversationId: id, items: [], view: "chat" });
     try {
       const [, raw] = await api.conversationGet(id);
       const toolStates = new Map<string, ToolCallState>();
