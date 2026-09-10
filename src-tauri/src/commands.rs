@@ -537,7 +537,8 @@ fn spawn_title_gen(state: Arc<AppState>, id: String, user_text: String, force: b
         .lock()
         .unwrap()
         .insert(id.clone(), ct.clone());
-    tokio::spawn(async move {
+    // Sync Tauri commands have no current Tokio runtime; use Tauri's.
+    tauri::async_runtime::spawn(async move {
         state.agent.generate_title(&id, &user_text, force, ct).await;
         state.title_runtimes.lock().unwrap().remove(&id);
     });
