@@ -6,4 +6,7 @@
   <launchable type="desktop-id">app.ducky.mcp.desktop</launchable>
   <name>Ducky</name>
   <summary>A friendly MCP client</summary>
+  <description>
+    <p>A friendly MCP client</p>
+  </description>
 </component>
