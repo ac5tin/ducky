@@ -144,6 +144,7 @@ interface StoreState {
   cancelTitle: (id: string) => Promise<void>;
   setActiveModel: (providerId: string, model: string) => Promise<void>;
   setActiveEffort: (effort: EffortLevel | null) => Promise<void>;
+  setActiveMcpIds: (mcpIds: string[] | null) => Promise<void>;
 
   send: (text: string) => Promise<void>;
   stop: () => void;
@@ -414,6 +415,13 @@ export const useStore = create<StoreState>((set, get) => ({
     const id = get().activeConversationId;
     if (!id) return;
     await api.conversationSetEffort(id, effort);
+    await get().refreshConfig();
+  },
+
+  async setActiveMcpIds(mcpIds) {
+    const id = get().activeConversationId;
+    if (!id) return;
+    await api.conversationSetMcpIds(id, mcpIds);
     await get().refreshConfig();
   },
 

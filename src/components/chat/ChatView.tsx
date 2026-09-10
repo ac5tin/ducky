@@ -7,6 +7,7 @@ import { ModelPicker } from "./ModelPicker";
 import { WorkingDirChip } from "./WorkingDirChip";
 import { TerminalPanel } from "./TerminalPanel";
 import { TokenMeter } from "./tokenUsage";
+import { ChatConnectorsDialog } from "./ChatConnectorsDialog";
 import { rfc9557, shortTime } from "../../time";
 
 export function ChatView() {
@@ -14,6 +15,12 @@ export function ChatView() {
   const streaming = useStore((s) => s.streaming);
   const activeId = useStore((s) => s.activeConversationId);
   const newConversation = useStore((s) => s.newConversation);
+  const generateTitle = useStore((s) => s.generateTitle);
+  const titleGenerating = useStore(
+    (s) =>
+      !!s.activeConversationId &&
+      s.titleGeneratingIds.has(s.activeConversationId),
+  );
   const toggleTerminal = useStore((s) => s.toggleTerminal);
   const terminalOpen = useStore(
     (s) =>
@@ -22,6 +29,8 @@ export function ChatView() {
   const terminalHeight = useStore((s) => s.terminalHeight);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [showJump, setShowJump] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [connectorsOpen, setConnectorsOpen] = useState(false);
   const [, setTick] = useState(0);
 
   useEffect(() => {
@@ -71,6 +80,56 @@ export function ChatView() {
               Working…
             </span>
           )}
+          <div className="relative">
+            <button
+              className="rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600 dark:hover:bg-slate-800 dark:hover:text-slate-300"
+              aria-label="Chat actions"
+              title="Chat actions"
+              onClick={() => setMenuOpen(!menuOpen)}
+            >
+              <Icon name="more" className="h-4 w-4" />
+            </button>
+            {menuOpen && (
+              <>
+                <button
+                  type="button"
+                  className="fixed inset-0 z-30 cursor-default"
+                  aria-label="Close menu"
+                  onClick={() => setMenuOpen(false)}
+                />
+                <div className="pop-in absolute right-0 top-full z-40 mt-1 w-44 overflow-hidden rounded-xl border border-slate-200 bg-white py-1 shadow-xl dark:border-slate-700 dark:bg-slate-900">
+                  <button
+                    className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent dark:hover:bg-slate-800 dark:disabled:hover:bg-transparent"
+                    disabled={titleGenerating || items.length === 0}
+                    title={
+                      titleGenerating
+                        ? "Generating…"
+                        : items.length === 0
+                          ? "Send a message first"
+                          : "Generate title"
+                    }
+                    onClick={() => {
+                      setMenuOpen(false);
+                      generateTitle(activeId).catch((e) => console.error(e));
+                    }}
+                  >
+                    <Icon name="refresh" className="h-4 w-4 text-slate-400" />
+                    Generate Title
+                  </button>
+                  <button
+                    className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition hover:bg-slate-50 dark:hover:bg-slate-800"
+                    onClick={() => {
+                      setMenuOpen(false);
+                      setConnectorsOpen(true);
+                    }}
+                  >
+                    <Icon name="plug" className="h-4 w-4 text-slate-400" />
+                    Connectors
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
         </div>
       </div>
 
@@ -107,6 +166,10 @@ export function ChatView() {
       {terminalOpen && activeId && <TerminalPanel conversationId={activeId} />}
 
       <Composer />
+      <ChatConnectorsDialog
+        open={connectorsOpen}
+        onClose={() => setConnectorsOpen(false)}
+      />
     </div>
   );
 }

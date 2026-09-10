@@ -80,6 +80,7 @@ pub fn run() {
             commands::conversation_cancel_title,
             commands::conversation_set_model,
             commands::conversation_set_effort,
+            commands::conversation_set_mcp_ids,
             commands::conversation_get,
             commands::effort_levels,
             commands::context_limit,

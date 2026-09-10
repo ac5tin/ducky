@@ -310,8 +310,20 @@ pub struct ConversationMeta {
     /// Reasoning effort for this conversation (None = provider default).
     #[serde(default)]
     pub effort: Option<EffortLevel>,
+    /// MCP servers this chat may use. None = all globally enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_ids: Option<Vec<String>>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl ConversationMeta {
+    pub fn allows_mcp(&self, server_id: &str) -> bool {
+        match &self.mcp_ids {
+            None => true,
+            Some(ids) => ids.iter().any(|id| id == server_id),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -937,6 +949,7 @@ mod tests {
             provider_id: "p".into(),
             model: "m".into(),
             effort: Some(EffortLevel::High),
+            mcp_ids: None,
             created_at: "t".into(),
             updated_at: "t".into(),
         };
@@ -960,6 +973,7 @@ mod tests {
             provider_id: "p".into(),
             model: "m".into(),
             effort: None,
+            mcp_ids: None,
             created_at: "t".into(),
             updated_at: "t".into(),
         };
@@ -986,6 +1000,7 @@ mod tests {
             provider_id: "p".into(),
             model: "m".into(),
             effort: None,
+            mcp_ids: None,
             created_at: "t".into(),
             updated_at: "t".into(),
         };
@@ -1011,6 +1026,7 @@ mod tests {
             provider_id: "p".into(),
             model: "m".into(),
             effort: None,
+            mcp_ids: None,
             created_at: "t".into(),
             updated_at: "t".into(),
         };
@@ -1044,6 +1060,7 @@ mod tests {
             provider_id: "p".into(),
             model: "m".into(),
             effort: None,
+            mcp_ids: None,
             created_at: "t".into(),
             updated_at: "t".into(),
         };
@@ -1145,5 +1162,32 @@ mod tests {
             serde_json::to_value(HttpAuth::OAuth).unwrap(),
             serde_json::json!({"type": "oauth"})
         );
+    }
+
+    fn parse_chat(extra: &str) -> ConversationMeta {
+        serde_json::from_str(&format!(
+            r#"{{"id":"x","title":"","provider_id":"p","model":"m","created_at":"t","updated_at":"t"{extra}}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn missing_mcp_ids_means_all_connectors() {
+        let meta = parse_chat("");
+        assert!(meta.mcp_ids.is_none());
+        assert!(meta.allows_mcp("any"));
+    }
+
+    #[test]
+    fn empty_mcp_ids_means_none() {
+        let meta = parse_chat(r#", "mcp_ids": []"#);
+        assert!(!meta.allows_mcp("a"));
+    }
+
+    #[test]
+    fn mcp_ids_allowlist() {
+        let meta = parse_chat(r#", "mcp_ids": ["a"]"#);
+        assert!(meta.allows_mcp("a"));
+        assert!(!meta.allows_mcp("b"));
     }
 }

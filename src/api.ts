@@ -129,6 +129,9 @@ export const conversationSetModel = (
 export const conversationSetEffort = (id: string, effort: EffortLevel | null) =>
   invoke<void>("conversation_set_effort", { id, effort });
 
+export const conversationSetMcpIds = (id: string, mcpIds: string[] | null) =>
+  invoke<void>("conversation_set_mcp_ids", { id, mcpIds });
+
 /** Effort levels the model supports per models.dev; empty = hide the selector. */
 export const effortLevels = (kind: string, model: string) =>
   invoke<EffortLevel[]>("effort_levels", { kind, model });

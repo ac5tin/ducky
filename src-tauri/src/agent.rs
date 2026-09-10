@@ -234,8 +234,25 @@ impl Agent {
                 model: model.clone(),
             }));
 
-            // Collect tools from every connected server, plus the builtins.
-            let tool_entries = self.manager.aggregated_tools();
+            // Collect tools from connected servers this chat allows, plus the builtins.
+            let allow = {
+                let cfg = self.store.config.lock().unwrap();
+                cfg.conversations
+                    .iter()
+                    .find(|c| c.id == conversation_id)
+                    .cloned()
+            };
+            let tool_entries: Vec<_> = self
+                .manager
+                .aggregated_tools()
+                .into_iter()
+                .filter(|t| {
+                    allow
+                        .as_ref()
+                        .map(|m| m.allows_mcp(&t.server_id))
+                        .unwrap_or(true)
+                })
+                .collect();
             let mut tools: Vec<ToolDef> = tool_entries
                 .iter()
                 .map(|t| ToolDef {

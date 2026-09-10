@@ -61,6 +61,7 @@ mod tests {
             provider_id: "chat-p".into(),
             model: "chat-m".into(),
             effort: Some(EffortLevel::High),
+            mcp_ids: None,
             created_at: "t".into(),
             updated_at: "t".into(),
         }

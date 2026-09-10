@@ -396,6 +396,7 @@ pub fn conversation_create(
         provider_id,
         model,
         effort,
+        mcp_ids: None,
         created_at: now(),
         updated_at: now(),
     };
@@ -468,6 +469,22 @@ pub fn conversation_set_effort(
             return Err("Unknown conversation".into());
         };
         meta.effort = effort;
+    }
+    state.store.save_config().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn conversation_set_mcp_ids(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    mcp_ids: Option<Vec<String>>,
+) -> Result<(), String> {
+    {
+        let mut c = state.store.config.lock().unwrap();
+        let Some(meta) = c.conversations.iter_mut().find(|c| c.id == id) else {
+            return Err("Unknown conversation".into());
+        };
+        meta.mcp_ids = mcp_ids;
     }
     state.store.save_config().map_err(|e| e.to_string())
 }

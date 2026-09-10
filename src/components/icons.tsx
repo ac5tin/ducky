@@ -326,6 +326,13 @@ const paths: Record<string, ReactElement> = {
       />
     </>
   ),
+  more: (
+    <>
+      <circle cx="12" cy="6" r="1.6" fill="currentColor" />
+      <circle cx="12" cy="12" r="1.6" fill="currentColor" />
+      <circle cx="12" cy="18" r="1.6" fill="currentColor" />
+    </>
+  ),
 };
 
 export type IconName = keyof typeof paths | string;

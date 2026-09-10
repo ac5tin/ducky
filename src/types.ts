@@ -99,6 +99,7 @@ export interface ConversationMeta {
         provider_id: string;
         model: string;
         effort: EffortLevel | null;
+        mcp_ids?: string[] | null;
         created_at: string;
         updated_at: string;
 }
