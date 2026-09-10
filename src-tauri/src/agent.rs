@@ -177,7 +177,10 @@ impl Agent {
         user_text: String,
         ct: &CancellationToken,
     ) -> Result<(), String> {
-        history.push(Msg::User { text: user_text });
+        history.push(Msg::User {
+            text: user_text,
+            ts: Some(chrono::Utc::now().to_rfc3339()),
+        });
 
         let max_iterations = self
             .store
@@ -370,6 +373,7 @@ impl Agent {
             history.push(Msg::Assistant {
                 text: text.clone(),
                 tool_calls: calls.clone(),
+                ts: Some(chrono::Utc::now().to_rfc3339()),
             });
             self.persist(conversation_id, history)?;
 
@@ -675,7 +679,7 @@ impl Agent {
                 .ok_or("conversation missing")?;
             meta.updated_at = chrono::Utc::now().to_rfc3339();
             if meta.title.is_empty() {
-                if let Some(Msg::User { text }) =
+                if let Some(Msg::User { text, .. }) =
                     history.iter().find(|m| matches!(m, Msg::User { .. }))
                 {
                     meta.title = text.chars().take(48).collect();

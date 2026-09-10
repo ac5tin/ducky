@@ -33,10 +33,12 @@ impl AnthropicProvider {
         for msg in messages {
             match msg {
                 Msg::System { text } => system_parts.push(text.clone()),
-                Msg::User { text } => {
+                Msg::User { text, .. } => {
                     push_block(&mut out, "user", json!({"type": "text", "text": text}));
                 }
-                Msg::Assistant { text, tool_calls } => {
+                Msg::Assistant {
+                    text, tool_calls, ..
+                } => {
                     if !text.is_empty() {
                         push_block(&mut out, "assistant", json!({"type": "text", "text": text}));
                     }
@@ -328,6 +330,7 @@ mod tests {
             },
             Msg::User {
                 text: "hello".into(),
+                ts: None,
             },
             Msg::Assistant {
                 text: "let me check".into(),
@@ -336,6 +339,7 @@ mod tests {
                     name: "fs__read".into(),
                     arguments: json!({"path": "a.txt"}),
                 }],
+                ts: None,
             },
             Msg::ToolResult {
                 call_id: "t1".into(),
@@ -356,7 +360,10 @@ mod tests {
 
         // consecutive tool results merge into one user message
         let msgs2 = vec![
-            Msg::User { text: "go".into() },
+            Msg::User {
+                text: "go".into(),
+                ts: None,
+            },
             Msg::Assistant {
                 text: String::new(),
                 tool_calls: vec![
@@ -371,6 +378,7 @@ mod tests {
                         arguments: json!({}),
                     },
                 ],
+                ts: None,
             },
             Msg::ToolResult {
                 call_id: "a".into(),

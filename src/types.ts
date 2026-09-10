@@ -167,8 +167,8 @@ export interface ToolCall {
 
 export type RawMessage =
   | { kind: "system"; text: string }
-  | { kind: "user"; text: string }
-  | { kind: "assistant"; text: string; tool_calls: ToolCall[] }
+  | { kind: "user"; text: string; ts?: string | null }
+  | { kind: "assistant"; text: string; tool_calls: ToolCall[]; ts?: string | null }
   | { kind: "tool_result"; call_id: string; text: string; is_error: boolean };
 
 // ---------------------------------------------------------------------------

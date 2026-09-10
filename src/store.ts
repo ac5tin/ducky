@@ -23,12 +23,14 @@ export interface UserItem {
   kind: "user";
   id: string;
   text: string;
+  ts?: string;
 }
 
 export interface AssistantItem {
   kind: "assistant";
   id: string;
   text: string;
+  ts?: string;
   reasoning?: string;
   streaming?: boolean;
   error?: string;
@@ -165,12 +167,18 @@ function rawToItems(
   const items: ChatItem[] = [];
   for (const msg of raw) {
     if (msg.kind === "user") {
-      items.push({ kind: "user", id: `u-${items.length}`, text: msg.text });
+      items.push({
+        kind: "user",
+        id: `u-${items.length}`,
+        text: msg.text,
+        ts: msg.ts ?? undefined,
+      });
     } else if (msg.kind === "assistant") {
       items.push({
         kind: "assistant",
         id: `a-${items.length}`,
         text: msg.text,
+        ts: msg.ts ?? undefined,
       });
       for (const call of msg.tool_calls ?? []) {
         const state = toolStates.get(call.id) ?? {
@@ -368,7 +376,15 @@ export const useStore = create<StoreState>((set, get) => ({
     const id = get().activeConversationId;
     if (!id || get().streaming) return;
     set((s) => ({
-      items: [...s.items, { kind: "user", id: `u-live-${Date.now()}`, text }],
+      items: [
+        ...s.items,
+        {
+          kind: "user",
+          id: `u-live-${Date.now()}`,
+          text,
+          ts: new Date().toISOString(),
+        },
+      ],
       streaming: true,
       busyConversationIds: new Set([...s.busyConversationIds, id]),
     }));
@@ -465,6 +481,7 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
             kind: "assistant",
             id: `a-live-${Date.now()}`,
             text: event.text,
+            ts: new Date().toISOString(),
             streaming: true,
           });
         }
@@ -487,6 +504,7 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
             kind: "assistant",
             id: `a-live-${Date.now()}`,
             text: "",
+            ts: new Date().toISOString(),
             reasoning: event.text,
             streaming: true,
           });
@@ -531,6 +549,7 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
             kind: "assistant",
             id: `a-err-${Date.now()}`,
             text: "",
+            ts: new Date().toISOString(),
             error: event.error,
           });
         }

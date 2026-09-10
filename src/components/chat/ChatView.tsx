@@ -6,6 +6,7 @@ import { ToolCallCard } from "./ToolCallCard";
 import { ModelPicker } from "./ModelPicker";
 import { WorkingDirChip } from "./WorkingDirChip";
 import { TerminalPanel } from "./TerminalPanel";
+import { rfc9557, shortTime } from "../../time";
 
 export function ChatView() {
   const items = useStore((s) => s.items);
@@ -13,10 +14,19 @@ export function ChatView() {
   const activeId = useStore((s) => s.activeConversationId);
   const newConversation = useStore((s) => s.newConversation);
   const toggleTerminal = useStore((s) => s.toggleTerminal);
-  const terminalOpen = useStore((s) => !!s.activeConversationId && s.terminalOpenIds.has(s.activeConversationId));
+  const terminalOpen = useStore(
+    (s) =>
+      !!s.activeConversationId && s.terminalOpenIds.has(s.activeConversationId),
+  );
   const terminalHeight = useStore((s) => s.terminalHeight);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [showJump, setShowJump] = useState(false);
+  const [, setTick] = useState(0);
+
+  useEffect(() => {
+    const id = setInterval(() => setTick((n) => n + 1), 60_000);
+    return () => clearInterval(id);
+  }, []);
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -101,8 +111,11 @@ function MessageItem({ item }: { item: import("../../store").ChatItem }) {
   if (item.kind === "user") {
     return (
       <div className="flex justify-end">
-        <div className="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-md bg-sky-600 px-4 py-2.5 text-sm leading-relaxed text-white shadow-sm">
-          {item.text}
+        <div className="max-w-[85%]">
+          <div className="whitespace-pre-wrap rounded-2xl rounded-br-md bg-sky-600 px-4 py-2.5 text-sm leading-relaxed text-white shadow-sm">
+            {item.text}
+          </div>
+          <MessageTime ts={item.ts} align="right" />
         </div>
       </div>
     );
@@ -129,7 +142,9 @@ function MessageItem({ item }: { item: import("../../store").ChatItem }) {
           {item.text ? (
             <Markdown text={item.text} />
           ) : (
-            !item.streaming && <span className="text-sm text-slate-400">(empty response)</span>
+            !item.streaming && (
+              <span className="text-sm text-slate-400">(empty response)</span>
+            )
           )}
           {item.error && (
             <div className="mt-2 flex items-start gap-2 rounded-lg bg-rose-50 px-3 py-2 text-sm text-rose-700 dark:bg-rose-950/50 dark:text-rose-300">
@@ -138,8 +153,24 @@ function MessageItem({ item }: { item: import("../../store").ChatItem }) {
             </div>
           )}
         </div>
+        <MessageTime ts={item.ts} align="left" />
       </div>
     </div>
+  );
+}
+
+function MessageTime({ ts, align }: { ts?: string; align: "left" | "right" }) {
+  if (!ts) return null;
+  return (
+    <time
+      className={`mt-1 block px-1 text-[11px] text-slate-400 dark:text-slate-500 ${
+        align === "right" ? "text-right" : "text-left"
+      }`}
+      dateTime={ts}
+      title={rfc9557(ts)}
+    >
+      {shortTime(ts)}
+    </time>
   );
 }
 

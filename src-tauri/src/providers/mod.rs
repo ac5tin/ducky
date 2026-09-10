@@ -25,11 +25,15 @@ pub enum Msg {
     },
     User {
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ts: Option<String>,
     },
     /// Assistant turn: optional text plus any tool calls it made.
     Assistant {
         text: String,
         tool_calls: Vec<ToolCall>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ts: Option<String>,
     },
     /// Result of one tool call, fed back to the model.
     ToolResult {
@@ -94,8 +98,7 @@ pub enum StopReason {
     Length,
 }
 
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ChatOptions {
     pub model: String,
     pub max_tokens: Option<u32>,
@@ -103,7 +106,6 @@ pub struct ChatOptions {
     /// Reasoning effort requested for this turn (None = provider default).
     pub effort: Option<crate::config::EffortLevel>,
 }
-
 
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
@@ -274,5 +276,32 @@ mod tests {
         assert_eq!(v["kind"], "tool_result");
         let back = Msg::from_json(&v).unwrap();
         assert_eq!(back, m);
+    }
+
+    #[test]
+    fn msg_preserves_ts_on_roundtrip() {
+        let v = serde_json::json!({
+            "kind": "user",
+            "text": "hi",
+            "ts": "2026-01-15T12:00:00Z"
+        });
+        let m = Msg::from_json(&v).expect("user msg");
+        assert_eq!(m.as_json()["ts"], "2026-01-15T12:00:00Z");
+
+        let a = serde_json::json!({
+            "kind": "assistant",
+            "text": "ok",
+            "tool_calls": [],
+            "ts": "2026-01-15T12:00:01Z"
+        });
+        let m = Msg::from_json(&a).expect("assistant msg");
+        assert_eq!(m.as_json()["ts"], "2026-01-15T12:00:01Z");
+    }
+
+    #[test]
+    fn msg_old_json_without_ts_still_loads() {
+        let v = serde_json::json!({"kind": "user", "text": "hi"});
+        let m = Msg::from_json(&v).expect("legacy user msg");
+        assert!(m.as_json().get("ts").is_none());
     }
 }

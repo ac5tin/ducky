@@ -71,8 +71,10 @@ impl OpenAiProvider {
         for msg in messages {
             match msg {
                 Msg::System { text } => out.push(json!({"role": "system", "content": text})),
-                Msg::User { text } => out.push(json!({"role": "user", "content": text})),
-                Msg::Assistant { text, tool_calls } => {
+                Msg::User { text, .. } => out.push(json!({"role": "user", "content": text})),
+                Msg::Assistant {
+                    text, tool_calls, ..
+                } => {
                     let mut m = json!({"role": "assistant"});
                     m["content"] = if text.is_empty() {
                         Value::Null
@@ -314,6 +316,7 @@ mod tests {
             },
             Msg::User {
                 text: "hello".into(),
+                ts: None,
             },
             Msg::Assistant {
                 text: "".into(),
@@ -322,6 +325,7 @@ mod tests {
                     name: "fs__read".into(),
                     arguments: json!({"path": "a.txt"}),
                 }],
+                ts: None,
             },
             Msg::ToolResult {
                 call_id: "c1".into(),
