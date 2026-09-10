@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
   <id>app.ducky.mcp</id>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
   <launchable type="desktop-id">app.ducky.mcp.desktop</launchable>
   <name>Ducky</name>
   <summary>A friendly MCP client</summary>

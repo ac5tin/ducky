@@ -311,7 +311,7 @@ export function SettingsView() {
               <span className="flex h-6 w-6 items-center justify-center rounded-lg bg-sky-500 text-white">
                 <Icon name="duck" className="h-4 w-4" />
               </span>
-              Ducky {version}
+              Ducky v{version}
             </p>
             <p>MCP specification: 2026-07-28 (full client support).</p>
             <p>

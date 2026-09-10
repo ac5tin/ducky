@@ -38,6 +38,11 @@ jobs:
           node-version: lts/*
           cache: npm
 
+      - name: set version from tag
+        shell: bash
+        run: |
+          node -e "const fs=require('fs'); const v=process.env.GITHUB_REF_NAME.replace(/^v/,''); const j=p=>{const o=JSON.parse(fs.readFileSync(p,'utf8')); o.version=v; fs.writeFileSync(p, JSON.stringify(o,null,2)+'\n');}; j('package.json'); j('src-tauri/tauri.conf.json'); let t=fs.readFileSync('src-tauri/Cargo.toml','utf8'); t=t.replace(/^version = \"[^\"]+\"/m, 'version = \"'+v+'\"'); fs.writeFileSync('src-tauri/Cargo.toml', t); console.log('version', v);"
+
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:

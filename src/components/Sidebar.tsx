@@ -148,7 +148,7 @@ export function Sidebar() {
           </button>
         ))}
         <div className="px-3 pb-1 pt-2 text-[10px] text-slate-300 dark:text-slate-600">
-          Ducky {version} · MCP 2026-07-28
+          Ducky v{version} · MCP 2026-07-28
         </div>
       </nav>
     </aside>
