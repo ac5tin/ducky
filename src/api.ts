@@ -68,9 +68,11 @@ export const providerUpdate = (update: {
 export const providerDelete = (id: string) =>
   invoke<void>("provider_delete", { id });
 
-export const providerTest = (id: string) => invoke<string[]>("provider_test", { id });
+export const providerTest = (id: string) =>
+  invoke<string[]>("provider_test", { id });
 
-export const providerHasKey = (id: string) => invoke<boolean>("provider_has_key", { id });
+export const providerHasKey = (id: string) =>
+  invoke<boolean>("provider_has_key", { id });
 
 // ---------------------------------------------------------------------------
 // Settings
@@ -106,8 +108,11 @@ export const conversationDelete = (id: string) =>
 export const conversationRename = (id: string, title: string) =>
   invoke<void>("conversation_rename", { id, title });
 
-export const conversationSetModel = (id: string, providerId: string, model: string) =>
-  invoke<void>("conversation_set_model", { id, providerId, model });
+export const conversationSetModel = (
+  id: string,
+  providerId: string,
+  model: string,
+) => invoke<void>("conversation_set_model", { id, providerId, model });
 
 export const conversationSetEffort = (id: string, effort: EffortLevel | null) =>
   invoke<void>("conversation_set_effort", { id, effort });
@@ -122,7 +127,8 @@ export const contextLimit = (kind: string, model: string) =>
 
 export const conversationGet = (
   id: string,
-): Promise<[ConversationMeta, RawMessage[]]> => invoke("conversation_get", { id });
+): Promise<[ConversationMeta, RawMessage[]]> =>
+  invoke("conversation_get", { id });
 
 export const chatSend = (conversationId: string, text: string) =>
   invoke<void>("chat_send", { conversationId, text });
@@ -140,8 +146,11 @@ export const terminalCreate = (conversationId: string) =>
 export const terminalWrite = (conversationId: string, data: string) =>
   invoke<void>("terminal_write", { conversationId, data });
 
-export const terminalResize = (conversationId: string, cols: number, rows: number) =>
-  invoke<void>("terminal_resize", { conversationId, cols, rows });
+export const terminalResize = (
+  conversationId: string,
+  cols: number,
+  rows: number,
+) => invoke<void>("terminal_resize", { conversationId, cols, rows });
 
 export const terminalClose = (conversationId: string) =>
   invoke<void>("terminal_close", { conversationId });
@@ -153,7 +162,10 @@ export const terminalClose = (conversationId: string) =>
 export const approvalRespond = (
   requestId: string,
   decision: "allow_once" | "always_allow" | "deny",
-) => invoke<boolean>("approval_respond", { response: { request_id: requestId, decision } });
+) =>
+  invoke<boolean>("approval_respond", {
+    response: { request_id: requestId, decision },
+  });
 
 export const elicitationRespond = (
   requestId: string,
@@ -188,13 +200,16 @@ export const mcpSetEnabled = (id: string, enabled: boolean) =>
 
 export const mcpConnect = (id: string) => invoke<string>("mcp_connect", { id });
 
-export const mcpDisconnect = (id: string) => invoke<void>("mcp_disconnect", { id });
+export const mcpDisconnect = (id: string) =>
+  invoke<void>("mcp_disconnect", { id });
 
 export const mcpSummaries = () => invoke<ServerSummary[]>("mcp_summaries");
 
-export const mcpSummary = (id: string) => invoke<ServerSummary>("mcp_summary", { id });
+export const mcpSummary = (id: string) =>
+  invoke<ServerSummary>("mcp_summary", { id });
 
-export const mcpRefresh = (id: string) => invoke<ServerSummary>("mcp_refresh", { id });
+export const mcpRefresh = (id: string) =>
+  invoke<ServerSummary>("mcp_refresh", { id });
 
 export const mcpReadResource = (serverId: string, uri: string) =>
   invoke<any>("mcp_read_resource", { serverId, uri });
@@ -217,18 +232,27 @@ export const mcpImportPreview = (text: string) =>
 export const mcpImportAdd = (servers: { name: string; transport: any }[]) =>
   invoke<number>("mcp_import_add", { servers });
 
-export const mcpOauthLogin = (id: string) => invoke<void>("mcp_oauth_login", { id });
+export const mcpOauthLogin = (id: string) =>
+  invoke<void>("mcp_oauth_login", { id });
 
-export const mcpOauthLogout = (id: string) => invoke<void>("mcp_oauth_logout", { id });
+export const mcpOauthLogout = (id: string) =>
+  invoke<void>("mcp_oauth_logout", { id });
 
 export const mcpSetBearerToken = (id: string, token: string) =>
   invoke<void>("mcp_set_bearer_token", { id, token });
 
-export const mcpHasAuth = (id: string) => invoke<string>("mcp_has_auth", { id });
+export const mcpHasAuth = (id: string) =>
+  invoke<string>("mcp_has_auth", { id });
 
 export const mcpSetOauthConfig = (
   id: string,
   clientId: string | null,
   clientSecret: string | null,
   redirectPort: number | null,
-) => invoke<void>("mcp_set_oauth_config", { id, clientId, clientSecret, redirectPort });
+) =>
+  invoke<void>("mcp_set_oauth_config", {
+    id,
+    clientId,
+    clientSecret,
+    redirectPort,
+  });

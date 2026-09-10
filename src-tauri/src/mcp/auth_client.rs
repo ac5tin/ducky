@@ -42,7 +42,9 @@ pub struct AuthHttpClient {
     inner: reqwest::Client,
 }
 
-fn map_delegate_error(err: StreamableHttpError<reqwest::Error>) -> StreamableHttpError<AuthClientError> {
+fn map_delegate_error(
+    err: StreamableHttpError<reqwest::Error>,
+) -> StreamableHttpError<AuthClientError> {
     use StreamableHttpError as E;
     match err {
         E::Sse(e) => E::Sse(e),
@@ -136,11 +138,13 @@ impl AuthHttpClient {
                             AuthReason::Missing
                         };
                         self.notify_auth(reason, Some(m.clone()));
-                        Err(StreamableHttpError::Client(AuthClientError::ReauthRequired(m)))
+                        Err(StreamableHttpError::Client(
+                            AuthClientError::ReauthRequired(m),
+                        ))
                     }
-                    Err(AuthFailure::Transient(m)) => Err(StreamableHttpError::Client(
-                        AuthClientError::Transient(m),
-                    )),
+                    Err(AuthFailure::Transient(m)) => {
+                        Err(StreamableHttpError::Client(AuthClientError::Transient(m)))
+                    }
                 }
             }
         }
@@ -187,9 +191,9 @@ impl AuthHttpClient {
                     if let StreamableHttpError::InsufficientScope(err) = &e {
                         let detail = insufficient_scope_detail(err);
                         self.notify_auth(AuthReason::Scope, Some(detail.clone()));
-                        return Err(StreamableHttpError::Client(AuthClientError::ReauthRequired(
-                            detail,
-                        )));
+                        return Err(StreamableHttpError::Client(
+                            AuthClientError::ReauthRequired(detail),
+                        ));
                     }
                     return Err(map_delegate_error(e));
                 }

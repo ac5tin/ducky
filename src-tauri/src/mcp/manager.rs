@@ -9,9 +9,9 @@ use std::time::Duration;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams,
     CompleteRequestParams, CompleteResult, ContentBlock, GetPromptRequestParams, GetPromptResult,
-    GetTaskParams, InputRequest, InputRequests, InputResponses, JsonObject, ListToolsResult,
-    ListRootsResult, NumberOrString, PaginatedRequestParams, ProgressToken, ProtocolVersion, Root,
-    ReadResourceRequestParams, ReadResourceResult, Reference, RequestMetaObject,
+    GetTaskParams, InputRequest, InputRequests, InputResponses, JsonObject, ListRootsResult,
+    ListToolsResult, NumberOrString, PaginatedRequestParams, ProgressToken, ProtocolVersion,
+    ReadResourceRequestParams, ReadResourceResult, Reference, RequestMetaObject, Root,
     ServerNotification, SubscriptionFilter, TaskPayload, TaskStatus, Tool, UpdateTaskParams,
     DEFAULT_MRTR_MAX_ROUNDS,
 };
@@ -235,9 +235,7 @@ impl ServerHandle {
             match response {
                 CallToolResponse::Complete(result) => return Ok(result),
                 CallToolResponse::Task(task) => {
-                    return self
-                        .poll_task(&peer, task.task.task_id, on_task, ct)
-                        .await;
+                    return self.poll_task(&peer, task.task.task_id, on_task, ct).await;
                 }
                 CallToolResponse::InputRequired(result) => {
                     let had_requests = result
@@ -323,9 +321,9 @@ impl ServerHandle {
                         .map_err(|e| e.to_string())?;
                 }
                 TaskPayload::Completed { result } => {
-                    return serde_json::from_value::<CallToolResult>(
-                        serde_json::Value::Object(result),
-                    )
+                    return serde_json::from_value::<CallToolResult>(serde_json::Value::Object(
+                        result,
+                    ))
                     .map_err(|e| format!("The server returned an invalid task result: {e}"));
                 }
                 TaskPayload::Failed { error } => {
@@ -387,14 +385,9 @@ impl ServerHandle {
                             root
                         })
                         .collect();
-                    serde_json::to_value(ListRootsResult::new(list))
-                        .map_err(|e| e.to_string())?
+                    serde_json::to_value(ListRootsResult::new(list)).map_err(|e| e.to_string())?
                 }
-                _ => {
-                    return Err(
-                        "The server requested an unsupported kind of input".to_string()
-                    )
-                }
+                _ => return Err("The server requested an unsupported kind of input".to_string()),
             };
             out.insert(key, value);
         }
@@ -455,9 +448,7 @@ impl AuthCoordinator {
 
     fn auth_generation(&self, server_id: &str) -> u64 {
         let gens = self.auth_gens.lock().unwrap();
-        gens.get(server_id)
-            .map(|tx| *tx.borrow())
-            .unwrap_or(0)
+        gens.get(server_id).map(|tx| *tx.borrow()).unwrap_or(0)
     }
 
     /// Bump the auth generation: everyone waiting for sign-in resumes.
@@ -555,8 +546,7 @@ impl McpManager {
             .lock()
             .unwrap()
             .insert(server_id.to_string(), status);
-        self.auth
-            .emit_status(server_id, status_str, detail, reason);
+        self.auth.emit_status(server_id, status_str, detail, reason);
     }
 
     /// Entry point for the transport wrapper and the background refresher:
@@ -803,8 +793,7 @@ impl McpManager {
             .lock()
             .unwrap()
             .insert(server_id.to_string(), ServerStatus::Disconnected);
-        self.auth
-            .emit_status(server_id, "disconnected", None, None);
+        self.auth.emit_status(server_id, "disconnected", None, None);
     }
 
     /// Connect every enabled server that is not already connected.
