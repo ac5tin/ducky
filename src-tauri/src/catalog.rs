@@ -1,9 +1,10 @@
-//! models.dev catalog: per-model reasoning effort levels.
+//! models.dev catalog: per-model reasoning effort levels and context windows.
 //!
 //! Fetches <https://models.dev/api.json> and indexes the
 //! `reasoning_options` entries of type `effort` so the UI can offer exactly
-//! the levels each model supports. Cached in memory (24h) and on disk so a
-//! failed refresh degrades to slightly stale data instead of nothing.
+//! the levels each model supports, plus each model's `limit.context`.
+//! Cached in memory (24h) and on disk so a failed refresh degrades to slightly
+//! stale data instead of nothing.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -18,6 +19,8 @@ const MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// effort levels per provider id -> model id, indexed from models.dev.
 /// An empty level list means "model known, no effort control" (hide the UI).
 pub type Index = HashMap<String, HashMap<String, Vec<EffortLevel>>>;
+/// context window (tokens) per provider id -> model id.
+pub type ContextIndex = HashMap<String, HashMap<String, u64>>;
 
 pub struct Catalog {
     state: Mutex<CatalogState>,
@@ -27,6 +30,7 @@ pub struct Catalog {
 #[derive(Default)]
 struct CatalogState {
     index: Option<Index>,
+    context: Option<ContextIndex>,
     /// When the in-memory index was fetched; `None` = loaded from disk (stale).
     fetched_at: Option<Instant>,
 }
@@ -39,6 +43,7 @@ impl Catalog {
         Self {
             state: Mutex::new(CatalogState {
                 index,
+                context: None,
                 fetched_at: None,
             }),
             cache_path: Some(cache_path.to_path_buf()),
@@ -48,29 +53,40 @@ impl Catalog {
     /// Effort levels for a Ducky provider kind + model id. Empty = hide the
     /// effort selector; unknown models fall back to the default trio.
     pub async fn effort_levels(&self, kind: &str, model: &str) -> Vec<EffortLevel> {
+        self.refresh_if_stale().await;
+        let st = self.state.lock().unwrap();
+        match &st.index {
+            Some(index) => lookup(index, kind, model),
+            None => EffortLevel::default_levels(),
+        }
+    }
+
+    /// Context window in tokens for a Ducky provider kind + model id.
+    pub async fn context_limit(&self, kind: &str, model: &str) -> Option<u64> {
+        self.refresh_if_stale().await;
+        let st = self.state.lock().unwrap();
+        lookup_context(st.context.as_ref()?, kind, model)
+    }
+
+    async fn refresh_if_stale(&self) {
         {
             let st = self.state.lock().unwrap();
-            if let (Some(index), Some(at)) = (&st.index, st.fetched_at) {
+            if let (Some(_), Some(at)) = (&st.index, st.fetched_at) {
                 if at.elapsed() < MAX_AGE {
-                    return lookup(index, kind, model);
+                    return;
                 }
             }
         }
-        match fetch_index().await {
-            Ok(index) => {
+        match fetch_catalog().await {
+            Ok((index, context)) => {
                 self.store_cache(&index);
                 let mut st = self.state.lock().unwrap();
                 st.index = Some(index);
+                st.context = Some(context);
                 st.fetched_at = Some(Instant::now());
-                lookup(st.index.as_ref().unwrap(), kind, model)
             }
             Err(e) => {
                 tracing::warn!("models.dev catalog unavailable: {e}");
-                let st = self.state.lock().unwrap();
-                match &st.index {
-                    Some(index) => lookup(index, kind, model),
-                    None => EffortLevel::default_levels(),
-                }
             }
         }
     }
@@ -89,7 +105,7 @@ impl Catalog {
     }
 }
 
-async fn fetch_index() -> anyhow::Result<Index> {
+async fn fetch_catalog() -> anyhow::Result<(Index, ContextIndex)> {
     let body = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?
@@ -99,15 +115,20 @@ async fn fetch_index() -> anyhow::Result<Index> {
         .error_for_status()?
         .text()
         .await?;
-    parse_index(&body)
+    parse_catalog(&body)
 }
 
 pub fn parse_index(body: &str) -> anyhow::Result<Index> {
+    Ok(parse_catalog(body)?.0)
+}
+
+pub fn parse_catalog(body: &str) -> anyhow::Result<(Index, ContextIndex)> {
     let value: serde_json::Value = serde_json::from_str(body)?;
     let Some(providers) = value.as_object() else {
         anyhow::bail!("unexpected catalog shape");
     };
     let mut index = Index::new();
+    let mut context = ContextIndex::new();
     for (provider_id, pv) in providers {
         let Some(models) = pv.get("models").and_then(|m| m.as_object()) else {
             continue;
@@ -123,9 +144,17 @@ pub fn parse_index(body: &str) -> anyhow::Result<Index> {
                     .or_default()
                     .insert(model_id.clone(), levels);
             }
+            if let Some(n) = mv.pointer("/limit/context").and_then(|v| v.as_u64()) {
+                if n > 0 {
+                    context
+                        .entry(provider_id.clone())
+                        .or_default()
+                        .insert(model_id.clone(), n);
+                }
+            }
         }
     }
-    Ok(index)
+    Ok((index, context))
 }
 
 /// Union of all `effort`-type `reasoning_options` values, catalog order.
@@ -192,6 +221,38 @@ pub fn lookup(index: &Index, kind: &str, model: &str) -> Vec<EffortLevel> {
     EffortLevel::default_levels()
 }
 
+pub fn lookup_context(index: &ContextIndex, kind: &str, model: &str) -> Option<u64> {
+    let model = model.trim();
+    if model.is_empty() {
+        return None;
+    }
+    let aliases = provider_aliases(kind);
+    for pid in &aliases {
+        if let Some(&n) = index.get(*pid).and_then(|m| m.get(model)) {
+            return Some(n);
+        }
+    }
+    let bare = bare_model_id(model);
+    for pid in &aliases {
+        if let Some(&n) = index.get(*pid).and_then(|m| m.get(&bare)) {
+            return Some(n);
+        }
+    }
+    let mut hits: Vec<(&String, u64)> = index
+        .iter()
+        .flat_map(|(pid, models)| {
+            models
+                .iter()
+                .filter(|(mid, _)| bare_model_id(mid) == bare)
+                .map(move |(_, n)| (pid, *n))
+        })
+        .collect();
+    hits.sort_by(|(a, _), (b, _)| {
+        (provider_rank(a), a.as_str()).cmp(&(provider_rank(b), b.as_str()))
+    });
+    hits.first().map(|(_, n)| *n)
+}
+
 /// Canonical models.dev provider ids for a Ducky provider kind, best first.
 fn provider_aliases(kind: &str) -> Vec<&'static str> {
     match kind {
@@ -243,9 +304,10 @@ mod tests {
                         "reasoning": true,
                         "reasoning_options": [
                             { "type": "effort", "values": ["none", "low", "medium", "high", "xhigh"] }
-                        ]
+                        ],
+                        "limit": { "context": 400000, "output": 128000 }
                     },
-                    "gpt-4o-mini": { "reasoning": false }
+                    "gpt-4o-mini": { "reasoning": false, "limit": { "context": 128000 } }
                 }
             },
             "zai": {
@@ -259,7 +321,7 @@ mod tests {
                         "reasoning": true,
                         "reasoning_options": [{ "type": "toggle" }]
                     },
-                    "glm-4.8": { "reasoning": false }
+                    "glm-4.8": { "reasoning": false, "limit": { "context": 204800 } }
                 }
             },
             "anthropic": {
@@ -361,5 +423,63 @@ mod tests {
             lookup(&back, "zai", "glm-5.3"),
             lookup(&index, "zai", "glm-5.3")
         );
+    }
+
+    fn context_fixture() -> ContextIndex {
+        parse_catalog(
+            &serde_json::to_string(&json!({
+                "openai": {
+                    "id": "openai",
+                    "models": {
+                        "gpt-5.5": {
+                            "reasoning": true,
+                            "limit": { "context": 400000 }
+                        },
+                        "gpt-4o-mini": { "reasoning": false, "limit": { "context": 128000 } }
+                    }
+                },
+                "zai": {
+                    "id": "zai",
+                    "models": {
+                        "glm-4.8": { "reasoning": false, "limit": { "context": 204800 } }
+                    }
+                },
+                "hpc-ai": {
+                    "id": "hpc-ai",
+                    "models": {
+                        "zai-org/glm-5.2": { "limit": { "context": 202752 } }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+        .1
+    }
+
+    #[test]
+    fn extracts_context_limit() {
+        let ctx = context_fixture();
+        assert_eq!(lookup_context(&ctx, "openai", "gpt-5.5"), Some(400000));
+        assert_eq!(lookup_context(&ctx, "openai", "gpt-4o-mini"), Some(128000));
+        assert_eq!(lookup_context(&ctx, "zai", "glm-4.8"), Some(204800));
+    }
+
+    #[test]
+    fn unknown_models_have_no_context_limit() {
+        let ctx = context_fixture();
+        assert_eq!(lookup_context(&ctx, "openai", "mystery"), None);
+        assert_eq!(lookup_context(&ctx, "custom", "mystery-model"), None);
+        assert_eq!(lookup_context(&ctx, "openai", ""), None);
+    }
+
+    #[test]
+    fn context_limit_matches_bare_model_id() {
+        let ctx = context_fixture();
+        assert_eq!(
+            lookup_context(&ctx, "custom", "zai-org/glm-5.2"),
+            Some(202752)
+        );
+        assert_eq!(lookup_context(&ctx, "custom", "gpt-5.5"), Some(400000));
     }
 }

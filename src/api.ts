@@ -116,6 +116,10 @@ export const conversationSetEffort = (id: string, effort: EffortLevel | null) =>
 export const effortLevels = (kind: string, model: string) =>
   invoke<EffortLevel[]>("effort_levels", { kind, model });
 
+/** Context window in tokens from models.dev; null if unknown. */
+export const contextLimit = (kind: string, model: string) =>
+  invoke<number | null>("context_limit", { kind, model });
+
 export const conversationGet = (
   id: string,
 ): Promise<[ConversationMeta, RawMessage[]]> => invoke("conversation_get", { id });

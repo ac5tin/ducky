@@ -327,7 +327,13 @@ impl Agent {
                                     .2
                                     .push_str(&fragment);
                             }
-                            Some(ProviderEvent::Usage { .. }) => {}
+                            Some(ProviderEvent::Usage { input, output }) => {
+                                self.sink.emit(BackendEvent::Usage {
+                                    conversation_id: conversation_id.to_string(),
+                                    input,
+                                    output,
+                                });
+                            }
                             None => break,
                         }
                     }
@@ -338,12 +344,22 @@ impl Agent {
             }
             // drain remaining events
             while let Ok(ev) = rx.try_recv() {
-                if let ProviderEvent::TextDelta(t) = ev {
-                    text.push_str(&t);
-                    self.sink.emit(BackendEvent::ChatDelta {
-                        conversation_id: conversation_id.to_string(),
-                        text: t,
-                    });
+                match ev {
+                    ProviderEvent::TextDelta(t) => {
+                        text.push_str(&t);
+                        self.sink.emit(BackendEvent::ChatDelta {
+                            conversation_id: conversation_id.to_string(),
+                            text: t,
+                        });
+                    }
+                    ProviderEvent::Usage { input, output } => {
+                        self.sink.emit(BackendEvent::Usage {
+                            conversation_id: conversation_id.to_string(),
+                            input,
+                            output,
+                        });
+                    }
+                    _ => {}
                 }
             }
             let stop = stop.ok_or("The provider stream ended unexpectedly")?;

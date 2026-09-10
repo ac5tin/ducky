@@ -212,6 +212,12 @@ export type BackendEvent =
   | { type: "reasoning_delta"; conversation_id: string; text: string }
   | { type: "message_done"; conversation_id: string; message_id: string }
   | { type: "chat_error"; conversation_id: string; error: string }
+  | {
+      type: "usage";
+      conversation_id: string;
+      input?: number | null;
+      output?: number | null;
+    }
   | ({ type: "tool_call_update"; conversation_id: string; tool_call_id: string; status: ToolCallState["status"] } & Partial<ToolCallState>)
   | {
       type: "approval_requested";

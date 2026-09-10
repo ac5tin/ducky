@@ -454,6 +454,16 @@ pub async fn effort_levels(
     Ok(state.catalog.effort_levels(&kind, &model).await)
 }
 
+/// Context window in tokens for the given model, from the models.dev catalog.
+#[tauri::command]
+pub async fn context_limit(
+    state: State<'_, Arc<AppState>>,
+    kind: String,
+    model: String,
+) -> Result<Option<u64>, String> {
+    Ok(state.catalog.context_limit(&kind, &model).await)
+}
+
 #[tauri::command]
 pub fn conversation_get(
     state: State<'_, Arc<AppState>>,

@@ -6,6 +6,7 @@ import { ToolCallCard } from "./ToolCallCard";
 import { ModelPicker } from "./ModelPicker";
 import { WorkingDirChip } from "./WorkingDirChip";
 import { TerminalPanel } from "./TerminalPanel";
+import { TokenMeter } from "./tokenUsage";
 import { rfc9557, shortTime } from "../../time";
 
 export function ChatView() {
@@ -62,12 +63,15 @@ export function ChatView() {
             <Icon name="terminal" className="h-4 w-4" />
           </button>
         </div>
-        {streaming && (
-          <span className="flex items-center gap-1.5 text-xs text-slate-400">
-            <Icon name="spinner" className="h-3.5 w-3.5 animate-spin" />
-            Working…
-          </span>
-        )}
+        <div className="flex items-center gap-3">
+          <TokenMeter />
+          {streaming && (
+            <span className="flex items-center gap-1.5 text-xs text-slate-400">
+              <Icon name="spinner" className="h-3.5 w-3.5 animate-spin" />
+              Working…
+            </span>
+          )}
+        </div>
       </div>
 
       <div

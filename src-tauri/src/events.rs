@@ -26,6 +26,12 @@ pub enum BackendEvent {
         conversation_id: String,
         error: String,
     },
+    /// Token usage for the last model call in a conversation.
+    Usage {
+        conversation_id: String,
+        input: Option<u64>,
+        output: Option<u64>,
+    },
     /// Tool call lifecycle updates. `status` is one of
     /// `pending_approval | running | awaiting_input | done | denied | error`.
     ToolCallUpdate {

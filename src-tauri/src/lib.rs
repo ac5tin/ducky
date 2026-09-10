@@ -79,6 +79,7 @@ pub fn run() {
             commands::conversation_set_effort,
             commands::conversation_get,
             commands::effort_levels,
+            commands::context_limit,
             commands::chat_send,
             commands::chat_cancel,
             commands::terminal_create,

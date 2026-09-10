@@ -112,6 +112,8 @@ interface StoreState {
   items: ChatItem[];
   streaming: boolean;
   busyConversationIds: Set<string>;
+  /** Last provider token usage per conversation. */
+  usageByConversation: Record<string, { input?: number; output?: number }>;
 
   /** Conversations whose terminal panel is open; the PTY lives in the backend. */
   terminalOpenIds: Set<string>;
@@ -234,6 +236,7 @@ export const useStore = create<StoreState>((set, get) => ({
   items: [],
   streaming: false,
   busyConversationIds: new Set(),
+  usageByConversation: {},
 
   terminalOpenIds: new Set(),
   terminalHeight: 300,
@@ -528,6 +531,18 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
       get()
         .refreshConfig()
         .catch(() => {});
+      break;
+    }
+    case "usage": {
+      set((s) => ({
+        usageByConversation: {
+          ...s.usageByConversation,
+          [event.conversation_id]: {
+            input: event.input ?? undefined,
+            output: event.output ?? undefined,
+          },
+        },
+      }));
       break;
     }
     case "chat_error": {
