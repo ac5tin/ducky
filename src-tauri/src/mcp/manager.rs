@@ -223,7 +223,6 @@ impl ServerHandle {
         let service = guard.as_ref().ok_or("Server is not connected")?;
         let peer = service.peer().clone();
 
-        let mut state_only_rounds = 0usize;
         for _round in 0..DEFAULT_MRTR_MAX_ROUNDS {
             let response = {
                 let call = peer.call_tool_once(params.clone());
@@ -248,12 +247,9 @@ impl ServerHandle {
                     let responses = self
                         .fulfill_input_requests(result.input_requests.unwrap_or_default())
                         .await?;
-                    if had_requests {
-                        state_only_rounds = 0;
-                    } else {
+                    if !had_requests {
                         // Server asked us to wait on request state alone.
                         tokio::time::sleep(Duration::from_millis(500)).await;
-                        state_only_rounds += 1;
                     }
                     params.input_responses = (!responses.is_empty()).then_some(responses);
                     params.request_state = result.request_state;
@@ -459,7 +455,7 @@ impl AuthCoordinator {
                 .or_insert_with(|| watch::channel(0u64).0)
                 .clone()
         };
-        let _ = tx.send(tx.borrow().wrapping_add(1));
+        tx.send_modify(|v| *v = v.wrapping_add(1));
     }
 
     /// Resolve once sign-in completes (generation advances past `previous`).
@@ -691,24 +687,39 @@ impl McpManager {
             legacy_version: None,
         };
 
-        let service = match built {
-            BuiltTransport::Stdio(transport) => {
-                rmcp::service::serve_client_with_lifecycle_and_ct(
-                    handler.clone(),
-                    transport,
-                    lifecycle,
-                    ct.clone(),
-                )
-                .await
+        let handshake = async {
+            match built {
+                BuiltTransport::Stdio(transport) => {
+                    rmcp::service::serve_client_with_lifecycle_and_ct(
+                        handler.clone(),
+                        transport,
+                        lifecycle,
+                        ct.clone(),
+                    )
+                    .await
+                }
+                BuiltTransport::Http(transport) => {
+                    rmcp::service::serve_client_with_lifecycle_and_ct(
+                        handler.clone(),
+                        transport,
+                        lifecycle,
+                        ct.clone(),
+                    )
+                    .await
+                }
             }
-            BuiltTransport::Http(transport) => {
-                rmcp::service::serve_client_with_lifecycle_and_ct(
-                    handler.clone(),
-                    transport,
-                    lifecycle,
-                    ct.clone(),
-                )
-                .await
+        };
+        let service = match tokio::time::timeout(Duration::from_secs(20), handshake).await {
+            Ok(inner) => inner,
+            Err(_) => {
+                ct.cancel();
+                self.set_status(
+                    server_id,
+                    ServerStatus::Error {
+                        message: "Timed out connecting to the server".into(),
+                    },
+                );
+                return Ok(self.status(server_id));
             }
         };
 
@@ -755,25 +766,22 @@ impl McpManager {
             }
         ));
 
-        // Learn everything about the server.
-        match self.refresh_data(&handle).await {
-            Ok(data) => {
-                *handle.data.lock().unwrap() = data;
-            }
-            Err(e) => {
-                handle.log(format!("listing failed: {e}"));
-            }
-        }
-
-        // Open a subscriptions/listen stream (modern servers only; legacy
-        // servers push notifications through the client handler instead).
-        self.spawn_list_changed_subscription(handle.clone());
-
+        // Publish the session before listing so OAuth waiters can retry as
+        // soon as initialize finishes. Listing is best-effort.
         self.handles
             .lock()
             .unwrap()
-            .insert(server_id.to_string(), handle);
+            .insert(server_id.to_string(), handle.clone());
         self.set_status(server_id, ServerStatus::Connected);
+        self.spawn_list_changed_subscription(handle.clone());
+
+        match tokio::time::timeout(Duration::from_secs(8), self.refresh_data(&handle)).await {
+            Ok(Ok(data)) => {
+                *handle.data.lock().unwrap() = data;
+            }
+            Ok(Err(e)) => handle.log(format!("listing failed: {e}")),
+            Err(_) => handle.log("listing timed out"),
+        }
         Ok(ServerStatus::Connected)
     }
 
@@ -785,8 +793,8 @@ impl McpManager {
             }
             h.ct.cancel();
             let service = h.service.lock().await.take();
-            if let Some(service) = service {
-                let _ = service.cancel().await;
+            if let Some(mut service) = service {
+                let _ = service.close_with_timeout(Duration::from_secs(2)).await;
             }
         }
         self.statuses
@@ -958,7 +966,14 @@ impl McpManager {
         let peer = handle.peer().await.ok_or("Server is not connected")?;
         let mut data = ServerData::default();
 
-        if let Some(info) = handle.peer_info().await {
+        let info = handle.peer_info().await;
+        let has_resources = info
+            .as_ref()
+            .is_some_and(|i| i.capabilities.resources.is_some());
+        let has_prompts = info
+            .as_ref()
+            .is_some_and(|i| i.capabilities.prompts.is_some());
+        if let Some(info) = info {
             data.protocol_version = Some(info.protocol_version.as_str().to_string());
             data.capabilities = serde_json::to_value(&info.capabilities).ok();
             data.instructions = info.instructions.clone();
@@ -989,58 +1004,62 @@ impl McpManager {
             .map(|t| tool_entry(&handle.cfg.id, &slug, t))
             .collect();
 
-        // resources + templates (skip silently when the capability is absent)
-        let mut resources = Vec::new();
-        let mut cursor = None;
-        loop {
-            let params = PaginatedRequestParams::default().with_cursor(cursor);
-            match peer.list_resources(Some(params)).await {
-                Ok(result) => {
-                    resources.extend(serialize_all(&result.resources));
-                    cursor = result.next_cursor;
-                    if cursor.is_none() {
-                        break;
+        // Skip list RPCs the server did not advertise — a missing capability
+        // often means the call never returns, which used to block reconnect.
+        if has_resources {
+            let mut resources = Vec::new();
+            let mut cursor = None;
+            loop {
+                let params = PaginatedRequestParams::default().with_cursor(cursor);
+                match peer.list_resources(Some(params)).await {
+                    Ok(result) => {
+                        resources.extend(serialize_all(&result.resources));
+                        cursor = result.next_cursor;
+                        if cursor.is_none() {
+                            break;
+                        }
                     }
+                    Err(_) => break,
                 }
-                Err(_) => break,
             }
-        }
-        data.resources = resources;
+            data.resources = resources;
 
-        let mut templates = Vec::new();
-        let mut cursor = None;
-        loop {
-            let params = PaginatedRequestParams::default().with_cursor(cursor);
-            match peer.list_resource_templates(Some(params)).await {
-                Ok(result) => {
-                    templates.extend(serialize_all(&result.resource_templates));
-                    cursor = result.next_cursor;
-                    if cursor.is_none() {
-                        break;
+            let mut templates = Vec::new();
+            let mut cursor = None;
+            loop {
+                let params = PaginatedRequestParams::default().with_cursor(cursor);
+                match peer.list_resource_templates(Some(params)).await {
+                    Ok(result) => {
+                        templates.extend(serialize_all(&result.resource_templates));
+                        cursor = result.next_cursor;
+                        if cursor.is_none() {
+                            break;
+                        }
                     }
+                    Err(_) => break,
                 }
-                Err(_) => break,
             }
+            data.resource_templates = templates;
         }
-        data.resource_templates = templates;
 
-        // prompts
-        let mut prompts = Vec::new();
-        let mut cursor = None;
-        loop {
-            let params = PaginatedRequestParams::default().with_cursor(cursor);
-            match peer.list_prompts(Some(params)).await {
-                Ok(result) => {
-                    prompts.extend(serialize_all(&result.prompts));
-                    cursor = result.next_cursor;
-                    if cursor.is_none() {
-                        break;
+        if has_prompts {
+            let mut prompts = Vec::new();
+            let mut cursor = None;
+            loop {
+                let params = PaginatedRequestParams::default().with_cursor(cursor);
+                match peer.list_prompts(Some(params)).await {
+                    Ok(result) => {
+                        prompts.extend(serialize_all(&result.prompts));
+                        cursor = result.next_cursor;
+                        if cursor.is_none() {
+                            break;
+                        }
                     }
+                    Err(_) => break,
                 }
-                Err(_) => break,
             }
+            data.prompts = prompts;
         }
-        data.prompts = prompts;
 
         Ok(data)
     }

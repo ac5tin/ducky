@@ -557,7 +557,14 @@ impl Agent {
                     .await_reauth(conversation_id, &call.id, &entry, &server_title, ct)
                     .await
                 {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        self.emit_tool_update(
+                            conversation_id,
+                            &call.id,
+                            "running",
+                            serde_json::json!({}),
+                        );
+                    }
                     Err(e) => {
                         self.emit_tool_update(
                             conversation_id,
@@ -613,7 +620,15 @@ impl Agent {
                 .await_reauth(conversation_id, &call.id, &entry, &server_title, ct)
                 .await
             {
-                Ok(()) => result = attempt().await,
+                Ok(()) => {
+                    self.emit_tool_update(
+                        conversation_id,
+                        &call.id,
+                        "running",
+                        serde_json::json!({}),
+                    );
+                    result = attempt().await;
+                }
                 Err(e) => result = Err(e),
             }
         }

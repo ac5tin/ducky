@@ -1069,10 +1069,14 @@ pub async fn mcp_oauth_login(
     id: String,
 ) -> Result<(), String> {
     crate::oauth::login(app, state.store.clone(), state.sink.clone(), id.clone()).await?;
-    // Sign-in succeeded: wake any chat tool calls waiting for auth, then
-    // (re)connect the server. Status events drive the UI from here.
-    state.manager.notify_auth_completed(&id);
-    let _ = state.manager.connect(&id).await;
+    // Return as soon as tokens are stored so the tool card drops "Waiting for
+    // sign-in". Reconnect in the background; notify waiters only after that
+    // handshake so they do not start a second one.
+    let manager = state.manager.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = manager.connect(&id).await;
+        manager.notify_auth_completed(&id);
+    });
     Ok(())
 }
 

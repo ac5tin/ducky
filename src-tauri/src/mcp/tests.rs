@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::bridge::InteractiveBridge;
 use super::handler::DuckyClientHandler;
+use super::manager::McpManager;
 use crate::config::Store;
 use crate::events::{BackendEvent, CollectingSink};
 
@@ -334,4 +335,32 @@ async fn elicitation_decline_surfaces_to_server() {
         })
         .expect("text content");
     assert_eq!(text, "Hello, stranger!");
+}
+
+#[tokio::test]
+async fn notify_auth_completed_wakes_waiter() {
+    let sink = Arc::new(CollectingSink::default());
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::new(dir.path(), dir.path().to_path_buf()).unwrap());
+    let bridge = Arc::new(InteractiveBridge::new(sink.clone(), store.clone()));
+    let manager = Arc::new(McpManager::new(store, bridge, sink));
+
+    let waiter = tokio::spawn({
+        let m = manager.clone();
+        async move { m.wait_for_auth("s", 0, Duration::from_secs(2)).await }
+    });
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let m = manager.clone();
+    let notified = tokio::spawn(async move {
+        m.notify_auth_completed("s");
+    });
+    tokio::time::timeout(Duration::from_secs(1), notified)
+        .await
+        .expect("notify_auth_completed deadlocked")
+        .expect("notify task");
+    let result = tokio::time::timeout(Duration::from_secs(1), waiter).await;
+    assert!(result.is_ok(), "waiter did not resume");
+    assert!(result.unwrap().unwrap().is_ok());
 }

@@ -47,9 +47,14 @@ struct AuthServerMetadata {
 }
 
 fn client() -> reqwest::Client {
+    client_with_timeout(std::time::Duration::from_secs(20))
+}
+
+fn client_with_timeout(timeout: std::time::Duration) -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(std::time::Duration::from_secs(20))
+        .connect_timeout(timeout)
+        .timeout(timeout)
         .build()
         .expect("oauth http client")
 }
@@ -963,5 +968,26 @@ mod tests {
         assert!(html.contains("<title>Signed in \u{2014} Ducky</title>"));
         assert!(html.contains("You're signed in"));
         assert!(html.contains("You can close this tab and return to Ducky."));
+    }
+
+    #[tokio::test]
+    async fn oauth_http_client_times_out_when_server_stays_silent() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _accepted = listener.accept().await;
+            std::future::pending::<()>().await
+        });
+        let client = client_with_timeout(std::time::Duration::from_millis(300));
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.get(format!("http://{addr}/")).send(),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "client should time out internally, not hang"
+        );
+        assert!(result.unwrap().is_err());
     }
 }
