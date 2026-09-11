@@ -3,17 +3,22 @@
 //! token for every request and reacts to 401/403 challenges mid-session
 //! (refresh + retry once, then surface re-auth requirements).
 
-use std::{collections::HashMap, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use futures::stream::BoxStream;
+use futures::StreamExt;
 use http::{HeaderName, HeaderValue};
 use reqwest::StatusCode;
-use rmcp::model::ClientJsonRpcMessage;
+use rmcp::model::{ClientJsonRpcMessage, JsonRpcMessage, ServerJsonRpcMessage};
 use rmcp::transport::streamable_http_client::{
     AuthRequiredError, InsufficientScopeError, StreamableHttpClient, StreamableHttpError,
     StreamableHttpPostResponse,
 };
-use sse_stream::{Error as SseError, Sse};
+use sse_stream::{Error as SseError, Sse, SseStream};
+
+/// Python/TS SDKs list JSON first. Ruby servers that pick the first Accept
+/// type then return JSON instead of SSE-framing unicode tool results.
+const POST_ACCEPT: &str = "application/json, text/event-stream";
 
 use crate::config::{HttpAuth, McpServerConfig, Store};
 use crate::oauth::AuthFailure;
@@ -202,6 +207,127 @@ impl AuthHttpClient {
     }
 }
 
+fn parse_json_rpc_error(body: &str) -> Option<ServerJsonRpcMessage> {
+    match serde_json::from_str::<ServerJsonRpcMessage>(body) {
+        Ok(message @ JsonRpcMessage::Error(_)) => Some(message),
+        _ => None,
+    }
+}
+
+/// Same as rmcp's reqwest `post_message`, except Accept lists JSON first.
+async fn post_prefer_json(
+    client: &reqwest::Client,
+    uri: Arc<str>,
+    message: ClientJsonRpcMessage,
+    session_id: Option<Arc<str>>,
+    token: Option<String>,
+    custom_headers: HashMap<HeaderName, HeaderValue>,
+) -> Result<StreamableHttpPostResponse, StreamableHttpError<reqwest::Error>> {
+    let mut request = client
+        .post(uri.as_ref())
+        .header(reqwest::header::ACCEPT, POST_ACCEPT);
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    for (name, value) in custom_headers {
+        request = request.header(name, value);
+    }
+    let session_was_attached = session_id.is_some();
+    if let Some(session_id) = session_id {
+        request = request.header("mcp-session-id", session_id.as_ref());
+    }
+    let response = request.json(&message).send().await?;
+    if response.status() == StatusCode::UNAUTHORIZED {
+        if let Some(header) = response.headers().get(reqwest::header::WWW_AUTHENTICATE) {
+            let header = header
+                .to_str()
+                .map_err(|_| {
+                    StreamableHttpError::UnexpectedServerResponse(Cow::from(
+                        "invalid www-authenticate header value",
+                    ))
+                })?
+                .to_string();
+            return Err(StreamableHttpError::AuthRequired(AuthRequiredError::new(
+                header,
+            )));
+        }
+    }
+    if response.status() == StatusCode::FORBIDDEN {
+        if let Some(header) = response.headers().get(reqwest::header::WWW_AUTHENTICATE) {
+            let header_str = header.to_str().map_err(|_| {
+                StreamableHttpError::UnexpectedServerResponse(Cow::from(
+                    "invalid www-authenticate header value",
+                ))
+            })?;
+            // ponytail: skip WWW-Authenticate scope parse; generic re-auth if upgrade needed
+            return Err(StreamableHttpError::InsufficientScope(
+                InsufficientScopeError::new(header_str.to_string(), None),
+            ));
+        }
+    }
+    let status = response.status();
+    if matches!(status, StatusCode::ACCEPTED | StatusCode::NO_CONTENT) {
+        return Ok(StreamableHttpPostResponse::Accepted);
+    }
+    if status == StatusCode::NOT_FOUND && session_was_attached {
+        return Err(StreamableHttpError::SessionExpired);
+    }
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .map(|ct| String::from_utf8_lossy(ct.as_bytes()).into_owned());
+    let content_length = response.content_length();
+    let session_id = response
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    if status.is_success()
+        && content_length == Some(0)
+        && matches!(
+            message,
+            ClientJsonRpcMessage::Notification(_)
+                | ClientJsonRpcMessage::Response(_)
+                | ClientJsonRpcMessage::Error(_)
+        )
+    {
+        return Ok(StreamableHttpPostResponse::Accepted);
+    }
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<failed to read response body>".to_owned());
+        if content_type
+            .as_deref()
+            .is_some_and(|ct| ct.as_bytes().starts_with(b"application/json"))
+        {
+            if let Some(message) = parse_json_rpc_error(&body) {
+                return Ok(StreamableHttpPostResponse::Json(message, session_id));
+            }
+        }
+        return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
+            format!("HTTP {status}: {body}"),
+        )));
+    }
+    match content_type.as_deref() {
+        Some(ct) if ct.as_bytes().starts_with(b"text/event-stream") => {
+            // ponytail: no 16MB SSE size cap (rmcp limiter is crate-private); add if a server floods
+            Ok(StreamableHttpPostResponse::Sse(
+                SseStream::from_bytes_stream(response.bytes_stream()).boxed(),
+                session_id,
+            ))
+        }
+        Some(ct) if ct.as_bytes().starts_with(b"application/json") => {
+            match response.json::<ServerJsonRpcMessage>().await {
+                Ok(message) => Ok(StreamableHttpPostResponse::Json(message, session_id)),
+                Err(_) => Ok(StreamableHttpPostResponse::Accepted),
+            }
+        }
+        _ => Err(StreamableHttpError::UnexpectedContentType(content_type)),
+    }
+}
+
 impl StreamableHttpClient for AuthHttpClient {
     type Error = AuthClientError;
 
@@ -224,9 +350,7 @@ impl StreamableHttpClient for AuthHttpClient {
             let custom_headers = custom_headers.clone();
             let uri = uri.clone();
             async move {
-                inner
-                    .post_message(uri, message, session_id, token, custom_headers)
-                    .await
+                post_prefer_json(&inner, uri, message, session_id, token, custom_headers).await
             }
         })
         .await
@@ -278,5 +402,89 @@ impl StreamableHttpClient for AuthHttpClient {
             }
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::McpTransport;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn post_accept_lists_json_before_event_stream() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            loop {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+                if buf.len() > 32_000 {
+                    break;
+                }
+            }
+            let body = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::new(dir.path(), dir.path().to_path_buf()).unwrap());
+        let url = format!("http://{addr}/mcp");
+        let cfg = McpServerConfig {
+            id: "t".into(),
+            name: "t".into(),
+            transport: McpTransport::Http {
+                url: url.clone(),
+                headers: HashMap::new(),
+            },
+            auth: HttpAuth::None,
+            enabled: true,
+            auto_start: true,
+            oauth_client_id: None,
+            oauth_redirect_port: None,
+            created_at: "now".into(),
+        };
+        let client = AuthHttpClient::new(cfg, store, Arc::new(|_, _| {}));
+        let msg: ClientJsonRpcMessage =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#).unwrap();
+        let _ = client
+            .post_message(url.into(), msg, None, None, HashMap::new())
+            .await;
+
+        let req = rx.await.unwrap();
+        let accept = req
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("accept:"))
+            .expect("Accept header");
+        let value = accept
+            .split_once(':')
+            .unwrap()
+            .1
+            .trim()
+            .to_ascii_lowercase();
+        assert!(
+            value.starts_with("application/json"),
+            "Accept should list JSON first, got {value:?}"
+        );
+        assert!(
+            value.contains("text/event-stream"),
+            "Accept should still allow SSE, got {value:?}"
+        );
     }
 }
