@@ -28,6 +28,12 @@ export function ChatView() {
   );
   const terminalHeight = useStore((s) => s.terminalHeight);
   const scrollRef = useRef<HTMLDivElement>(null);
+  // null until this instance has rendered a conversation once — a remount
+  // (view switches unmount ChatView) must still jump to the latest message
+  const prevActiveId = useRef<string | null>(null);
+  // Set when the conversation changes; the next items render must land at the
+  // bottom (latest message), even if messages load async after the switch.
+  const jumpToBottom = useRef(false);
   const [showJump, setShowJump] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [connectorsOpen, setConnectorsOpen] = useState(false);
@@ -39,11 +45,26 @@ export function ChatView() {
   }, []);
 
   useEffect(() => {
+    if (prevActiveId.current !== activeId) {
+      prevActiveId.current = activeId;
+      jumpToBottom.current = true;
+    }
     const el = scrollRef.current;
     if (!el) return;
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 140;
-    if (nearBottom || streaming) el.scrollTop = el.scrollHeight;
-  }, [items, streaming]);
+    const jump = jumpToBottom.current && items.length > 0;
+    if (jump) jumpToBottom.current = false;
+    if (jump || nearBottom || streaming) {
+      el.scrollTop = el.scrollHeight;
+      if (jump) {
+        // one frame later: markdown/images settle the real height after paint
+        requestAnimationFrame(() => {
+          const el2 = scrollRef.current;
+          if (el2) el2.scrollTop = el2.scrollHeight;
+        });
+      }
+    }
+  }, [items, streaming, activeId]);
 
   if (!activeId) {
     return (

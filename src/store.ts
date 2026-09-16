@@ -323,6 +323,12 @@ export const useStore = create<StoreState>((set, get) => ({
   },
 
   async openConversation(id) {
+    if (id === get().activeConversationId) {
+      // clicking the chat we're already in: just show it — don't wipe items
+      // and reload, which would reset scroll to the top
+      set({ view: "chat" });
+      return;
+    }
     set({ activeConversationId: id, items: [], view: "chat" });
     try {
       const [, raw] = await api.conversationGet(id);
