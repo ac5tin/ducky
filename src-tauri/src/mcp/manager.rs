@@ -636,26 +636,25 @@ impl McpManager {
         // Make sure OAuth tokens are fresh (no-op for other auth modes).
         if let McpTransport::Http { .. } = &cfg.transport {
             if let HttpAuth::OAuth = &cfg.auth {
-                let had_tokens = self.store.oauth_tokens(server_id).is_some();
-                if let Err(e) = crate::oauth::ensure_fresh_token(&self.store, &cfg).await {
-                    match e {
-                        crate::oauth::AuthFailure::ReauthRequired(detail) => {
-                            self.set_status(
-                                server_id,
-                                ServerStatus::NeedsAuth {
-                                    detail: Some(detail),
-                                    reason: Some(if had_tokens {
-                                        AuthReason::Expired
-                                    } else {
-                                        AuthReason::Missing
-                                    }),
-                                },
-                            );
-                            return Ok(self.status(server_id));
-                        }
-                        crate::oauth::AuthFailure::Transient(message) => {
-                            self.set_status(server_id, ServerStatus::Error { message });
-                            return Ok(self.status(server_id));
+                // Missing OAuth tokens are valid for lazy authentication. If a
+                // session exists, refresh it before connecting as before.
+                if self.store.oauth_tokens(server_id).is_some() {
+                    if let Err(e) = crate::oauth::ensure_fresh_token(&self.store, &cfg).await {
+                        match e {
+                            crate::oauth::AuthFailure::ReauthRequired(detail) => {
+                                self.set_status(
+                                    server_id,
+                                    ServerStatus::NeedsAuth {
+                                        detail: Some(detail),
+                                        reason: Some(AuthReason::Expired),
+                                    },
+                                );
+                                return Ok(self.status(server_id));
+                            }
+                            crate::oauth::AuthFailure::Transient(message) => {
+                                self.set_status(server_id, ServerStatus::Error { message });
+                                return Ok(self.status(server_id));
+                            }
                         }
                     }
                 }
@@ -730,7 +729,14 @@ impl McpManager {
         let service = match service {
             Ok(s) => s,
             Err(e) => {
-                if e.is_authorization_required() {
+                // A missing OAuth token is allowed through initialize. If the
+                // server rejects that request, the wrapper reports its local
+                // re-auth error after observing the HTTP challenge.
+                let oauth_without_tokens = matches!(&cfg.auth, HttpAuth::OAuth)
+                    && self.store.oauth_tokens(server_id).is_none();
+                if e.is_authorization_required()
+                    || (oauth_without_tokens && e.to_string().contains("Not signed in"))
+                {
                     let challenge = e.auth_challenge().unwrap_or_default();
                     let (detail, reason) = summarise_challenge(challenge);
                     self.set_status(

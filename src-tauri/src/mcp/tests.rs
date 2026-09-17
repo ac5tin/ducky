@@ -2,7 +2,7 @@
 //! to an in-process rmcp server over a tokio duplex transport — including the
 //! MCP 2026-07-28 MRTR elicitation round-trip.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,12 +17,13 @@ use rmcp::service::{
     serve_client_with_lifecycle_and_ct, ClientLifecycleMode, RequestContext, RoleServer,
 };
 use rmcp::{ErrorData as McpError, ServiceExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
 use super::bridge::InteractiveBridge;
 use super::handler::DuckyClientHandler;
-use super::manager::McpManager;
-use crate::config::Store;
+use super::manager::{AuthReason, McpManager, ServerStatus};
+use crate::config::{HttpAuth, McpServerConfig, McpTransport, Store};
 use crate::events::{BackendEvent, CollectingSink};
 
 // ---------------------------------------------------------------------------
@@ -363,4 +364,63 @@ async fn notify_auth_completed_wakes_waiter() {
     let result = tokio::time::timeout(Duration::from_secs(1), waiter).await;
     assert!(result.is_ok(), "waiter did not resume");
     assert!(result.unwrap().unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn oauth_connect_reaches_server_before_needs_auth() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = sock.read(&mut buf).await;
+        let response = concat!(
+            "HTTP/1.1 401 Unauthorized\r\n",
+            "WWW-Authenticate: Bearer resource_metadata=\"https://auth.example/.well-known\"\r\n",
+            "Content-Length: 0\r\n",
+            "Connection: close\r\n\r\n"
+        );
+        let _ = sock.write_all(response.as_bytes()).await;
+        let _ = tx.send(());
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::new(dir.path(), dir.path().to_path_buf()).unwrap());
+    store
+        .config
+        .lock()
+        .unwrap()
+        .mcp_servers
+        .push(McpServerConfig {
+            id: "oauth-server".into(),
+            name: "OAuth Server".into(),
+            transport: McpTransport::Http {
+                url: format!("http://{addr}/mcp"),
+                headers: HashMap::new(),
+            },
+            auth: HttpAuth::OAuth,
+            enabled: true,
+            auto_start: true,
+            oauth_client_id: None,
+            oauth_redirect_port: None,
+            created_at: "now".into(),
+        });
+    let sink = Arc::new(CollectingSink::default());
+    let bridge = Arc::new(InteractiveBridge::new(sink.clone(), store.clone()));
+    let manager = McpManager::new(store, bridge, sink);
+
+    let status = manager.connect("oauth-server").await.unwrap();
+    assert!(matches!(
+        status,
+        ServerStatus::NeedsAuth {
+            reason: Some(AuthReason::Missing),
+            ..
+        }
+    ));
+    tokio::time::timeout(Duration::from_secs(1), rx)
+        .await
+        .expect("connect should reach the server")
+        .expect("server request signal");
 }

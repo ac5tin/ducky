@@ -143,10 +143,7 @@ export function AddConnectorModal({ open, onClose }: { open: boolean; onClose: (
       if (authKind === "bearer" && bearerToken.trim()) {
         await api.mcpSetBearerToken(cfg.id, bearerToken.trim());
       }
-      await finishAdd(name.trim(), authKind !== "oauth");
-      if (authKind === "oauth") {
-        await api.mcpOauthLogin(cfg.id).catch((e) => toast("error", `${e}`));
-      }
+      await finishAdd(name.trim(), true);
       reset();
       onClose();
     } catch (e) {

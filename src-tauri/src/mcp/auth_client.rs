@@ -121,6 +121,9 @@ impl AuthHttpClient {
             HttpAuth::Bearer { .. } => Ok(self.store.server_token(&self.cfg.id)),
             HttpAuth::OAuth => {
                 let had_tokens = self.store.oauth_tokens(&self.cfg.id).is_some();
+                if !force_refresh && !had_tokens {
+                    return Ok(None);
+                }
                 let result = if force_refresh {
                     match self.store.oauth_tokens(&self.cfg.id) {
                         Some(tokens) => {
@@ -486,5 +489,68 @@ mod tests {
             value.contains("text/event-stream"),
             "Accept should still allow SSE, got {value:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn oauth_without_tokens_sends_an_unauthenticated_request() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            loop {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let body = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::new(dir.path(), dir.path().to_path_buf()).unwrap());
+        let url = format!("http://{addr}/mcp");
+        let cfg = McpServerConfig {
+            id: "oauth-server".into(),
+            name: "OAuth Server".into(),
+            transport: McpTransport::Http {
+                url: url.clone(),
+                headers: HashMap::new(),
+            },
+            auth: HttpAuth::OAuth,
+            enabled: true,
+            auto_start: true,
+            oauth_client_id: None,
+            oauth_redirect_port: None,
+            created_at: "now".into(),
+        };
+        let client = AuthHttpClient::new(cfg, store, Arc::new(|_, _| {}));
+        let message: ClientJsonRpcMessage =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#).unwrap();
+
+        assert!(client
+            .post_message(url.into(), message, None, None, HashMap::new())
+            .await
+            .is_ok());
+        let request = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!request
+            .lines()
+            .any(|line| line.to_ascii_lowercase().starts_with("authorization:")));
     }
 }
