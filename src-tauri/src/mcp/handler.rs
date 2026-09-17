@@ -1,6 +1,8 @@
 //! Ducky's MCP client handler: declares capabilities and routes server
 //! requests (elicitation, sampling, roots) through the interactive bridge.
 
+#![allow(deprecated)] // SEP-2577; rmcp 3.1.4 still exposes these compatibility APIs.
+
 use std::sync::Arc;
 
 use rmcp::handler::client::ClientHandler;

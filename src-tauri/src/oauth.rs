@@ -25,8 +25,6 @@ use crate::config::{HttpAuth, McpServerConfig, McpTransport, OAuthTokens, Store}
 
 #[derive(Debug, Deserialize, Clone)]
 struct ProtectedResourceMetadata {
-    #[serde(default)]
-    resource: Option<String>,
     #[serde(default, rename = "authorization_servers")]
     authorization_servers: Vec<String>,
     #[serde(default, rename = "scopes_supported")]
@@ -361,7 +359,7 @@ pub async fn login(
 
     // 5. PKCE + state.
     let mut verifier_bytes = [0u8; 48];
-    rand::thread_rng().fill_bytes(&mut verifier_bytes);
+    rand::rng().fill_bytes(&mut verifier_bytes);
     let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(verifier_bytes);
     let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(Sha256::digest(verifier.as_bytes()));
@@ -848,7 +846,7 @@ mod tests {
     #[test]
     fn pkce_shapes() {
         let mut v = [0u8; 48];
-        rand::thread_rng().fill_bytes(&mut v);
+        rand::rng().fill_bytes(&mut v);
         let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v);
         let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(Sha256::digest(verifier.as_bytes()));

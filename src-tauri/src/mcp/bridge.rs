@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+#[allow(deprecated)] // SEP-2577; rmcp 3.1.4 still exposes the compatibility API.
 use rmcp::model::{
     CreateMessageRequestParams, CreateMessageResult, ElicitRequestParams, ElicitResult,
     ElicitationAction, Role, SamplingMessage, SamplingMessageContentBlock,
@@ -225,6 +226,7 @@ impl InteractiveBridge {
 
     // -- sampling ------------------------------------------------------------
 
+    #[allow(deprecated)] // SEP-2577; rmcp 3.1.4 still exposes the compatibility API.
     pub async fn run_sampling(
         &self,
         server: &str,
@@ -361,6 +363,7 @@ impl InteractiveBridge {
 }
 
 /// Extract a plain-text prompt from a sampling message.
+#[allow(deprecated)] // SEP-2577; rmcp 3.1.4 still exposes the compatibility API.
 fn sampling_message_text(m: &SamplingMessage) -> String {
     let mut parts = Vec::new();
     for block in m.content.clone().into_vec() {
@@ -458,6 +461,7 @@ mod tests {
         assert!(!b.resolve_approval(&request_id, ApprovalDecision::Deny));
     }
 
+    #[allow(deprecated)] // SEP-2577; rmcp 3.1.4 still exposes the compatibility API.
     #[test]
     fn sampling_message_text_extracts() {
         let msg = SamplingMessage::new_multiple(

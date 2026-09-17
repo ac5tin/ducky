@@ -9,12 +9,15 @@ use std::time::Duration;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams,
     CompleteRequestParams, CompleteResult, ContentBlock, GetPromptRequestParams, GetPromptResult,
-    GetTaskParams, InputRequest, InputRequests, InputResponses, JsonObject, ListRootsResult,
-    ListToolsResult, NumberOrString, PaginatedRequestParams, ProgressToken, ProtocolVersion,
-    ReadResourceRequestParams, ReadResourceResult, Reference, RequestMetaObject, Root,
+    GetTaskParams, InputRequest, InputRequests, InputResponses, JsonObject, ListToolsResult,
+    NumberOrString, PaginatedRequestParams, ProgressToken, ProtocolVersion,
+    ReadResourceRequestParams, ReadResourceResult, Reference, RequestMetaObject,
     ServerNotification, SubscriptionFilter, TaskPayload, TaskStatus, Tool, UpdateTaskParams,
     DEFAULT_MRTR_MAX_ROUNDS,
 };
+
+#[allow(deprecated)] // SEP-2577; rmcp 3.1.4 still exposes the compatibility API.
+use rmcp::model::{ListRootsResult, Root};
 use rmcp::service::{ClientLifecycleMode, Peer, RoleClient, RunningService};
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
@@ -346,6 +349,7 @@ impl ServerHandle {
 
     /// Answer server-initiated input requests (elicitation / sampling / roots)
     /// through the interactive bridge.
+    #[allow(deprecated)] // SEP-2577; rmcp 3.1.4 still exposes the compatibility API.
     async fn fulfill_input_requests(
         &self,
         requests: InputRequests,
