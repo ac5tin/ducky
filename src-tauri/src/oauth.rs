@@ -563,8 +563,6 @@ async fn discover_resource(
                 scope = parse_www_authenticate_scope(&header);
                 prm_url = parse_www_authenticate_resource(&header);
             }
-        } else if response.status().is_success() {
-            return Err("This server does not seem to require authorization.".into());
         }
     }
 
@@ -841,6 +839,60 @@ mod tests {
             parse_www_authenticate_scope(header).as_deref(),
             Some("files:read")
         );
+    }
+
+    #[tokio::test]
+    async fn discovery_uses_well_known_metadata_after_public_ping() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    let Ok(n) = sock.read(&mut chunk).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&chunk[..n]);
+                    if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                if request.starts_with("POST ") {
+                    let response =
+                        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = sock.write_all(response.as_bytes()).await;
+                    continue;
+                }
+                let body = r#"{"authorization_servers":["https://auth.example"]}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = tx.send(());
+                return;
+            }
+        });
+
+        let result = discover_resource(&format!("http://{addr}/mcp")).await;
+        assert_eq!(
+            result.unwrap().0.authorization_servers,
+            vec!["https://auth.example"]
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), rx)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[test]
