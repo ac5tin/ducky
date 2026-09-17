@@ -12,9 +12,12 @@ import { rfc9557, shortTime } from "../../time";
 
 export function ChatView() {
   const items = useStore((s) => s.items);
-  const streaming = useStore((s) => s.streaming);
   const activeId = useStore((s) => s.activeConversationId);
-  const newConversation = useStore((s) => s.newConversation);
+  const streaming = useStore(
+    (s) =>
+      !!s.activeConversationId &&
+      s.busyConversationIds.has(s.activeConversationId),
+  );
   const generateTitle = useStore((s) => s.generateTitle);
   const titleGenerating = useStore(
     (s) =>
@@ -67,11 +70,7 @@ export function ChatView() {
   }, [items, streaming, activeId]);
 
   if (!activeId) {
-    return (
-      <EmptyState
-        onStart={() => newConversation().catch((e) => console.error(e))}
-      />
-    );
+    return <EmptyState />;
   }
 
   return (
@@ -262,10 +261,14 @@ function MessageTime({ ts, align }: { ts?: string; align: "left" | "right" }) {
   );
 }
 
-function Composer() {
+function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
   const send = useStore((s) => s.send);
   const stop = useStore((s) => s.stop);
-  const streaming = useStore((s) => s.streaming);
+  const streaming = useStore(
+    (s) =>
+      !!s.activeConversationId &&
+      s.busyConversationIds.has(s.activeConversationId),
+  );
   const [text, setText] = useState("");
   const ref = useRef<HTMLTextAreaElement>(null);
 
@@ -282,6 +285,7 @@ function Composer() {
         <textarea
           ref={ref}
           value={text}
+          autoFocus={autoFocus}
           rows={1}
           placeholder="Ask anything — your connected tools are available automatically…"
           className="max-h-40 min-h-[44px] flex-1 resize-none rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-sm outline-none transition focus:border-sky-400 focus:ring-2 focus:ring-sky-100 dark:border-slate-700 dark:bg-slate-900 dark:focus:border-sky-500 dark:focus:ring-sky-900/40"
@@ -320,7 +324,7 @@ function Composer() {
   );
 }
 
-function EmptyState({ onStart }: { onStart: () => void }) {
+function EmptyState() {
   const provider = useStore((s) => s.activeProvider());
   const examples = [
     "Summarise the files in my project folder",
@@ -338,12 +342,6 @@ function EmptyState({ onStart }: { onStart: () => void }) {
           ? `Connected to ${provider.name}. Start a chat and I'll use your connected tools when they help.`
           : "Add an AI provider in Settings to get started, then connect a few tools."}
       </p>
-      <button
-        className="mt-5 rounded-xl bg-sky-600 px-5 py-2.5 text-sm font-medium text-white shadow-sm transition hover:bg-sky-500"
-        onClick={onStart}
-      >
-        Start a chat
-      </button>
       <div className="mt-8 grid max-w-xl gap-2 sm:grid-cols-1">
         {examples.map((e) => (
           <div
@@ -353,6 +351,9 @@ function EmptyState({ onStart }: { onStart: () => void }) {
             “{e}”
           </div>
         ))}
+      </div>
+      <div className="mt-6 w-full max-w-3xl">
+        <Composer autoFocus />
       </div>
     </div>
   );

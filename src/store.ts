@@ -80,6 +80,9 @@ export type View = "chat" | "connectors" | "settings" | "onboarding";
 // Shared init promise: concurrent init() calls (StrictMode double-effect) must
 // not register a second backend listener, or every delta is handled twice.
 let initPromise: Promise<void> | null = null;
+// Lazy chat creation: the draft page has no record yet; this flag stops a
+// double-submit during the create round-trip from spawning two records.
+let creatingDraft = false;
 const media =
   typeof window === "undefined"
     ? null
@@ -344,22 +347,9 @@ export const useStore = create<StoreState>((set, get) => ({
   },
 
   async newConversation() {
-    const { config } = get();
-    // an app-level default model wins over "whatever was used last"
-    const defaultProvider = defaultProviderOf(config);
-    const provider = defaultProvider ?? get().activeProvider();
-    if (!provider) {
-      get().toast("error", "Add an AI provider first (Settings → Providers).");
-      return;
-    }
-    const model =
-      (defaultProvider && config?.settings.default_model) ||
-      provider.default_model ||
-      provider.models[0] ||
-      "";
-    const meta = await api.conversationCreate(provider.id, model);
-    await get().refreshConfig();
-    set({ activeConversationId: meta.id, items: [], view: "chat" });
+    // The draft page: no conversation record exists until the first message
+    // is sent from it (see send()).
+    set({ activeConversationId: null, items: [], view: "chat" });
   },
 
   async renameConversation(id, title) {
@@ -432,11 +422,44 @@ export const useStore = create<StoreState>((set, get) => ({
   },
 
   async send(text) {
-    const id = get().activeConversationId;
-    if (!id || get().streaming) return;
+    let id = get().activeConversationId;
+    if (id && (get().streaming || get().busyConversationIds.has(id))) return;
+    if (!id) {
+      // lazy chat creation: the record is made only when the first message is
+      // sent from the draft page
+      if (creatingDraft) return;
+      creatingDraft = true;
+      try {
+        const { config } = get();
+        // an app-level default model wins over "whatever was used last"
+        const defaultProvider = defaultProviderOf(config);
+        const provider = defaultProvider ?? get().activeProvider();
+        if (!provider) {
+          get().toast(
+            "error",
+            "Add an AI provider first (Settings → Providers).",
+          );
+          return;
+        }
+        const model =
+          (defaultProvider && config?.settings.default_model) ||
+          provider.default_model ||
+          provider.models[0] ||
+          "";
+        const meta = await api.conversationCreate(provider.id, model);
+        await get().refreshConfig();
+        id = meta.id;
+      } catch (e) {
+        get().toast("error", `Could not start a new chat: ${e}`);
+        return;
+      } finally {
+        creatingDraft = false;
+      }
+    }
+    const convId = id;
     const untitled =
       get().items.every((i) => i.kind !== "user") &&
-      !get().config?.conversations.find((c) => c.id === id)?.title;
+      !get().config?.conversations.find((c) => c.id === convId)?.title;
     set((s) => ({
       items: [
         ...s.items,
@@ -447,19 +470,20 @@ export const useStore = create<StoreState>((set, get) => ({
           ts: new Date().toISOString(),
         },
       ],
+      activeConversationId: convId,
       streaming: true,
-      busyConversationIds: new Set([...s.busyConversationIds, id]),
+      busyConversationIds: new Set([...s.busyConversationIds, convId]),
       titleGeneratingIds: untitled
-        ? new Set([...s.titleGeneratingIds, id])
+        ? new Set([...s.titleGeneratingIds, convId])
         : s.titleGeneratingIds,
     }));
     try {
-      await api.chatSend(id, text);
+      await api.chatSend(convId, text);
     } catch (e) {
       get().toast("error", `${e}`);
       set((s) => {
         const titleGeneratingIds = new Set(s.titleGeneratingIds);
-        titleGeneratingIds.delete(id);
+        titleGeneratingIds.delete(convId);
         return { streaming: false, titleGeneratingIds };
       });
     }
