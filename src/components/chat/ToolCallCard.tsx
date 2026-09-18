@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { memo, useState } from "react";
 import type { ToolCallState, ContentBlockValue } from "../../types";
 import { useStore } from "../../store";
 import * as api from "../../api";
@@ -41,7 +41,11 @@ function authMessage(reason?: string | null): { line: string; button: string } {
   return { line: "Sign in to connect.", button: "Sign in" };
 }
 
-export function ToolCallCard({ state }: { state: ToolCallState }) {
+export const ToolCallCard = memo(function ToolCallCard({
+  state,
+}: {
+  state: ToolCallState;
+}) {
   const toolDetails = useStore(
     (s) => s.config?.settings.tool_details ?? "auto",
   );
@@ -218,7 +222,7 @@ export function ToolCallCard({ state }: { state: ToolCallState }) {
       )}
     </div>
   );
-}
+});
 
 function RichContent({ blocks }: { blocks: ContentBlockValue[] }) {
   return (

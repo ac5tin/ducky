@@ -1,44 +1,49 @@
-import { useState, type ReactNode } from "react";
+import { memo, useState, type ComponentProps } from "react";
 import { Icon } from "./icons";
 import { openUrl } from "@tauri-apps/plugin-opener";
-
-export function Markdown({ text }: { text: string }) {
-  // react-markdown is imported lazily via static import at module level in
-  // MarkdownInner to keep this file lean.
-  return <MarkdownInner text={text} />;
-}
-
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { type ExtraProps } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 
-function MarkdownInner({ text }: { text: string }) {
+type MarkdownProps = ComponentProps<typeof ReactMarkdown>;
+
+// Module-level: fresh plugin/component values on every render make React treat
+// `a`/`pre` as new component types, remounting every code block on each token.
+const REMARK_PLUGINS: MarkdownProps["remarkPlugins"] = [remarkGfm];
+const REHYPE_PLUGINS: MarkdownProps["rehypePlugins"] = [
+  [rehypeHighlight, { detect: false, ignoreMissing: true }],
+];
+const COMPONENTS: MarkdownProps["components"] = {
+  a: (props) => (
+    <a
+      {...props}
+      onClick={(e) => {
+        e.preventDefault();
+        const href = props.href ?? "";
+        if (href.startsWith("http")) openUrl(href).catch(() => {});
+      }}
+    />
+  ),
+  pre: (props) => <CodeBlock {...props} />,
+};
+
+// Memoized on `text` so a streaming message only re-parses itself, never the
+// finished messages above it.
+export const Markdown = memo(function Markdown({ text }: { text: string }) {
   return (
     <div className="md-body">
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        rehypePlugins={[[rehypeHighlight, { detect: false, ignoreMissing: true }]]}
-        components={{
-          a: (props) => (
-            <a
-              {...props}
-              onClick={(e) => {
-                e.preventDefault();
-                const href = props.href ?? "";
-                if (href.startsWith("http")) openUrl(href).catch(() => {});
-              }}
-            />
-          ),
-          pre: (props) => <CodeBlock {...(props as any)} />,
-        }}
+        remarkPlugins={REMARK_PLUGINS}
+        rehypePlugins={REHYPE_PLUGINS}
+        components={COMPONENTS}
       >
         {text}
       </ReactMarkdown>
     </div>
   );
-}
+});
 
-function CodeBlock({ children, ...rest }: { children?: ReactNode } & Record<string, any>) {
+function CodeBlock({ children, ...rest }: ComponentProps<"pre"> & ExtraProps) {
   const [copied, setCopied] = useState(false);
   const code = extractText(children);
   return (

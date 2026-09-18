@@ -560,50 +560,78 @@ function defaultProviderOf(config: AppConfig | null): ProviderConfig | null {
 type SetFn = typeof useStore.setState;
 type GetFn = () => StoreState;
 
+// Streamed text is batched per animation frame: the provider emits one chunk
+// per few characters, and applying each one straight to the store re-rendered
+// (and re-parsed) the whole conversation per chunk — quadratic in response
+// length, worst on markdown tables.
+let pending: { convId: string; text: string; reasoning: string } | null = null;
+let pendingFrame = 0;
+
+const scheduleFrame: (cb: () => void) => number =
+  typeof requestAnimationFrame === "function"
+    ? (cb) => requestAnimationFrame(cb)
+    : (cb) => setTimeout(cb, 0);
+
+function enqueueDelta(
+  convId: string,
+  text: string,
+  reasoning: string,
+  set: SetFn,
+  get: GetFn,
+) {
+  if (pending && pending.convId !== convId) flushPending(set, get);
+  pending ??= { convId, text: "", reasoning: "" };
+  pending.text += text;
+  pending.reasoning += reasoning;
+  if (!pendingFrame) pendingFrame = scheduleFrame(() => flushPending(set, get));
+}
+
+/** Applied synchronously by any non-delta event: text streamed so far must land
+ * before whatever the event does, or it would append after a tool card or a
+ * finished message. */
+function flushPending(set: SetFn, get: GetFn) {
+  pendingFrame = 0;
+  const p = pending;
+  pending = null;
+  if (!p || p.convId !== get().activeConversationId) return;
+  set((s) => {
+    const items = [...s.items];
+    const last = items[items.length - 1];
+    if (last?.kind === "assistant" && last.streaming) {
+      items[items.length - 1] = {
+        ...last,
+        text: last.text + p.text,
+        reasoning: p.reasoning
+          ? (last.reasoning ?? "") + p.reasoning
+          : last.reasoning,
+      };
+    } else {
+      items.push({
+        kind: "assistant",
+        id: `a-live-${Date.now()}`,
+        text: p.text,
+        ts: new Date().toISOString(),
+        reasoning: p.reasoning || undefined,
+        streaming: true,
+      });
+    }
+    return { items };
+  });
+}
+
 function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
+  if (event.type !== "chat_delta" && event.type !== "reasoning_delta") {
+    flushPending(set, get);
+  }
   switch (event.type) {
     case "chat_delta": {
       if (event.conversation_id !== get().activeConversationId) return;
-      set((s) => {
-        const items = [...s.items];
-        const last = items[items.length - 1];
-        if (last?.kind === "assistant" && last.streaming) {
-          items[items.length - 1] = { ...last, text: last.text + event.text };
-        } else {
-          items.push({
-            kind: "assistant",
-            id: `a-live-${Date.now()}`,
-            text: event.text,
-            ts: new Date().toISOString(),
-            streaming: true,
-          });
-        }
-        return { items };
-      });
+      enqueueDelta(event.conversation_id, event.text, "", set, get);
       break;
     }
     case "reasoning_delta": {
       if (event.conversation_id !== get().activeConversationId) return;
-      set((s) => {
-        const items = [...s.items];
-        const last = items[items.length - 1];
-        if (last?.kind === "assistant" && last.streaming) {
-          items[items.length - 1] = {
-            ...last,
-            reasoning: (last.reasoning ?? "") + event.text,
-          };
-        } else {
-          items.push({
-            kind: "assistant",
-            id: `a-live-${Date.now()}`,
-            text: "",
-            ts: new Date().toISOString(),
-            reasoning: event.text,
-            streaming: true,
-          });
-        }
-        return { items };
-      });
+      enqueueDelta(event.conversation_id, "", event.text, set, get);
       break;
     }
     case "message_done": {

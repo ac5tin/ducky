@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { useStore } from "../../store";
 import { Icon } from "../icons";
 import { Markdown } from "../Markdown";
@@ -194,7 +194,13 @@ export function ChatView() {
   );
 }
 
-function MessageItem({ item }: { item: import("../../store").ChatItem }) {
+// Memoized: streaming replaces only the last item's object, so every finished
+// message must not re-render (and re-parse its markdown) on each token.
+const MessageItem = memo(function MessageItem({
+  item,
+}: {
+  item: import("../../store").ChatItem;
+}) {
   if (item.kind === "user") {
     return (
       <div className="flex justify-end">
@@ -244,7 +250,7 @@ function MessageItem({ item }: { item: import("../../store").ChatItem }) {
       </div>
     </div>
   );
-}
+});
 
 function MessageTime({ ts, align }: { ts?: string; align: "left" | "right" }) {
   if (!ts) return null;
