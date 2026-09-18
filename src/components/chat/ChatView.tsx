@@ -359,6 +359,10 @@ function EmptyState() {
         ))}
       </div>
       <div className="mt-6 w-full max-w-3xl">
+        <div className="mb-2 flex items-center justify-center gap-1">
+          <ModelPicker dropUp />
+          <WorkingDirChip />
+        </div>
         <Composer autoFocus />
       </div>
     </div>

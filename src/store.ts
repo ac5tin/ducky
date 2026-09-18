@@ -3,6 +3,7 @@ import { create } from "zustand";
 import { check as updaterCheck, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import * as api from "./api";
+import { resolveDraftModel } from "./chatDraft";
 import { dispatchTerminalEvent } from "./terminalBus";
 import type {
   AppConfig,
@@ -139,6 +140,11 @@ interface StoreState {
 
   view: View;
   activeConversationId: string | null;
+  /** Model staged on the draft page; null = no pick, defaults apply. */
+  draftModel: string | null;
+  /** Effort staged on the draft page; undefined = untouched (creation seeds
+   * settings.default_effort), null = explicit "Default". */
+  draftEffort: EffortLevel | null | undefined;
   items: ChatItem[];
   streaming: boolean;
   busyConversationIds: Set<string>;
@@ -273,6 +279,8 @@ export const useStore = create<StoreState>((set, get) => ({
 
   view: "chat",
   activeConversationId: null,
+  draftModel: null,
+  draftEffort: undefined,
   items: [],
   streaming: false,
   busyConversationIds: new Set(),
@@ -397,8 +405,14 @@ export const useStore = create<StoreState>((set, get) => ({
 
   async newConversation() {
     // The draft page: no conversation record exists until the first message
-    // is sent from it (see send()).
-    set({ activeConversationId: null, items: [], view: "chat" });
+    // is sent from it (see send()). A fresh draft starts from defaults.
+    set({
+      activeConversationId: null,
+      draftModel: null,
+      draftEffort: undefined,
+      items: [],
+      view: "chat",
+    });
   },
 
   async renameConversation(id, title) {
@@ -451,14 +465,21 @@ export const useStore = create<StoreState>((set, get) => ({
 
   async setActiveModel(providerId, model) {
     const id = get().activeConversationId;
-    if (!id) return;
+    if (!id) {
+      // draft page: stage the pick for the chat that send() will create
+      set({ draftModel: model });
+      return;
+    }
     await api.conversationSetModel(id, providerId, model);
     await get().refreshConfig();
   },
 
   async setActiveEffort(effort) {
     const id = get().activeConversationId;
-    if (!id) return;
+    if (!id) {
+      set({ draftEffort: effort });
+      return;
+    }
     await api.conversationSetEffort(id, effort);
     await get().refreshConfig();
   },
@@ -490,12 +511,14 @@ export const useStore = create<StoreState>((set, get) => ({
           );
           return;
         }
-        const model =
-          (defaultProvider && config?.settings.default_model) ||
-          provider.default_model ||
-          provider.models[0] ||
-          "";
+        const model = resolveDraftModel(get().draftModel, config, provider);
         const meta = await api.conversationCreate(provider.id, model);
+        const { draftEffort } = get();
+        if (draftEffort !== undefined) {
+          // non-fatal: the chat proceeds with the default effort if this fails
+          await api.conversationSetEffort(meta.id, draftEffort).catch(() => {});
+        }
+        set({ draftModel: null, draftEffort: undefined });
         await get().refreshConfig();
         id = meta.id;
       } catch (e) {

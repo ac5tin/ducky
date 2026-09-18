@@ -1,13 +1,16 @@
 import { useState } from "react";
 import * as api from "../../api";
+import { resolveShownEffort, resolveShownModel } from "../../chatDraft";
 import { useStore } from "../../store";
 import { Icon } from "../icons";
 import { EFFORT_LABELS, EffortPill, useEffortLevels } from "./effortLevels";
 
-export function ModelPicker() {
+export function ModelPicker({ dropUp = false }: { dropUp?: boolean }) {
   const config = useStore((s) => s.config);
   const activeId = useStore((s) => s.activeConversationId);
   const activeProvider = useStore((s) => s.activeProvider());
+  const draftModel = useStore((s) => s.draftModel);
+  const draftEffort = useStore((s) => s.draftEffort);
   const setActiveModel = useStore((s) => s.setActiveModel);
   const setActiveEffort = useStore((s) => s.setActiveEffort);
   const refreshConfig = useStore((s) => s.refreshConfig);
@@ -15,15 +18,14 @@ export function ModelPicker() {
   const [open, setOpen] = useState(false);
 
   const conversation = config?.conversations.find((c) => c.id === activeId);
-  // before a chat exists, surface the app-level default model if one applies
-  const defaultApplies = !!activeProvider && config?.settings.default_provider_id === activeProvider.id;
-  const currentModel =
-    conversation?.model ||
-    (defaultApplies ? config?.settings.default_model : null) ||
-    activeProvider?.default_model ||
-    activeProvider?.models[0] ||
-    "";
-  const effort = conversation?.effort ?? null;
+  const currentModel = resolveShownModel(
+    conversation,
+    activeId,
+    draftModel,
+    config,
+    activeProvider,
+  );
+  const effort = resolveShownEffort(activeId, conversation, draftEffort, config);
   const efforts = useEffortLevels(activeProvider?.kind, currentModel);
 
   const isDefaultModel = (model: string) =>
@@ -72,7 +74,11 @@ export function ModelPicker() {
       {open && (
         <>
           <div className="fixed inset-0 z-30" onClick={() => setOpen(false)} />
-          <div className="pop-in absolute left-0 top-full z-40 mt-1 max-h-80 w-72 overflow-y-auto rounded-xl border border-slate-200 bg-white py-1 shadow-xl dark:border-slate-700 dark:bg-slate-900">
+          <div
+            className={`pop-in absolute left-0 z-40 max-h-80 w-72 overflow-y-auto rounded-xl border border-slate-200 bg-white py-1 shadow-xl dark:border-slate-700 dark:bg-slate-900 ${
+              dropUp ? "bottom-full mb-1" : "top-full mt-1"
+            }`}
+          >
             {activeProvider.models.length === 0 && (
               <p className="px-3 py-2 text-xs text-slate-400">
                 No models fetched yet — refresh them in Settings → Providers.
