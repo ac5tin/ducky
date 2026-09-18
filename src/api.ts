@@ -96,6 +96,8 @@ export const settingsSet = (settings: {
   title_model?: string;
   /** null clears title effort; undefined leaves it unchanged. */
   title_effort?: EffortLevel | null;
+  update_mode?: "prompt" | "auto";
+  update_check_interval_hours?: number;
 }) => invoke<void>("settings_set", { settings });
 
 export const toolRuleSet = (key: string, rule: ToolRule | null) =>

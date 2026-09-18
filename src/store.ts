@@ -1,5 +1,7 @@
 // Global app store: state, backend event wiring, and actions.
 import { create } from "zustand";
+import { check as updaterCheck, type Update } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import * as api from "./api";
 import { dispatchTerminalEvent } from "./terminalBus";
 import type {
@@ -77,12 +79,37 @@ export interface SamplingRequest {
 
 export type View = "chat" | "connectors" | "settings" | "onboarding";
 
+export interface UpdateState {
+  status: "idle" | "checking" | "available" | "downloading" | "ready";
+  version: string;
+  notes: string | null;
+  downloaded: number;
+  contentLength: number | null;
+  /** True once the user answered "Later"; hides the prompt until a newer version. */
+  promptDismissed: boolean;
+}
+
 // Shared init promise: concurrent init() calls (StrictMode double-effect) must
 // not register a second backend listener, or every delta is handled twice.
 let initPromise: Promise<void> | null = null;
 // Lazy chat creation: the draft page has no record yet; this flag stops a
 // double-submit during the create round-trip from spawning two records.
 let creatingDraft = false;
+// The update found by the last check; kept outside the store because it holds
+// the download handle, not display state.
+let pendingUpdate: Update | null = null;
+let updateTimer: ReturnType<typeof setInterval> | null = null;
+
+/** (Re)arm the periodic update check; 0 hours means startup-only. */
+function scheduleUpdateChecks(hours: number) {
+  if (updateTimer) clearInterval(updateTimer);
+  updateTimer = null;
+  if (hours > 0) {
+    updateTimer = setInterval(() => {
+      void useStore.getState().checkForUpdates(false);
+    }, hours * 3_600_000);
+  }
+}
 const media =
   typeof window === "undefined"
     ? null
@@ -128,12 +155,18 @@ interface StoreState {
   elicitations: ElicitationRequest[];
   samplings: SamplingRequest[];
   toasts: Toast[];
+  update: UpdateState;
 
   init: () => Promise<void>;
   setView: (v: View) => void;
 
   toast: (kind: Toast["kind"], text: string) => void;
   dismissToast: (id: string) => void;
+
+  checkForUpdates: (manual: boolean) => Promise<void>;
+  downloadUpdate: () => Promise<void>;
+  restartForUpdate: () => Promise<void>;
+  dismissUpdate: () => void;
 
   refreshConfig: () => Promise<void>;
   refreshServers: () => Promise<void>;
@@ -253,6 +286,14 @@ export const useStore = create<StoreState>((set, get) => ({
   elicitations: [],
   samplings: [],
   toasts: [],
+  update: {
+    status: "idle",
+    version: "",
+    notes: null,
+    downloaded: 0,
+    contentLength: null,
+    promptDismissed: false,
+  },
 
   async init() {
     if (!initPromise) {
@@ -274,6 +315,12 @@ export const useStore = create<StoreState>((set, get) => ({
               ? "chat"
               : "onboarding",
         });
+        if (!import.meta.env.DEV) {
+          scheduleUpdateChecks(
+            boot.config.settings.update_check_interval_hours,
+          );
+          void get().checkForUpdates(false);
+        }
       })().catch((e) => {
         initPromise = null;
         throw e;
@@ -308,6 +355,8 @@ export const useStore = create<StoreState>((set, get) => ({
         }),
       },
     }));
+    // the check interval may have just changed
+    scheduleUpdateChecks(config.settings.update_check_interval_hours);
   },
 
   async refreshServers() {
@@ -530,6 +579,98 @@ export const useStore = create<StoreState>((set, get) => ({
       samplings: s.samplings.filter((x) => x.request_id !== requestId),
     }));
     await api.samplingRespond(requestId, approve);
+  },
+
+  async checkForUpdates(manual) {
+    // dev builds have no installed app to replace
+    if (import.meta.env.DEV) {
+      if (manual)
+        get().toast("info", "Update checks only run in installed builds.");
+      return;
+    }
+    const { status } = get().update;
+    if (status === "checking" || status === "downloading") return;
+    set((s) => ({ update: { ...s.update, status: "checking" } }));
+    try {
+      const update = await updaterCheck();
+      if (!update) {
+        set((s) => ({ update: { ...s.update, status: "idle" } }));
+        if (manual) get().toast("success", "Ducky is up to date.");
+        return;
+      }
+      pendingUpdate = update;
+      const known = get().update.version === update.version;
+      set((s) => ({
+        update: {
+          ...s.update,
+          status: "available",
+          version: update.version,
+          notes: update.body ?? null,
+          downloaded: 0,
+          contentLength: null,
+          // a periodic re-check must not resurrect a dismissed prompt;
+          // a manual check always shows it again
+          promptDismissed: manual || !known ? false : s.update.promptDismissed,
+        },
+      }));
+      if (get().config?.settings.update_mode === "auto") {
+        await get().downloadUpdate();
+      }
+    } catch (e) {
+      set((s) => ({ update: { ...s.update, status: "idle" } }));
+      if (manual) get().toast("error", `Could not check for updates: ${e}`);
+      else console.warn("update check failed", e);
+    }
+  },
+
+  async downloadUpdate() {
+    const update = pendingUpdate;
+    if (!update) return;
+    set((s) => ({
+      update: {
+        ...s.update,
+        status: "downloading",
+        downloaded: 0,
+        contentLength: null,
+        promptDismissed: false,
+      },
+    }));
+    try {
+      await update.downloadAndInstall((event) => {
+        if (event.event === "Started") {
+          set((s) => ({
+            update: {
+              ...s.update,
+              contentLength: event.data.contentLength ?? null,
+            },
+          }));
+        } else if (event.event === "Progress") {
+          set((s) => ({
+            update: {
+              ...s.update,
+              downloaded: s.update.downloaded + event.data.chunkLength,
+            },
+          }));
+        }
+      });
+      set((s) => ({ update: { ...s.update, status: "ready" } }));
+    } catch (e) {
+      // back to "available" so the user can retry from the prompt
+      set((s) => ({ update: { ...s.update, status: "available" } }));
+      get().toast("error", `Could not download the update: ${e}`);
+    }
+  },
+
+  async restartForUpdate() {
+    try {
+      await relaunch();
+    } catch (e) {
+      get().toast("error", `Could not restart: ${e}`);
+    }
+  },
+
+  dismissUpdate() {
+    set((s) => ({ update: { ...s.update, promptDismissed: true } }));
   },
 
   activeProvider() {

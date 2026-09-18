@@ -404,6 +404,14 @@ export function SettingsView() {
           </div>
         </Section>
 
+        {/* Updates */}
+        <Section
+          title="Updates"
+          description="Ducky checks GitHub for new releases. Downloads are signature-verified before installing."
+        >
+          <UpdatesSection />
+        </Section>
+
         {/* About */}
         <Section title="About">
           <div className="space-y-1 text-sm text-slate-500 dark:text-slate-400">
@@ -479,6 +487,87 @@ function Section({
       )}
       {description ? children : <div className="mt-4">{children}</div>}
     </section>
+  );
+}
+
+function UpdatesSection() {
+  const config = useStore((s) => s.config);
+  const update = useStore((s) => s.update);
+  const checkForUpdates = useStore((s) => s.checkForUpdates);
+  const toast = useStore((s) => s.toast);
+  const refreshConfig = useStore((s) => s.refreshConfig);
+
+  if (!config) return null;
+  const settings = config.settings;
+
+  const patch = async (p: Parameters<typeof api.settingsSet>[0]) => {
+    await api.settingsSet(p);
+    await refreshConfig();
+  };
+
+  const busy = update.status === "checking" || update.status === "downloading";
+  const waiting =
+    update.status === "available" ||
+    update.status === "downloading" ||
+    update.status === "ready";
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap gap-6">
+        <div>
+          <div className="mb-1.5 text-sm font-medium">
+            When a new release is found
+          </div>
+          <select
+            className={inputClass + " w-56"}
+            value={settings.update_mode}
+            onChange={(e) =>
+              patch({ update_mode: e.target.value as "prompt" | "auto" }).catch(
+                (err) => toast("error", `${err}`),
+              )
+            }
+          >
+            <option value="prompt">Ask before downloading</option>
+            <option value="auto">Download automatically</option>
+          </select>
+        </div>
+        <div>
+          <div className="mb-1.5 text-sm font-medium">Check for updates</div>
+          <select
+            className={inputClass + " w-44"}
+            value={String(settings.update_check_interval_hours)}
+            onChange={(e) =>
+              patch({
+                update_check_interval_hours: Number(e.target.value),
+              }).catch((err) => toast("error", `${err}`))
+            }
+          >
+            <option value="0">On startup only</option>
+            <option value="1">Every hour</option>
+            <option value="6">Every 6 hours</option>
+            <option value="24">Every day</option>
+          </select>
+        </div>
+      </div>
+      <div className="flex items-center gap-3">
+        <Button
+          variant="secondary"
+          disabled={busy}
+          onClick={() => void checkForUpdates(true)}
+        >
+          {update.status === "checking" ? "Checking…" : "Check for updates"}
+        </Button>
+        {waiting && (
+          <span className="text-xs text-slate-400">
+            {update.status === "downloading" && "Downloading update…"}
+            {update.status === "available" &&
+              `Ducky v${update.version} is available`}
+            {update.status === "ready" &&
+              `v${update.version} downloaded — restart to apply`}
+          </span>
+        )}
+      </div>
+    </div>
   );
 }
 

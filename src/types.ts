@@ -91,6 +91,10 @@ export interface AppSettings {
         title_model: string | null;
         /** Effort for title generation; null = model default (or the chat's, when title provider is unset). */
         title_effort: EffortLevel | null;
+        /** What Ducky does when it detects a new GitHub release. */
+        update_mode: "prompt" | "auto";
+        /** Hours between update checks; 0 = check on startup only. */
+        update_check_interval_hours: number;
 }
 
 export interface ConversationMeta {

@@ -28,6 +28,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.png", "icons/icon.ico"],
     "macOS": {
       "signingIdentity": "-"
@@ -35,5 +36,11 @@
     "category": "DeveloperTool",
     "shortDescription": "A friendly MCP client",
     "longDescription": "Ducky is an easy-to-use desktop app that connects AI models (OpenAI, Claude, Z.ai, Ollama and more) to MCP servers — tools, resources and prompts — without any configuration files."
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZBQjQ5Rjc0ODAzQThBNTAKUldSUWlqcUFkSiswYW1lZjU4ei9nWWg1NFIyeXA4RCsvYk9KeGdFZVZuN1EyWFB4ajhNWHFaT1QK",
+      "endpoints": ["https://github.com/ac5tin/ducky/releases/latest/download/latest.json"]
+    }
   }
 }

@@ -311,6 +311,12 @@ pub async fn settings_set(
         if let Some(v) = settings.title_effort {
             c.settings.title_effort = v;
         }
+        if let Some(v) = settings.update_mode {
+            c.settings.update_mode = v;
+        }
+        if let Some(v) = settings.update_check_interval_hours {
+            c.settings.update_check_interval_hours = v.min(168);
+        }
     }
     state.store.save_config().map_err(|e| e.to_string())?;
 
@@ -357,6 +363,8 @@ pub struct AppSettingsPatch {
     pub title_model: Option<String>,
     #[serde(default, deserialize_with = "deserialize_clearable")]
     pub title_effort: Option<Option<config::EffortLevel>>,
+    pub update_mode: Option<config::UpdateMode>,
+    pub update_check_interval_hours: Option<u32>,
 }
 
 #[tauri::command]
@@ -1207,5 +1215,18 @@ mod tests {
         let set: AppSettingsPatch =
             serde_json::from_str(r#"{"tool_details": "collapsed"}"#).unwrap();
         assert_eq!(set.tool_details, Some(config::ToolDetailsMode::Collapsed));
+    }
+
+    #[test]
+    fn update_settings_patch_deserializes() {
+        let keep: AppSettingsPatch = serde_json::from_str("{}").unwrap();
+        assert_eq!(keep.update_mode, None);
+        assert_eq!(keep.update_check_interval_hours, None);
+
+        let set: AppSettingsPatch =
+            serde_json::from_str(r#"{"update_mode": "auto", "update_check_interval_hours": 24}"#)
+                .unwrap();
+        assert_eq!(set.update_mode, Some(config::UpdateMode::Auto));
+        assert_eq!(set.update_check_interval_hours, Some(24));
     }
 }

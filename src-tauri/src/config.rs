@@ -212,6 +212,22 @@ pub enum ToolDetailsMode {
     Expanded,
 }
 
+/// What Ducky does when it detects a new GitHub release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateMode {
+    /// Ask before downloading anything (default).
+    #[default]
+    Prompt,
+    /// Download in the background, then ask to restart.
+    Auto,
+}
+
+/// Default hours between update checks.
+fn default_update_check_interval_hours() -> u32 {
+    6
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     pub theme: Theme,
@@ -254,6 +270,12 @@ pub struct AppSettings {
     /// title provider is set; the chat's effort when title provider is unset.
     #[serde(default)]
     pub title_effort: Option<EffortLevel>,
+    /// What Ducky does when it detects a new GitHub release.
+    #[serde(default)]
+    pub update_mode: UpdateMode,
+    /// Hours between update checks; 0 = check on startup only.
+    #[serde(default = "default_update_check_interval_hours")]
+    pub update_check_interval_hours: u32,
 }
 
 impl Default for AppSettings {
@@ -274,6 +296,8 @@ impl Default for AppSettings {
             title_provider_id: None,
             title_model: None,
             title_effort: None,
+            update_mode: UpdateMode::Prompt,
+            update_check_interval_hours: default_update_check_interval_hours(),
         }
     }
 }
@@ -1143,6 +1167,26 @@ mod tests {
         }"#;
         let cfg: AppConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.settings.tool_details, ToolDetailsMode::Auto);
+    }
+
+    #[test]
+    fn config_without_update_settings_defaults() {
+        // old config.json files predate the update fields
+        let json = r#"{
+            "version": 1,
+            "settings": {
+                "theme": "dark",
+                "tool_approval": "always_ask",
+                "sampling": "ask",
+                "tool_rules": {},
+                "roots": [],
+                "max_tool_iterations": 25,
+                "show_reasoning": false
+            }
+        }"#;
+        let cfg: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.settings.update_mode, UpdateMode::Prompt);
+        assert_eq!(cfg.settings.update_check_interval_hours, 6);
     }
 
     #[test]
