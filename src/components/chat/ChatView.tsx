@@ -13,6 +13,10 @@ import { rfc9557, shortTime } from "../../time";
 export function ChatView() {
   const items = useStore((s) => s.items);
   const activeId = useStore((s) => s.activeConversationId);
+  const queued = useStore((s) =>
+    s.activeConversationId ? s.messageQueues[s.activeConversationId] : undefined,
+  );
+  const removeQueued = useStore((s) => s.removeQueued);
   const streaming = useStore(
     (s) =>
       !!s.activeConversationId &&
@@ -67,7 +71,7 @@ export function ChatView() {
         });
       }
     }
-  }, [items, streaming, activeId]);
+  }, [items, queued, streaming, activeId]);
 
   if (!activeId) {
     return <EmptyState />;
@@ -164,6 +168,13 @@ export function ChatView() {
         <div className="mx-auto flex max-w-3xl flex-col gap-4 px-5 py-6">
           {items.map((item) => (
             <MessageItem key={item.id} item={item} />
+          ))}
+          {queued?.map((m) => (
+            <QueuedBubble
+              key={m.id}
+              message={m}
+              onRemove={() => removeQueued(m.id)}
+            />
           ))}
           <div className="h-2" />
         </div>
@@ -267,6 +278,36 @@ function MessageTime({ ts, align }: { ts?: string; align: "left" | "right" }) {
   );
 }
 
+function QueuedBubble({
+  message,
+  onRemove,
+}: {
+  message: import("../../store").QueuedMessage;
+  onRemove: () => void;
+}) {
+  return (
+    <div className="flex justify-end">
+      <div className="max-w-[85%]">
+        <div className="whitespace-pre-wrap rounded-2xl rounded-br-md border border-dashed border-sky-400/70 bg-sky-600/40 px-4 py-2.5 text-sm leading-relaxed text-sky-50">
+          {message.text}
+        </div>
+        <div className="mt-1 flex items-center justify-end gap-1.5 px-1 text-[11px] text-slate-400 dark:text-slate-500">
+          <Icon name="clock" className="h-3 w-3" />
+          <span>Queued</span>
+          <button
+            className="rounded p-0.5 transition hover:text-rose-500"
+            aria-label="Remove from queue"
+            title="Remove from queue"
+            onClick={onRemove}
+          >
+            <Icon name="x" className="h-3 w-3" />
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
   const send = useStore((s) => s.send);
   const stop = useStore((s) => s.stop);
@@ -280,7 +321,8 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
 
   const submit = () => {
     const t = text.trim();
-    if (!t || streaming) return;
+    if (!t) return;
+    // while the agent is responding the store queues the message instead
     setText("");
     send(t).catch((e) => console.error(e));
   };
@@ -293,7 +335,11 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
           value={text}
           autoFocus={autoFocus}
           rows={1}
-          placeholder="Ask anything — your connected tools are available automatically…"
+          placeholder={
+            streaming
+              ? "Queue a message — it sends when the response finishes…"
+              : "Ask anything — your connected tools are available automatically…"
+          }
           className="max-h-40 min-h-[44px] flex-1 resize-none rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-sm outline-none transition focus:border-sky-400 focus:ring-2 focus:ring-sky-100 dark:border-slate-700 dark:bg-slate-900 dark:focus:border-sky-500 dark:focus:ring-sky-900/40"
           onChange={(e) => {
             setText(e.target.value);

@@ -47,6 +47,14 @@ export interface ToolItem {
 
 export type ChatItem = UserItem | AssistantItem | ToolItem;
 
+/** A message submitted while its conversation was mid-turn; held until the
+ * turn ends, then sent FIFO (one per turn end). */
+export interface QueuedMessage {
+  id: string;
+  text: string;
+  ts: string;
+}
+
 export interface Toast {
   id: string;
   kind: "error" | "info" | "success";
@@ -148,6 +156,8 @@ interface StoreState {
   items: ChatItem[];
   streaming: boolean;
   busyConversationIds: Set<string>;
+  /** Per-conversation FIFO of messages waiting for the current turn to end. */
+  messageQueues: Record<string, QueuedMessage[]>;
   titleGeneratingIds: Set<string>;
   /** Last provider token usage per conversation. */
   usageByConversation: Record<string, { input?: number; output?: number }>;
@@ -190,6 +200,7 @@ interface StoreState {
 
   send: (text: string) => Promise<void>;
   stop: () => void;
+  removeQueued: (id: string) => void;
 
   toggleTerminal: (id?: string) => void;
   setTerminalHeight: (height: number) => void;
@@ -284,6 +295,7 @@ export const useStore = create<StoreState>((set, get) => ({
   items: [],
   streaming: false,
   busyConversationIds: new Set(),
+  messageQueues: {},
   titleGeneratingIds: new Set(),
   usageByConversation: {},
 
@@ -454,7 +466,8 @@ export const useStore = create<StoreState>((set, get) => ({
       terminalOpenIds.delete(id);
       const titleGeneratingIds = new Set(s.titleGeneratingIds);
       titleGeneratingIds.delete(id);
-      return { terminalOpenIds, titleGeneratingIds };
+      const { [id]: _queue, ...messageQueues } = s.messageQueues;
+      return { terminalOpenIds, titleGeneratingIds, messageQueues };
     });
     const state = get();
     if (state.activeConversationId === id) {
@@ -493,7 +506,24 @@ export const useStore = create<StoreState>((set, get) => ({
 
   async send(text) {
     let id = get().activeConversationId;
-    if (id && (get().streaming || get().busyConversationIds.has(id))) return;
+    if (id && get().busyConversationIds.has(id)) {
+      // mid-turn: hold the message, it is sent when the turn ends
+      const convId = id;
+      set((s) => ({
+        messageQueues: {
+          ...s.messageQueues,
+          [convId]: [
+            ...(s.messageQueues[convId] ?? []),
+            {
+              id: `u-queue-${++queueSeq}`,
+              text,
+              ts: new Date().toISOString(),
+            },
+          ],
+        },
+      }));
+      return;
+    }
     if (!id) {
       // lazy chat creation: the record is made only when the first message is
       // sent from the draft page
@@ -529,41 +559,27 @@ export const useStore = create<StoreState>((set, get) => ({
       }
     }
     const convId = id;
-    const untitled =
-      get().items.every((i) => i.kind !== "user") &&
-      !get().config?.conversations.find((c) => c.id === convId)?.title;
-    set((s) => ({
-      items: [
-        ...s.items,
-        {
-          kind: "user",
-          id: `u-live-${Date.now()}`,
-          text,
-          ts: new Date().toISOString(),
-        },
-      ],
-      activeConversationId: convId,
-      streaming: true,
-      busyConversationIds: new Set([...s.busyConversationIds, convId]),
-      titleGeneratingIds: untitled
-        ? new Set([...s.titleGeneratingIds, convId])
-        : s.titleGeneratingIds,
-    }));
-    try {
-      await api.chatSend(convId, text);
-    } catch (e) {
-      get().toast("error", `${e}`);
-      set((s) => {
-        const titleGeneratingIds = new Set(s.titleGeneratingIds);
-        titleGeneratingIds.delete(convId);
-        return { streaming: false, titleGeneratingIds };
-      });
+    if (get().activeConversationId !== convId) {
+      // first message from the draft page: the new chat becomes the active one
+      set({ activeConversationId: convId });
     }
+    await dispatchSend(convId, text, set, get);
   },
 
   stop() {
     const id = get().activeConversationId;
     if (id) api.chatCancel(id).catch(() => {});
+  },
+
+  removeQueued(id) {
+    const convId = get().activeConversationId;
+    if (!convId) return;
+    set((s) => ({
+      messageQueues: {
+        ...s.messageQueues,
+        [convId]: (s.messageQueues[convId] ?? []).filter((m) => m.id !== id),
+      },
+    }));
   },
 
   toggleTerminal(id) {
@@ -783,6 +799,79 @@ function flushPending(set: SetFn, get: GetFn) {
   });
 }
 
+// --- message queue ------------------------------------------------------------
+// Messages submitted mid-turn live in messageQueues and are sent FIFO, one per
+// turn end (message_done / chat_error), via drainQueue.
+
+let queueSeq = 0;
+
+/** Starts a turn for `convId`. Transcript updates, the `streaming` mirror and
+ * the title flag apply only to the active conversation — a background drain
+ * (queue firing in a chat the user switched away from) must not touch the
+ * visible transcript. */
+async function dispatchSend(
+  convId: string,
+  text: string,
+  set: SetFn,
+  get: GetFn,
+) {
+  const active = convId === get().activeConversationId;
+  if (active) {
+    const untitled =
+      get().items.every((i) => i.kind !== "user") &&
+      !get().config?.conversations.find((c) => c.id === convId)?.title;
+    set((s) => ({
+      items: [
+        ...s.items,
+        {
+          kind: "user" as const,
+          id: `u-live-${Date.now()}`,
+          text,
+          ts: new Date().toISOString(),
+        },
+      ],
+      streaming: true,
+      busyConversationIds: new Set([...s.busyConversationIds, convId]),
+      titleGeneratingIds: untitled
+        ? new Set([...s.titleGeneratingIds, convId])
+        : s.titleGeneratingIds,
+    }));
+  } else {
+    set((s) => ({
+      busyConversationIds: new Set([...s.busyConversationIds, convId]),
+    }));
+  }
+  try {
+    await api.chatSend(convId, text);
+  } catch (e) {
+    get().toast("error", `${e}`);
+    set((s) => {
+      const busyConversationIds = new Set(s.busyConversationIds);
+      busyConversationIds.delete(convId);
+      const titleGeneratingIds = new Set(s.titleGeneratingIds);
+      titleGeneratingIds.delete(convId);
+      return {
+        streaming: active ? false : s.streaming,
+        busyConversationIds,
+        titleGeneratingIds,
+      };
+    });
+    // the turn never started, so no message_done will arrive to drain the rest
+    drainQueue(convId, set, get);
+  }
+}
+
+/** Sends the next queued message for `convId`, if any. One per call — the
+ * sent message re-marks the conversation busy, so the next one waits for that
+ * turn's message_done. */
+function drainQueue(convId: string, set: SetFn, get: GetFn) {
+  const queue = get().messageQueues[convId];
+  if (!queue?.length) return;
+  const [next, ...rest] = queue;
+  set({ messageQueues: { ...get().messageQueues, [convId]: rest } });
+  void dispatchSend(convId, next.text, set, get);
+}
+
 function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
   if (event.type !== "chat_delta" && event.type !== "reasoning_delta") {
     flushPending(set, get);
@@ -799,20 +888,28 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
       break;
     }
     case "message_done": {
-      if (event.conversation_id !== get().activeConversationId) return;
+      const active = event.conversation_id === get().activeConversationId;
       set((s) => {
+        const busy = new Set(s.busyConversationIds);
+        busy.delete(event.conversation_id);
+        if (!active) {
+          // a turn ending in the background still clears its busy flag and
+          // may fire the next queued message — but never the visible chat
+          return { busyConversationIds: busy };
+        }
         const items = s.items.map((item) =>
           item.kind === "assistant" && item.streaming
             ? { ...item, streaming: false }
             : item,
         );
-        const busy = new Set(s.busyConversationIds);
-        busy.delete(event.conversation_id);
         return { items, streaming: false, busyConversationIds: busy };
       });
-      get()
-        .refreshConfig()
-        .catch(() => {});
+      if (active) {
+        get()
+          .refreshConfig()
+          .catch(() => {});
+      }
+      drainQueue(event.conversation_id, set, get);
       break;
     }
     case "usage": {
@@ -828,11 +925,12 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
       break;
     }
     case "chat_error": {
-      if (event.conversation_id !== get().activeConversationId) {
-        get().toast("error", event.error);
-        return;
-      }
+      const active = event.conversation_id === get().activeConversationId;
+      if (!active) get().toast("error", event.error);
       set((s) => {
+        const busy = new Set(s.busyConversationIds);
+        busy.delete(event.conversation_id);
+        if (!active) return { busyConversationIds: busy };
         const items = [...s.items];
         const last = items[items.length - 1];
         if (last?.kind === "assistant" && last.streaming) {
@@ -850,10 +948,9 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
             error: event.error,
           });
         }
-        const busy = new Set(s.busyConversationIds);
-        busy.delete(event.conversation_id);
         return { items, streaming: false, busyConversationIds: busy };
       });
+      drainQueue(event.conversation_id, set, get);
       break;
     }
     case "tool_call_update": {
