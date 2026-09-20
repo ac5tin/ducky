@@ -28,7 +28,8 @@ Rust 1.85+ required (`rust-version` in Cargo.toml). Linux builds need `webkit2gt
 - `src-tauri/src/agent.rs` — chat loop: stream → tool calls → approvals → tool results.
 - `src-tauri/src/mcp/` — `manager.rs` (one rmcp client per server, caches, subscriptions), `handler.rs` (client capabilities: elicitation/sampling/roots), `bridge.rs` (interactive approvals ↔ UI events), `tests.rs`.
 - `src-tauri/src/providers/` — `openai.rs` + `anthropic.rs` adapters.
-- Also: `config.rs` (AppConfig + secrets), `oauth.rs` (OAuth 2.1 for remote MCP servers), `terminal.rs` (portable-pty), `builtin/` (built-in fs/html/web tools), `catalog.rs`, `title.rs`.
+- Also: `config.rs` (AppConfig + secrets), `oauth.rs` (OAuth 2.1 for remote MCP servers), `terminal.rs` (portable-pty), `builtin/` (built-in fs/html/web tools), `catalog.rs`, `title.rs`, `compact.rs` (`/compact` summarisation), `snapshot.rs` (hidden git repos backing `/undo` — see ADR-0002).
+- Slash commands (`/compact`, `/undo`, `/init`) are parsed in `src/slashCommands.ts` and routed in `store.ts` `send()` before the busy-queue branch; their design is in `docs/adr/0002-slash-commands-undo-compact.md`.
 
 ## Rules & gotchas
 

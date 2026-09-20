@@ -51,7 +51,7 @@ impl Agent {
         }
     }
 
-    fn provider_for(
+    pub(crate) fn provider_for(
         &self,
         provider_id: &str,
     ) -> Result<(Arc<dyn LlmProvider>, String, String), String> {
@@ -729,8 +729,10 @@ impl Agent {
             meta.clone()
         };
         let payload: Vec<serde_json::Value> = history.iter().map(|m| m.as_json()).collect();
+        // keep the /undo records `chat_send` captured for this conversation
+        let undo = self.store.load_undo_records(conversation_id);
         self.store
-            .save_conversation(&meta, &payload)
+            .save_conversation(&meta, &payload, &undo)
             .map_err(|e| e.to_string())
     }
 

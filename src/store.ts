@@ -4,6 +4,7 @@ import { check as updaterCheck, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import * as api from "./api";
 import { resolveDraftModel } from "./chatDraft";
+import { expandInitPrompt, parseSlashCommand } from "./slashCommands";
 import { dispatchTerminalEvent } from "./terminalBus";
 import type {
   AppConfig,
@@ -156,6 +157,10 @@ interface StoreState {
   items: ChatItem[];
   streaming: boolean;
   busyConversationIds: Set<string>;
+  /** Conversations currently running a /compact summary. */
+  compactingConversationIds: Set<string>;
+  /** Undone prompts waiting to be restored into the composer, by conversation. */
+  restoredDrafts: Record<string, string>;
   /** Per-conversation FIFO of messages waiting for the current turn to end. */
   messageQueues: Record<string, QueuedMessage[]>;
   titleGeneratingIds: Set<string>;
@@ -201,6 +206,13 @@ interface StoreState {
   send: (text: string) => Promise<void>;
   stop: () => void;
   removeQueued: (id: string) => void;
+  /** `/compact`: summarise the conversation's history. */
+  compactConversation: (id: string, instructions?: string) => Promise<void>;
+  /** `/undo`: drop the last turn and revert its file changes. */
+  undoConversation: (id: string) => Promise<void>;
+  /** Re-read a conversation's transcript from the backend into `items`. */
+  reloadItems: (id: string) => Promise<void>;
+  clearRestoredDraft: (id: string) => void;
 
   toggleTerminal: (id?: string) => void;
   setTerminalHeight: (height: number) => void;
@@ -295,6 +307,8 @@ export const useStore = create<StoreState>((set, get) => ({
   items: [],
   streaming: false,
   busyConversationIds: new Set(),
+  compactingConversationIds: new Set(),
+  restoredDrafts: {},
   messageQueues: {},
   titleGeneratingIds: new Set(),
   usageByConversation: {},
@@ -505,6 +519,49 @@ export const useStore = create<StoreState>((set, get) => ({
   },
 
   async send(text) {
+    // slash commands never reach the model as chat text — and unlike real
+    // messages they are never queued behind a running turn
+    const command = parseSlashCommand(text);
+    if (command) {
+      if (command.unknown) {
+        get().toast("error", `Unknown command: /${command.name}`);
+        return;
+      }
+      switch (command.name) {
+        case "init": {
+          const workingDir = get().config?.settings.working_dir?.trim() || "~";
+          await get().send(expandInitPrompt(workingDir, command.args));
+          return;
+        }
+        case "compact": {
+          const id = get().activeConversationId;
+          if (!id) {
+            get().toast("error", "Open a conversation first — /compact needs a chat.");
+            return;
+          }
+          if (get().busyConversationIds.has(id)) {
+            get().toast("error", "Wait for the response to finish before compacting.");
+            return;
+          }
+          await get().compactConversation(id, command.args || undefined);
+          return;
+        }
+        case "undo": {
+          const id = get().activeConversationId;
+          if (!id) {
+            get().toast("info", "Nothing to undo yet.");
+            return;
+          }
+          if (get().busyConversationIds.has(id)) {
+            get().toast("error", "Wait for the response to finish before undoing.");
+            return;
+          }
+          await get().undoConversation(id);
+          return;
+        }
+      }
+      return;
+    }
     let id = get().activeConversationId;
     if (id && get().busyConversationIds.has(id)) {
       // mid-turn: hold the message, it is sent when the turn ends
@@ -580,6 +637,69 @@ export const useStore = create<StoreState>((set, get) => ({
         [convId]: (s.messageQueues[convId] ?? []).filter((m) => m.id !== id),
       },
     }));
+  },
+
+  async compactConversation(id, instructions) {
+    if (get().compactingConversationIds.has(id)) return;
+    set((s) => ({
+      compactingConversationIds: new Set(s.compactingConversationIds).add(id),
+    }));
+    try {
+      await api.conversationCompact(id, instructions);
+      await get().reloadItems(id);
+      get().toast("success", "Conversation compacted.");
+    } catch (e) {
+      get().toast("error", `Could not compact: ${e}`);
+    } finally {
+      set((s) => {
+        const next = new Set(s.compactingConversationIds);
+        next.delete(id);
+        return { compactingConversationIds: next };
+      });
+    }
+  },
+
+  async undoConversation(id) {
+    try {
+      const outcome = await api.conversationUndo(id);
+      await get().reloadItems(id);
+      if (outcome.undone_text.trim()) {
+        set((s) => ({
+          restoredDrafts: { ...s.restoredDrafts, [id]: outcome.undone_text },
+        }));
+      }
+      const files = outcome.reverted_files.length;
+      const filesNote =
+        files > 0 ? ` and reverted ${files} file${files === 1 ? "" : "s"}` : "";
+      if (outcome.file_warning) {
+        get().toast("info", `Undone${filesNote}. ${outcome.file_warning}`);
+      } else {
+        get().toast("success", `Undone${filesNote}.`);
+      }
+    } catch (e) {
+      get().toast("error", `${e}`);
+    }
+  },
+
+  async reloadItems(id) {
+    try {
+      const [, raw] = await api.conversationGet(id);
+      if (get().activeConversationId !== id) return;
+      const toolStates = new Map<string, ToolCallState>();
+      for (const item of get().items) {
+        if (item.kind === "tool") toolStates.set(item.id, item.state);
+      }
+      set({ items: rawToItems(raw, toolStates) });
+    } catch (e) {
+      get().toast("error", `Could not refresh the conversation: ${e}`);
+    }
+  },
+
+  clearRestoredDraft(id) {
+    set((s) => {
+      const { [id]: _restored, ...restoredDrafts } = s.restoredDrafts;
+      return { restoredDrafts };
+    });
   },
 
   toggleTerminal(id) {

@@ -1,10 +1,17 @@
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { useStore } from "../../store";
+import {
+  COMPACT_SUMMARY_MARKER,
+  INIT_PROMPT_MARKER,
+  filterCommands,
+  type SlashCommand,
+} from "../../slashCommands";
 import { Icon } from "../icons";
 import { Markdown } from "../Markdown";
 import { ToolCallCard } from "./ToolCallCard";
 import { ModelPicker } from "./ModelPicker";
 import { WorkingDirChip } from "./WorkingDirChip";
+import { SlashCommandMenu } from "./SlashCommandMenu";
 import { TerminalPanel } from "./TerminalPanel";
 import { TokenMeter } from "./tokenUsage";
 import { ChatConnectorsDialog } from "./ChatConnectorsDialog";
@@ -213,6 +220,17 @@ const MessageItem = memo(function MessageItem({
   item: import("../../store").ChatItem;
 }) {
   if (item.kind === "user") {
+    if (item.text.startsWith(COMPACT_SUMMARY_MARKER)) {
+      return (
+        <CompactSummaryCard
+          summary={item.text.slice(COMPACT_SUMMARY_MARKER.length).trim()}
+          ts={item.ts}
+        />
+      );
+    }
+    if (item.text.startsWith(INIT_PROMPT_MARKER)) {
+      return <RanInitCard text={item.text} />;
+    }
     return (
       <div className="flex justify-end">
         <div className="max-w-[85%]">
@@ -278,6 +296,56 @@ function MessageTime({ ts, align }: { ts?: string; align: "left" | "right" }) {
   );
 }
 
+/** The single message a compacted conversation starts from: the summary that
+ * replaced everything before it. */
+function CompactSummaryCard({
+  summary,
+  ts,
+}: {
+  summary: string;
+  ts?: string;
+}) {
+  return (
+    <div className="flex justify-center">
+      <div className="w-full max-w-[85%] rounded-xl border border-slate-200 bg-slate-50 px-4 py-2.5 text-sm dark:border-slate-800 dark:bg-slate-900">
+        <details>
+          <summary className="cursor-pointer select-none text-xs font-medium text-slate-500 dark:text-slate-400">
+            <span className="inline-flex items-center gap-1.5">
+              <Icon name="box" className="h-3.5 w-3.5" />
+              Conversation compacted — summary of everything before this point
+            </span>
+          </summary>
+          <div className="mt-2 whitespace-pre-wrap leading-relaxed text-slate-600 dark:text-slate-300">
+            {summary}
+          </div>
+        </details>
+        <MessageTime ts={ts} align="left" />
+      </div>
+    </div>
+  );
+}
+
+/** The canned /init prompt, shown collapsed so the transcript stays readable. */
+function RanInitCard({ text }: { text: string }) {
+  return (
+    <div className="flex justify-end">
+      <div className="max-w-[85%]">
+        <details className="rounded-2xl rounded-br-md bg-sky-600 px-4 py-2.5 text-sm text-white shadow-sm">
+          <summary className="cursor-pointer select-none font-medium">
+            <span className="inline-flex items-center gap-1.5">
+              <Icon name="file" className="h-3.5 w-3.5" />
+              Ran /init — create or update AGENTS.md
+            </span>
+          </summary>
+          <div className="mt-1.5 whitespace-pre-wrap text-xs leading-relaxed text-sky-100">
+            {text}
+          </div>
+        </details>
+      </div>
+    </div>
+  );
+}
+
 function QueuedBubble({
   message,
   onRemove,
@@ -311,17 +379,66 @@ function QueuedBubble({
 function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
   const send = useStore((s) => s.send);
   const stop = useStore((s) => s.stop);
+  const activeId = useStore((s) => s.activeConversationId);
   const streaming = useStore(
     (s) =>
       !!s.activeConversationId &&
       s.busyConversationIds.has(s.activeConversationId),
   );
+  const compacting = useStore(
+    (s) =>
+      !!s.activeConversationId &&
+      s.compactingConversationIds.has(s.activeConversationId),
+  );
+  const restoredDraft = useStore((s) =>
+    s.activeConversationId ? s.restoredDrafts[s.activeConversationId] : undefined,
+  );
+  const clearRestoredDraft = useStore((s) => s.clearRestoredDraft);
   const [text, setText] = useState("");
+  // Esc hides the popup for the current "/" token; leaving or clearing the
+  // slash context reopens it
+  const [dismissed, setDismissed] = useState(false);
+  const [menuIndex, setMenuIndex] = useState(0);
   const ref = useRef<HTMLTextAreaElement>(null);
+
+  // /undo puts the removed prompt back into the composer
+  useEffect(() => {
+    if (restoredDraft === undefined || !activeId) return;
+    clearRestoredDraft(activeId);
+    setText(restoredDraft);
+    requestAnimationFrame(() => {
+      const el = ref.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(el.value.length, el.value.length);
+      el.style.height = "auto";
+      el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+    });
+  }, [restoredDraft, activeId, clearRestoredDraft]);
+
+  const slashMatches = useMemo(() => {
+    const t = text.trim();
+    if (!t.startsWith("/") || /\s/.test(t)) return [];
+    return filterCommands(t);
+  }, [text]);
+  const menuOpen = slashMatches.length > 0 && !dismissed && !compacting;
+  const activeMatch = Math.min(menuIndex, slashMatches.length - 1);
+
+  const completeCommand = (command: SlashCommand) => {
+    setText(`/${command.name} `);
+    setDismissed(false);
+    requestAnimationFrame(() => {
+      const el = ref.current;
+      if (!el) return;
+      el.focus();
+      el.style.height = "auto";
+      el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+    });
+  };
 
   const submit = () => {
     const t = text.trim();
-    if (!t) return;
+    if (!t || compacting) return;
     // while the agent is responding the store queues the message instead
     setText("");
     send(t).catch((e) => console.error(e));
@@ -329,47 +446,94 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
 
   return (
     <div className="border-t border-slate-200 bg-white/80 px-5 py-3.5 backdrop-blur dark:border-slate-800 dark:bg-slate-950/70">
-      <div className="mx-auto flex max-w-3xl items-end gap-2">
-        <textarea
-          ref={ref}
-          value={text}
-          autoFocus={autoFocus}
-          rows={1}
-          placeholder={
-            streaming
-              ? "Queue a message — it sends when the response finishes…"
-              : "Ask anything — your connected tools are available automatically…"
-          }
-          className="max-h-40 min-h-[44px] flex-1 resize-none rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-sm outline-none transition focus:border-sky-400 focus:ring-2 focus:ring-sky-100 dark:border-slate-700 dark:bg-slate-900 dark:focus:border-sky-500 dark:focus:ring-sky-900/40"
-          onChange={(e) => {
-            setText(e.target.value);
-            e.currentTarget.style.height = "auto";
-            e.currentTarget.style.height = `${Math.min(e.currentTarget.scrollHeight, 160)}px`;
-          }}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              submit();
-            }
-          }}
-        />
-        {streaming ? (
-          <button
-            className="flex h-11 w-11 items-center justify-center rounded-xl bg-slate-800 text-white transition hover:bg-slate-700 dark:bg-slate-700"
-            aria-label="Stop"
-            onClick={stop}
+      <div className="relative mx-auto flex max-w-3xl items-end gap-2">
+        {menuOpen && (
+          <SlashCommandMenu
+            commands={slashMatches}
+            activeIndex={activeMatch}
+            hasConversation={!!activeId}
+            onPick={completeCommand}
+            onDismiss={() => setDismissed(true)}
+          />
+        )}
+        {compacting ? (
+          // /compact in flight: the input is unavailable until it lands
+          <div
+            className="flex min-h-[44px] flex-1 items-center gap-2.5 rounded-xl border border-sky-200 bg-sky-50 px-3.5 py-2.5 text-sm font-medium text-sky-700 dark:border-sky-900 dark:bg-sky-950/60 dark:text-sky-300"
+            role="status"
           >
-            <Icon name="stop" className="h-4 w-4" />
-          </button>
+            <Icon name="spinner" className="h-4 w-4 animate-spin" />
+            Compacting the conversation…
+          </div>
         ) : (
-          <button
-            className="flex h-11 w-11 items-center justify-center rounded-xl bg-sky-600 text-white shadow-sm transition hover:bg-sky-500 disabled:opacity-40"
-            aria-label="Send"
-            disabled={!text.trim()}
-            onClick={submit}
-          >
-            <Icon name="send" className="h-4.5 w-4.5" />
-          </button>
+          <>
+            <textarea
+              ref={ref}
+              value={text}
+              autoFocus={autoFocus}
+              rows={1}
+              placeholder={
+                streaming
+                  ? "Queue a message — it sends when the response finishes…"
+                  : "Ask anything — your connected tools are available automatically…"
+              }
+              className="max-h-40 min-h-[44px] flex-1 resize-none rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-sm outline-none transition focus:border-sky-400 focus:ring-2 focus:ring-sky-100 dark:border-slate-700 dark:bg-slate-900 dark:focus:border-sky-500 dark:focus:ring-sky-900/40"
+              onChange={(e) => {
+                setText(e.target.value);
+                if (!e.target.value.trim().startsWith("/")) setDismissed(false);
+                e.currentTarget.style.height = "auto";
+                e.currentTarget.style.height = `${Math.min(e.currentTarget.scrollHeight, 160)}px`;
+              }}
+              onKeyDown={(e) => {
+                if (menuOpen && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+                  e.preventDefault();
+                  const step = e.key === "ArrowDown" ? 1 : slashMatches.length - 1;
+                  setMenuIndex((activeMatch + step) % slashMatches.length);
+                  return;
+                }
+                if (menuOpen && e.key === "Tab") {
+                  e.preventDefault();
+                  completeCommand(slashMatches[activeMatch]);
+                  return;
+                }
+                if (menuOpen && e.key === "Escape") {
+                  e.preventDefault();
+                  setDismissed(true);
+                  return;
+                }
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  if (
+                    menuOpen &&
+                    `/${slashMatches[activeMatch].name}` !== text.trim()
+                  ) {
+                    // still typing a command name — complete it, don't submit
+                    completeCommand(slashMatches[activeMatch]);
+                    return;
+                  }
+                  submit();
+                }
+              }}
+            />
+            {streaming ? (
+              <button
+                className="flex h-11 w-11 items-center justify-center rounded-xl bg-slate-800 text-white transition hover:bg-slate-700 dark:bg-slate-700"
+                aria-label="Stop"
+                onClick={stop}
+              >
+                <Icon name="stop" className="h-4 w-4" />
+              </button>
+            ) : (
+              <button
+                className="flex h-11 w-11 items-center justify-center rounded-xl bg-sky-600 text-white shadow-sm transition hover:bg-sky-500 disabled:opacity-40"
+                aria-label="Send"
+                disabled={!text.trim()}
+                onClick={submit}
+              >
+                <Icon name="send" className="h-4.5 w-4.5" />
+              </button>
+            )}
+          </>
         )}
       </div>
     </div>

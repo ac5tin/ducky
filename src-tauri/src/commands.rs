@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::ConversationRuntime;
 use crate::config::{
     self, AppConfig, ConversationMeta, McpServerConfig, ProviderConfig, Store, Theme, ToolRule,
+    UndoRecord,
 };
 use crate::mcp::bridge::ApprovalDecision;
 use crate::providers::Msg;
@@ -413,7 +414,7 @@ pub fn conversation_create(
         c.conversations.insert(0, meta.clone());
     }
     let _ = state.store.save_config();
-    let _ = state.store.save_conversation(&meta, &[]);
+    let _ = state.store.save_conversation(&meta, &[], &[]);
     meta
 }
 
@@ -591,12 +592,69 @@ pub async fn chat_send(
 
     let ct = CancellationToken::new();
     {
+        // both locks held together (always in this order) so a concurrent
+        // /compact can never slip between the check and the insert
+        let compacting = state.compacting.lock().unwrap();
+        if compacting.contains(&conversation_id) {
+            return Err("This conversation is being compacted — try again in a moment.".into());
+        }
         let mut runtimes = state.runtimes.lock().unwrap();
         runtimes.insert(
             conversation_id.clone(),
             Arc::new(ConversationRuntime { ct: ct.clone() }),
         );
     }
+
+    // /undo bookkeeping: capture the project's state before this turn can
+    // touch files. Outside git repos (or without git) there is nothing to
+    // capture and /undo falls back to removing messages only.
+    {
+        let mut records = state.store.load_undo_records(&conversation_id);
+        let user_index = history.len();
+        let snap_root = state.store.snapshots_dir.clone();
+        let wd = {
+            let cfg = state.store.config.lock().unwrap();
+            cfg.settings.effective_working_dir(&state.store.home_dir)
+        };
+        match tokio::task::spawn_blocking(move || crate::snapshot::capture(&snap_root, &wd)).await
+        {
+            Ok(Ok((tree, root))) => {
+                records.push(UndoRecord {
+                    user_index,
+                    tree,
+                    wd: root.to_string_lossy().into_owned(),
+                });
+                // bound the record list; older turns are long gone anyway
+                if records.len() > 100 {
+                    let drop = records.len() - 100;
+                    records.drain(0..drop);
+                }
+                // the record must survive even if this turn is interrupted
+                // before its first persist, so write it out right away
+                let meta = state
+                    .store
+                    .config
+                    .lock()
+                    .unwrap()
+                    .conversations
+                    .iter()
+                    .find(|c| c.id == conversation_id)
+                    .cloned()
+                    .ok_or("Unknown conversation")?;
+                let payload: Vec<serde_json::Value> =
+                    history.iter().map(|m| m.as_json()).collect();
+                if let Err(e) = state.store.save_conversation(&meta, &payload, &records) {
+                    tracing::warn!("failed to persist /undo snapshot record: {e}");
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::debug!("no /undo snapshot for this turn: {e}");
+            }
+            Err(e) => {
+                tracing::debug!("/undo snapshot task failed: {e}");
+            }
+        }
+    };
 
     let app_state = state.inner().clone();
     if auto_title {
@@ -627,6 +685,153 @@ pub fn chat_cancel(state: State<'_, Arc<AppState>>, conversation_id: String) {
         rt.ct.cancel();
     }
     state.bridge.cancel_for_conversation(&conversation_id);
+}
+
+/// `/compact`: replace the conversation's history with a model-generated
+/// summary. Refuses while a turn is running (and vice versa).
+#[tauri::command]
+pub async fn conversation_compact(
+    state: State<'_, Arc<AppState>>,
+    conversation_id: String,
+    instructions: Option<String>,
+) -> Result<(), String> {
+    {
+        // same nested-lock order as chat_send
+        let mut compacting = state.compacting.lock().unwrap();
+        if compacting.contains(&conversation_id) {
+            return Err("This conversation is already being compacted.".into());
+        }
+        let runtimes = state.runtimes.lock().unwrap();
+        if runtimes.contains_key(&conversation_id) {
+            return Err("Wait for the current response to finish before compacting.".into());
+        }
+        compacting.insert(conversation_id.clone());
+    }
+    let app_state = state.inner().clone();
+    // run in its own task: a panic inside the provider call must surface as
+    // an Err here (tokio catches it at the task boundary) instead of
+    // unwinding through the command, which would leave the compacting flag
+    // set and the invoke forever pending.
+    let task_agent = app_state.agent.clone();
+    let task_id = conversation_id.clone();
+    let result = match tokio::spawn(async move {
+        crate::compact::run(&task_agent, &task_id, instructions.as_deref()).await
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => Err(format!("Compaction failed unexpectedly: {e}")),
+    };
+    app_state.compacting.lock().unwrap().remove(&conversation_id);
+    result
+}
+
+#[derive(Serialize)]
+pub struct UndoOutcome {
+    /// The user message that was removed, for the composer to restore.
+    pub undone_text: String,
+    /// Repository-relative paths restored or deleted by the file revert.
+    pub reverted_files: Vec<String>,
+    /// How many transcript messages were removed.
+    pub truncated: usize,
+    /// Set when the messages were removed but the files could not be reverted.
+    pub file_warning: Option<String>,
+}
+
+/// `/undo`: drop the last user turn from the transcript and, when a snapshot
+/// exists, restore the project files to their pre-turn state.
+#[tauri::command]
+pub async fn conversation_undo(
+    state: State<'_, Arc<AppState>>,
+    conversation_id: String,
+) -> Result<UndoOutcome, String> {
+    {
+        let compacting = state.compacting.lock().unwrap();
+        if compacting.contains(&conversation_id) {
+            return Err("This conversation is being compacted.".into());
+        }
+        let runtimes = state.runtimes.lock().unwrap();
+        if runtimes.contains_key(&conversation_id) {
+            return Err("Wait for the current response to finish before undoing.".into());
+        }
+    }
+    let app_state = state.inner().clone();
+    let (meta, messages, records) = {
+        let Some((meta, messages)) = app_state.store.load_conversation(&conversation_id) else {
+            return Err("Unknown conversation".into());
+        };
+        (meta, messages, app_state.store.load_undo_records(&conversation_id))
+    };
+
+    // boundary = the last real user message (compaction summaries are
+    // carriers, not turns); everything from it onward is removed
+    let boundary = messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, v)| {
+            Msg::from_json(v)
+                .map(|m| {
+                    matches!(&m, Msg::User { text, .. }
+                        if !text.starts_with(crate::compact::COMPACT_MARKER))
+                })
+                .unwrap_or(false)
+        })
+        .map(|(i, _)| i)
+        .ok_or("Nothing to undo")?;
+    let undone_text = match Msg::from_json(&messages[boundary]) {
+        Some(Msg::User { text, .. }) => text,
+        _ => return Err("Nothing to undo".into()),
+    };
+
+    let record = records.iter().rev().find(|r| r.user_index == boundary).cloned();
+    let (reverted_files, file_warning) = match record {
+        Some(rec) => {
+            let snap_root = app_state.store.snapshots_dir.clone();
+            let wd = std::path::PathBuf::from(&rec.wd);
+            let tree = rec.tree.clone();
+            match tokio::task::spawn_blocking(move || {
+                crate::snapshot::restore(&snap_root, &wd, &tree)
+            })
+            .await
+            {
+                Ok(Ok(files)) => (files, None),
+                Ok(Err(e)) => (
+                    Vec::new(),
+                    Some(format!("Files were not reverted: {e}")),
+                ),
+                Err(e) => (
+                    Vec::new(),
+                    Some(format!("Files were not reverted: {e}")),
+                ),
+            }
+        }
+        None => (
+            Vec::new(),
+            Some(
+                "No file snapshot for this turn — files were left unchanged \
+                 (snapshots need the working directory to be a git repository)."
+                    .into(),
+            ),
+        ),
+    };
+
+    let truncated = messages.len() - boundary;
+    let kept: Vec<serde_json::Value> = messages[..boundary].to_vec();
+    let kept_records: Vec<UndoRecord> =
+        records.into_iter().filter(|r| r.user_index < boundary).collect();
+    let mut meta = meta;
+    meta.updated_at = now();
+    app_state
+        .store
+        .save_conversation(&meta, &kept, &kept_records)
+        .map_err(|e| e.to_string())?;
+    Ok(UndoOutcome {
+        undone_text,
+        reverted_files,
+        truncated,
+        file_warning,
+    })
 }
 
 #[tauri::command]

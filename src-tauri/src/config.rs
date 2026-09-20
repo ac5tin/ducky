@@ -350,6 +350,18 @@ impl ConversationMeta {
     }
 }
 
+/// One `/undo` snapshot: the state of the project repository just before the
+/// user message at index `user_index` was sent. `tree` is a git tree hash in
+/// Ducky's private snapshot repo (see `snapshot.rs`); `wd` is the repository
+/// root it was captured from. Absent for turns taken outside git repos —
+/// those undo messages only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UndoRecord {
+    pub user_index: usize,
+    pub tree: String,
+    pub wd: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppConfig {
     pub version: u32,
@@ -566,6 +578,8 @@ pub struct Store {
     config_path: PathBuf,
     secrets_path: PathBuf,
     conversations_dir: PathBuf,
+    /// Root of the private git repos backing `/undo` (see `snapshot.rs`).
+    pub snapshots_dir: PathBuf,
     /// The machine's home directory; the default working directory.
     pub home_dir: PathBuf,
     pub config: Mutex<AppConfig>,
@@ -597,6 +611,7 @@ impl Store {
         let secrets_path = base.join("secrets.json");
         let conversations_dir = base.join("conversations");
         std::fs::create_dir_all(&conversations_dir)?;
+        let snapshots_dir = base.join("snapshots");
 
         let config = if config_path.exists() {
             serde_json::from_str(&std::fs::read_to_string(&config_path)?).unwrap_or_default()
@@ -616,6 +631,7 @@ impl Store {
             config_path,
             secrets_path,
             conversations_dir,
+            snapshots_dir,
             home_dir,
             config: Mutex::new(config),
             secrets: Mutex::new(secrets),
@@ -748,6 +764,7 @@ impl Store {
         &self,
         meta: &ConversationMeta,
         messages: &[serde_json::Value],
+        undo: &[UndoRecord],
     ) -> anyhow::Result<()> {
         let meta = {
             let mut cfg = self.config.lock().unwrap();
@@ -762,7 +779,7 @@ impl Store {
                 meta.clone()
             }
         };
-        let payload = serde_json::json!({ "meta": meta, "messages": messages });
+        let payload = serde_json::json!({ "meta": meta, "messages": messages, "undo": undo });
         write_private(
             &self.conversation_path(&meta.id),
             &serde_json::to_string_pretty(&payload)?,
@@ -793,6 +810,23 @@ impl Store {
         let meta = serde_json::from_value(payload.get("meta")?.clone()).ok()?;
         let messages = payload.get("messages")?.as_array()?.clone();
         Some((meta, messages))
+    }
+
+    /// The `/undo` snapshots recorded for a conversation. Conversations
+    /// written before the feature existed (or outside git repos) have none.
+    pub fn load_undo_records(&self, id: &str) -> Vec<UndoRecord> {
+        let path = self.conversation_path(id);
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return Vec::new();
+        };
+        let Ok(payload) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            return Vec::new();
+        };
+        payload
+            .get("undo")
+            .cloned()
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default()
     }
 
     pub fn delete_conversation(&self, id: &str) -> anyhow::Result<()> {
@@ -978,13 +1012,33 @@ mod tests {
             updated_at: "t".into(),
         };
         let messages = vec![serde_json::json!({"role": "user", "text": "hello"})];
-        store.save_conversation(&meta, &messages).unwrap();
+        let undo = vec![UndoRecord {
+            user_index: 0,
+            tree: "abc123".into(),
+            wd: "/repo".into(),
+        }];
+        store.save_conversation(&meta, &messages, &undo).unwrap();
         let (meta2, msgs2) = store.load_conversation("abc-123").unwrap();
         assert_eq!(meta2.title, "Hi");
         assert_eq!(meta2.effort, Some(EffortLevel::High));
         assert_eq!(msgs2.len(), 1);
+        assert_eq!(store.load_undo_records("abc-123"), undo);
         store.delete_conversation("abc-123").unwrap();
         assert!(store.load_conversation("abc-123").is_none());
+    }
+
+    #[test]
+    fn undo_records_absent_in_old_transcripts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(tmp.path(), tmp.path().to_path_buf()).unwrap();
+        // a transcript written before /undo existed has no "undo" array
+        std::fs::write(
+            store.conversation_path("legacy-1"),
+            r#"{"meta": {"id": "legacy-1", "title": "", "provider_id": "p", "model": "m", "created_at": "t", "updated_at": "t"}, "messages": []}"#,
+        )
+        .unwrap();
+        assert!(store.load_undo_records("legacy-1").is_empty());
+        assert!(store.load_undo_records("never-created").is_empty());
     }
 
     #[test]
@@ -1009,7 +1063,7 @@ mod tests {
             .push(meta.clone());
         store.save_config().unwrap();
         meta.title = "Hi".into();
-        store.save_conversation(&meta, &[]).unwrap();
+        store.save_conversation(&meta, &[], &[]).unwrap();
         let store2 = Store::new(tmp.path(), tmp.path().to_path_buf()).unwrap();
         assert_eq!(store2.config.lock().unwrap().conversations[0].title, "Hi");
     }
@@ -1034,9 +1088,9 @@ mod tests {
             .unwrap()
             .conversations
             .push(meta.clone());
-        store.save_conversation(&meta, &[]).unwrap();
+        store.save_conversation(&meta, &[], &[]).unwrap();
         meta.title.clear();
-        store.save_conversation(&meta, &[]).unwrap();
+        store.save_conversation(&meta, &[], &[]).unwrap();
         assert_eq!(store.config.lock().unwrap().conversations[0].title, "Hi");
     }
 
@@ -1064,7 +1118,7 @@ mod tests {
                 ..meta.clone()
             });
         store.save_config().unwrap();
-        store.save_conversation(&meta, &[]).unwrap();
+        store.save_conversation(&meta, &[], &[]).unwrap();
         {
             let mut cfg = store.config.lock().unwrap();
             cfg.conversations[0].title.clear();

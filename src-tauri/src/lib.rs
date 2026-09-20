@@ -4,11 +4,13 @@ pub mod agent;
 pub mod builtin;
 pub mod catalog;
 pub mod commands;
+pub mod compact;
 pub mod config;
 pub mod events;
 pub mod mcp;
 pub mod oauth;
 pub mod providers;
+pub mod snapshot;
 pub mod state;
 pub mod terminal;
 pub mod title;
@@ -88,6 +90,8 @@ pub fn run() {
             commands::context_limit,
             commands::chat_send,
             commands::chat_cancel,
+            commands::conversation_compact,
+            commands::conversation_undo,
             commands::terminal_create,
             commands::terminal_write,
             commands::terminal_resize,

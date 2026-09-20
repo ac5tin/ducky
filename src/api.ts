@@ -153,6 +153,31 @@ export const chatSend = (conversationId: string, text: string) =>
 export const chatCancel = (conversationId: string) =>
   invoke<void>("chat_cancel", { conversationId });
 
+/** `/compact`: replace the conversation's history with a summary. */
+export const conversationCompact = (
+  conversationId: string,
+  instructions?: string,
+) =>
+  invoke<void>("conversation_compact", {
+    conversationId,
+    instructions: instructions || null,
+  });
+
+export interface UndoOutcome {
+  /** The removed user message, for the composer to restore. */
+  undone_text: string;
+  /** Repository-relative paths restored or deleted by the file revert. */
+  reverted_files: string[];
+  /** How many transcript messages were removed. */
+  truncated: number;
+  /** Set when the messages were removed but files could not be reverted. */
+  file_warning: string | null;
+}
+
+/** `/undo`: drop the last user turn and revert its file changes. */
+export const conversationUndo = (conversationId: string) =>
+  invoke<UndoOutcome>("conversation_undo", { conversationId });
+
 // ---------------------------------------------------------------------------
 // Per-conversation terminal
 // ---------------------------------------------------------------------------

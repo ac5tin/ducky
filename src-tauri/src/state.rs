@@ -1,6 +1,6 @@
 //! Shared application state passed to every Tauri command.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use tokio_util::sync::CancellationToken;
@@ -35,6 +35,9 @@ pub struct AppState {
     pub runtimes: Mutex<HashMap<String, Arc<ConversationRuntime>>>,
     /// Cancellation tokens for in-flight chat-title generation.
     pub title_runtimes: Mutex<HashMap<String, CancellationToken>>,
+    /// Conversations currently being compacted (`/compact`); `chat_send` and
+    /// `/undo` refuse to run for these until the summary lands.
+    pub compacting: Mutex<HashSet<String>>,
     /// Per-conversation PTY terminals (one shell per chat session).
     pub terminals: crate::terminal::TerminalMap,
 }
@@ -63,6 +66,7 @@ impl AppState {
             catalog,
             runtimes: Mutex::new(HashMap::new()),
             title_runtimes: Mutex::new(HashMap::new()),
+            compacting: Mutex::new(HashSet::new()),
             terminals: Arc::new(Mutex::new(HashMap::new())),
         })
     }
