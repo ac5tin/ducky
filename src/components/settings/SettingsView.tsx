@@ -218,6 +218,14 @@ export function SettingsView() {
           )}
         </Section>
 
+        {/* System prompt */}
+        <Section
+          title="System prompt"
+          description="Custom instructions for the main agent, appended after its built-in ones in every chat."
+        >
+          <SystemPromptSection />
+        </Section>
+
         {/* Subagents */}
         <Section
           title="Subagents"
@@ -920,6 +928,50 @@ const BUILTIN_TOOL_OPTIONS: [string, string][] = [
 
 function chipClass() {
   return "rounded bg-slate-100 px-1.5 py-0.5 text-[11px] font-medium text-slate-500 dark:bg-slate-800 dark:text-slate-400";
+}
+
+function SystemPromptSection() {
+  const config = useStore((s) => s.config);
+  const refreshConfig = useStore((s) => s.refreshConfig);
+  const toast = useStore((s) => s.toast);
+  const [value, setValue] = useState(config?.settings.system_prompt ?? "");
+  const [busy, setBusy] = useState(false);
+
+  if (!config) return null;
+  const saved = config.settings.system_prompt;
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      await api.settingsSet({ system_prompt: value });
+      await refreshConfig();
+    } catch (e) {
+      toast("error", `${e}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="space-y-3">
+      <Field
+        label="Custom instructions"
+        hint="Takes effect from the next message on, including in existing chats. Subagents are unaffected — they keep their own personas. Leave empty to disable."
+      >
+        <textarea
+          className={inputClass + " min-h-32 font-mono text-xs"}
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          placeholder="e.g. Answer concisely. Prefer TypeScript. Always suggest tests."
+        />
+      </Field>
+      <div className="flex justify-end">
+        <Button disabled={busy || value === saved} onClick={save}>
+          Save
+        </Button>
+      </div>
+    </div>
+  );
 }
 
 function SubagentsSection() {

@@ -99,6 +99,7 @@ export const settingsSet = (settings: {
   title_effort?: EffortLevel | null;
   update_mode?: "prompt" | "auto";
   update_check_interval_hours?: number;
+  system_prompt?: string;
 }) => invoke<void>("settings_set", { settings });
 
 export const toolRuleSet = (key: string, rule: ToolRule | null) =>

@@ -276,6 +276,10 @@ pub struct AppSettings {
     /// Hours between update checks; 0 = check on startup only.
     #[serde(default = "default_update_check_interval_hours")]
     pub update_check_interval_hours: u32,
+    /// Custom prompt appended to the main agent's grounding text.
+    /// Empty or whitespace means none.
+    #[serde(default)]
+    pub system_prompt: String,
 }
 
 impl Default for AppSettings {
@@ -298,6 +302,7 @@ impl Default for AppSettings {
             title_effort: None,
             update_mode: UpdateMode::Prompt,
             update_check_interval_hours: default_update_check_interval_hours(),
+            system_prompt: String::new(),
         }
     }
 }

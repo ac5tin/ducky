@@ -777,3 +777,45 @@ async fn stalled_subagent_stream_fails_loudly() {
         .iter()
         .any(|e| matches!(e, BackendEvent::MessageDone { .. })));
 }
+
+#[tokio::test]
+async fn main_system_prompt_applies_to_main_run_only() {
+    script(
+        "t11-main",
+        vec![
+            MockRound::Tools(vec![(
+                SUBAGENT.into(),
+                serde_json::json!({"task": "t11-sub"}),
+            )]),
+            MockRound::Text("main done".into()),
+        ],
+    );
+    script("t11-sub", vec![MockRound::Text("sub answer".into())]);
+
+    let (agent, _sink, store) = test_agent("t11-conv");
+    store
+        .config
+        .lock()
+        .unwrap()
+        .settings
+        .system_prompt = "Always answer in haiku.".into();
+    run(&agent, "t11-conv", "t11-main", &CancellationToken::new()).await;
+
+    // the main run's system message carries the custom prompt after the grounding
+    let main = captures_for("t11-main");
+    assert_eq!(main.len(), 2);
+    assert!(main[0].system.contains("Working directory"));
+    assert!(main[0].system.contains("Always answer in haiku."));
+    assert!(
+        main[0]
+            .system
+            .find("Working directory")
+            .unwrap()
+            < main[0].system.find("Always answer in haiku.").unwrap()
+    );
+    // the subagent run keeps its own persona flow, without the main prompt
+    let sub = captures_for("t11-sub");
+    assert_eq!(sub.len(), 1);
+    assert!(sub[0].system.contains("Working directory"));
+    assert!(!sub[0].system.contains("Always answer in haiku."));
+}

@@ -412,7 +412,10 @@ pub async fn settings_set(
             c.settings.update_mode = v;
         }
         if let Some(v) = settings.update_check_interval_hours {
-            c.settings.update_check_interval_hours = v.min(168);
+            c.settings.update_check_interval_hours = v;
+        }
+        if let Some(v) = settings.system_prompt {
+            c.settings.system_prompt = v;
         }
     }
     state.store.save_config().map_err(|e| e.to_string())?;
@@ -462,6 +465,7 @@ pub struct AppSettingsPatch {
     pub title_effort: Option<Option<config::EffortLevel>>,
     pub update_mode: Option<config::UpdateMode>,
     pub update_check_interval_hours: Option<u32>,
+    pub system_prompt: Option<String>,
 }
 
 #[tauri::command]

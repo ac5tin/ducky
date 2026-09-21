@@ -95,6 +95,8 @@ export interface AppSettings {
         update_mode: "prompt" | "auto";
         /** Hours between update checks; 0 = check on startup only. */
         update_check_interval_hours: number;
+        /** Custom prompt appended to the main agent's system message; empty = none. */
+        system_prompt: string;
 }
 
 export interface ConversationMeta {

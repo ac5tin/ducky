@@ -162,10 +162,12 @@ pub struct Agent {
 }
 
 /// Per-round system message (never persisted). Rebuilt each round so
-/// working-directory changes apply mid-turn. Subagent runs get a preamble
-/// describing their contract: isolated context, autonomous, final answer;
-/// spawns via a configured agent type also get that type's persona.
-fn system_message(cwd: &std::path::Path, scope: &RunScope) -> Msg {
+/// working-directory changes apply mid-turn. Main runs append the custom
+/// system prompt from settings after the grounding text. Subagent runs get
+/// a preamble describing their contract: isolated context, autonomous,
+/// final answer; spawns via a configured agent type also get that type's
+/// persona.
+fn system_message(cwd: &std::path::Path, scope: &RunScope, main_prompt: &str) -> Msg {
     let grounding = format!(
         "Working directory: {}. Resolve relative file paths the user mentions \
          against this directory. Built-in file tools are confined to the \
@@ -176,7 +178,15 @@ fn system_message(cwd: &std::path::Path, scope: &RunScope) -> Msg {
         cwd.display()
     );
     let text = match scope {
-        RunScope::Main => grounding,
+        RunScope::Main => {
+            let mut text = grounding;
+            let prompt = main_prompt.trim();
+            if !prompt.is_empty() {
+                text.push_str("\n\n");
+                text.push_str(prompt);
+            }
+            text
+        }
         RunScope::Subagent { spec, .. } => {
             let mut text = format!(
                 "You are a subagent: an autonomous helper spawned by another agent to \
@@ -498,12 +508,15 @@ impl Agent {
             // history plus a system message with the current working
             // directory (injected per turn, never persisted) so we can mutate
             // it freely while events stream in.
-            let cwd = {
+            let (cwd, main_prompt) = {
                 let cfg = self.store.config.lock().unwrap();
-                cfg.settings.effective_working_dir(&self.store.home_dir)
+                (
+                    cfg.settings.effective_working_dir(&self.store.home_dir),
+                    cfg.settings.system_prompt.clone(),
+                )
             };
             let mut snapshot = history.clone();
-            snapshot.insert(0, system_message(&cwd, scope));
+            snapshot.insert(0, system_message(&cwd, scope, &main_prompt));
             let conversation_effort = {
                 let cfg = self.store.config.lock().unwrap();
                 cfg.conversations
