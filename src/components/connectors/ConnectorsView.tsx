@@ -104,8 +104,9 @@ export function ConnectorsView() {
               <Icon name="plug" className="mx-auto h-8 w-8 text-slate-300" />
               <p className="mt-3 text-sm font-medium">No connectors yet</p>
               <p className="mx-auto mt-1 max-w-sm text-xs leading-relaxed text-slate-400">
-                Try “Filesystem” to let the AI read files, or “Fetch” to read
-                web pages. You can also paste a config from another MCP app.
+                Try “Filesystem” to let the AI read files, or “Memory” to give
+                it a knowledge graph. You can also paste a config from another
+                MCP app.
               </p>
               <Button
                 className="mt-4"

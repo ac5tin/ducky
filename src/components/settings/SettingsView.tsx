@@ -2,7 +2,11 @@ import { useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useStore } from "../../store";
 import * as api from "../../api";
-import type { EffortLevel, ProviderConfig } from "../../types";
+import type {
+  EffortLevel,
+  ProviderConfig,
+  SubagentConfig,
+} from "../../types";
 import { Button, Field, Modal, inputClass } from "../modals/Modal";
 import { Icon } from "../icons";
 import {
@@ -212,6 +216,14 @@ export function SettingsView() {
               </div>
             </div>
           )}
+        </Section>
+
+        {/* Subagents */}
+        <Section
+          title="Subagents"
+          description="Reusable helper types the AI can spawn with the ducky__subagent tool. By default each inherits the chat's model and effort, and has every tool."
+        >
+          <SubagentsSection />
         </Section>
 
         {/* Working directory */}
@@ -880,6 +892,407 @@ function ProviderEditorModal({
             Test connection
           </Button>
           <Button disabled={busy} onClick={save}>
+            Save
+          </Button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Subagents
+// ---------------------------------------------------------------------------
+
+const DEFAULT_SUBAGENT_NAMES = ["General-Purpose", "Explore"];
+
+/** Built-in tools offered as allowlist checkboxes: value + friendly label. */
+const BUILTIN_TOOL_OPTIONS: [string, string][] = [
+  ["ducky__fs_list", "List files"],
+  ["ducky__fs_read", "Read file"],
+  ["ducky__fs_search", "Search file names"],
+  ["ducky__fs_write", "Write file"],
+  ["ducky__fs_mkdir", "Create folder"],
+  ["ducky__web_fetch", "Fetch URL"],
+  ["ducky__web_search", "Web search"],
+  ["ducky__subagent", "Spawn subagents"],
+];
+
+function chipClass() {
+  return "rounded bg-slate-100 px-1.5 py-0.5 text-[11px] font-medium text-slate-500 dark:bg-slate-800 dark:text-slate-400";
+}
+
+function SubagentsSection() {
+  const config = useStore((s) => s.config);
+  const refreshConfig = useStore((s) => s.refreshConfig);
+  const toast = useStore((s) => s.toast);
+  const [editing, setEditing] = useState<SubagentConfig | null>(null);
+  const [adding, setAdding] = useState(false);
+
+  if (!config) return null;
+
+  const present = new Set(
+    config.subagents.map((s) => s.name.trim().toLowerCase()),
+  );
+  const missingDefaults = DEFAULT_SUBAGENT_NAMES.filter(
+    (n) => !present.has(n.toLowerCase()),
+  );
+
+  const remove = async (id: string) => {
+    try {
+      await api.subagentRemove(id);
+      await refreshConfig();
+    } catch (e) {
+      toast("error", `${e}`);
+    }
+  };
+
+  const restore = async () => {
+    try {
+      const added = await api.subagentRestoreDefaults();
+      await refreshConfig();
+      toast(
+        "success",
+        added > 0
+          ? `Restored ${added} default subagent${added > 1 ? "s" : ""}.`
+          : "Nothing to restore — all defaults are present.",
+      );
+    } catch (e) {
+      toast("error", `${e}`);
+    }
+  };
+
+  return (
+    <div className="space-y-2">
+      {config.subagents.map((s) => {
+        const provider = config.providers.find(
+          (p) => p.id === s.provider_id,
+        );
+        return (
+          <div
+            key={s.id}
+            className="flex items-center justify-between gap-3 rounded-xl border border-slate-200 p-3.5 dark:border-slate-700"
+          >
+            <div className="min-w-0">
+              <div className="font-semibold">{s.name}</div>
+              <div className="truncate text-xs text-slate-400">
+                {s.description}
+              </div>
+              <div className="mt-1.5 flex flex-wrap gap-1">
+                <span className={chipClass()}>
+                  {s.provider_id && s.model
+                    ? `${provider?.name ?? s.provider_id} · ${s.model}`
+                    : "Inherits chat model"}
+                </span>
+                <span className={chipClass()}>
+                  {s.effort ? `Effort: ${EFFORT_LABELS[s.effort]}` : "Inherits effort"}
+                </span>
+                <span className={chipClass()}>
+                  {s.tools ? `${s.tools.length} tools` : "All tools"}
+                </span>
+              </div>
+            </div>
+            <div className="flex shrink-0 gap-1.5">
+              <Button variant="secondary" onClick={() => setEditing(s)}>
+                Edit
+              </Button>
+              <Button variant="ghost" onClick={() => void remove(s.id)}>
+                <Icon name="trash" className="h-4 w-4" />
+              </Button>
+            </div>
+          </div>
+        );
+      })}
+      <div className="flex gap-2">
+        <Button variant="secondary" onClick={() => setAdding(true)}>
+          <Icon name="plus" className="h-4 w-4" />
+          Add subagent
+        </Button>
+        {missingDefaults.length > 0 && (
+          <Button variant="ghost" onClick={() => void restore()}>
+            Restore defaults
+          </Button>
+        )}
+      </div>
+      {(editing || adding) && (
+        <SubagentEditorModal
+          existing={editing}
+          onClose={() => {
+            setEditing(null);
+            setAdding(false);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function SubagentEditorModal({
+  existing,
+  onClose,
+}: {
+  /** The definition being edited, or null when adding a new one. */
+  existing: SubagentConfig | null;
+  onClose: () => void;
+}) {
+  const config = useStore((s) => s.config);
+  const refreshConfig = useStore((s) => s.refreshConfig);
+  const toast = useStore((s) => s.toast);
+  const [name, setName] = useState(existing?.name ?? "");
+  const [description, setDescription] = useState(existing?.description ?? "");
+  const [systemPrompt, setSystemPrompt] = useState(
+    existing?.system_prompt ?? "",
+  );
+  const [providerId, setProviderId] = useState(existing?.provider_id ?? "");
+  const [model, setModel] = useState(existing?.model ?? "");
+  const [effort, setEffort] = useState<EffortLevel | null>(
+    existing?.effort ?? null,
+  );
+  const [restricted, setRestricted] = useState(!!existing?.tools);
+  const [tools, setTools] = useState<string[]>(existing?.tools ?? []);
+  const [busy, setBusy] = useState(false);
+
+  // hooks before any early return (rules of hooks)
+  const provider =
+    config && providerId
+      ? (config.providers.find((p) => p.id === providerId) ?? null)
+      : null;
+  const resolvedModel = (provider && model) || provider?.default_model || "";
+  // with a model override the pills follow that model's levels; while
+  // inheriting, offer the standard fallback trio
+  const efforts = useEffortLevels(provider?.kind, resolvedModel || undefined);
+
+  if (!config) return null;
+  const effortOptions =
+    efforts.length > 0
+      ? efforts
+      : (["low", "medium", "high"] as EffortLevel[]);
+
+  const serverOptions = config.mcp_servers.map((s) => ({
+    value: `${s.id}/*`,
+    label: `${s.name} (all tools)`,
+  }));
+  const knownEntries = new Set([
+    ...BUILTIN_TOOL_OPTIONS.map(([value]) => value),
+    ...serverOptions.map((s) => s.value),
+  ]);
+  const extraEntries = tools.filter((t) => !knownEntries.has(t));
+
+  const toggleTool = (value: string) => {
+    setTools((prev) =>
+      prev.includes(value)
+        ? prev.filter((t) => t !== value)
+        : [...prev, value],
+    );
+  };
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      const def: SubagentConfig = {
+        id: existing?.id ?? "",
+        name: name.trim(),
+        description: description.trim(),
+        system_prompt: systemPrompt,
+        provider_id: providerId || null,
+        model: providerId ? model.trim() || null : null,
+        effort,
+        tools: restricted && tools.length > 0 ? tools : null,
+        created_at: existing?.created_at ?? "",
+      };
+      if (existing) {
+        await api.subagentUpdate(def);
+      } else {
+        await api.subagentAdd(def);
+      }
+      await refreshConfig();
+      onClose();
+    } catch (e) {
+      toast("error", `${e}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      title={existing ? `Edit ${existing.name}` : "Add subagent"}
+      wide
+    >
+      <div className="space-y-4">
+        <Field
+          label="Name"
+          hint="What the AI passes as the `agent` type and what cards show by default."
+        >
+          <input
+            className={inputClass}
+            value={name}
+            placeholder="e.g. Code-Reviewer"
+            onChange={(e) => setName(e.target.value)}
+          />
+        </Field>
+        <Field
+          label="Description"
+          hint="When-to-use hint the AI reads to decide whether to spawn this subagent."
+        >
+          <input
+            className={inputClass}
+            value={description}
+            placeholder="e.g. Reviews diffs for bugs — use after writing code"
+            onChange={(e) => setDescription(e.target.value)}
+          />
+        </Field>
+        <Field
+          label="System prompt"
+          hint="Appended after the generic subagent preamble (fresh context, one task, final answer)."
+        >
+          <textarea
+            className={inputClass + " min-h-32 font-mono text-xs"}
+            value={systemPrompt}
+            placeholder="You are a careful code reviewer…"
+            onChange={(e) => setSystemPrompt(e.target.value)}
+          />
+        </Field>
+        <Field label="Model">
+          <div className="grid gap-2 sm:grid-cols-2">
+            <select
+              className={inputClass}
+              value={providerId}
+              onChange={(e) => {
+                setProviderId(e.target.value);
+                setModel("");
+              }}
+            >
+              <option value="">Inherit from the chat</option>
+              {config.providers.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.name}
+                </option>
+              ))}
+            </select>
+            <select
+              className={inputClass}
+              value={model}
+              disabled={!provider}
+              onChange={(e) => setModel(e.target.value)}
+            >
+              <option value="">Provider default</option>
+              {(provider?.models ?? []).map((m) => (
+                <option key={m} value={m}>
+                  {m}
+                </option>
+              ))}
+            </select>
+          </div>
+        </Field>
+        <Field label="Thinking effort">
+          <div className="flex flex-wrap gap-1">
+            <EffortPill
+              selected={effort === null}
+              label="Inherit"
+              onClick={() => setEffort(null)}
+            />
+            {effortOptions.map((level) => (
+              <EffortPill
+                key={level}
+                selected={effort === level}
+                label={EFFORT_LABELS[level]}
+                onClick={() => setEffort(level)}
+              />
+            ))}
+          </div>
+        </Field>
+        <Field
+          label="Tools"
+          hint={
+            restricted
+              ? "The subagent only sees the checked tools — others are not offered to it at all."
+              : "All tools the chat has, including every connected server."
+          }
+        >
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={!restricted}
+              onChange={(e) => setRestricted(!e.target.checked)}
+            />
+            All tools
+          </label>
+          {restricted && (
+            <div className="mt-2 space-y-1.5">
+              <div className="text-xs font-medium text-slate-400">
+                Built-in tools
+              </div>
+              <div className="grid gap-1 sm:grid-cols-2">
+                {BUILTIN_TOOL_OPTIONS.map(([value, label]) => (
+                  <label
+                    key={value}
+                    className="flex items-center gap-2 text-sm"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={tools.includes(value)}
+                      onChange={() => toggleTool(value)}
+                    />
+                    {label}
+                  </label>
+                ))}
+              </div>
+              {serverOptions.length > 0 && (
+                <>
+                  <div className="mt-2 text-xs font-medium text-slate-400">
+                    MCP servers
+                  </div>
+                  <div className="grid gap-1 sm:grid-cols-2">
+                    {serverOptions.map((s) => (
+                      <label
+                        key={s.value}
+                        className="flex items-center gap-2 text-sm"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={tools.includes(s.value)}
+                          onChange={() => toggleTool(s.value)}
+                        />
+                        {s.label}
+                      </label>
+                    ))}
+                  </div>
+                </>
+              )}
+              {extraEntries.length > 0 && (
+                <>
+                  <div className="mt-2 text-xs font-medium text-slate-400">
+                    Other entries
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {extraEntries.map((entry) => (
+                      <button
+                        key={entry}
+                        className={chipClass() + " flex items-center gap-1"}
+                        onClick={() => toggleTool(entry)}
+                        title="Remove"
+                      >
+                        <span className="font-mono">{entry}</span>
+                        <Icon name="x" className="h-3 w-3" />
+                      </button>
+                    ))}
+                  </div>
+                </>
+              )}
+              {tools.length === 0 && (
+                <p className="text-xs text-amber-600 dark:text-amber-400">
+                  Nothing is checked — saving will grant this subagent every
+                  tool instead.
+                </p>
+              )}
+            </div>
+          )}
+        </Field>
+        <div className="flex justify-end">
+          <Button disabled={busy} onClick={() => void save()}>
             Save
           </Button>
         </div>

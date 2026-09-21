@@ -350,6 +350,176 @@ impl ConversationMeta {
     }
 }
 
+/// A reusable subagent definition: a named persona the main agent can spawn
+/// via the `ducky__subagent` tool's `agent` parameter. Unset overrides mean
+/// "inherit the conversation's provider/model/effort".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentConfig {
+    pub id: String,
+    /// Display name; also the enum value the model passes as `agent`.
+    /// Unique case-insensitively.
+    pub name: String,
+    /// When-to-use hint shown to the parent model so it can pick the right
+    /// subagent for a task.
+    pub description: String,
+    /// Persona system prompt appended after the generic subagent preamble.
+    /// May be empty (General-Purpose ships empty).
+    #[serde(default)]
+    pub system_prompt: String,
+    /// Provider override. `None` = inherit the conversation's provider.
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    /// Model override. Only honored together with `provider_id`.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Reasoning-effort override. `None` = inherit the conversation's.
+    #[serde(default)]
+    pub effort: Option<EffortLevel>,
+    /// Tool allowlist. `None` = all tools (the parent's tool set). Entries
+    /// match builtin tool names (`ducky__fs_read`), qualified MCP tools
+    /// (`server_id/tool_name`), or whole servers (`server_id/*`).
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
+    pub created_at: String,
+}
+
+/// Validate a subagent definition. `providers` is the current provider list
+/// (for override checks), `others` the existing subagents excluding `def`
+/// itself (for name uniqueness). Returns a human-readable error for the UI.
+pub fn validate_subagent(
+    def: &SubagentConfig,
+    providers: &[ProviderConfig],
+    others: &[SubagentConfig],
+) -> Result<(), String> {
+    let name = def.name.trim();
+    if name.is_empty() {
+        return Err("Name is required".into());
+    }
+    if name.len() > 64 {
+        return Err("Name must be 64 characters or fewer".into());
+    }
+    if others
+        .iter()
+        .any(|s| s.name.trim().eq_ignore_ascii_case(name))
+    {
+        return Err(format!("A subagent named \"{name}\" already exists"));
+    }
+    let description = def.description.trim();
+    if description.is_empty() {
+        return Err(
+            "Description is required — it tells the model when to use this subagent".into(),
+        );
+    }
+    if description.len() > 1000 {
+        return Err("Description must be 1000 characters or fewer".into());
+    }
+    match (&def.provider_id, def.model.as_deref().map(str::trim)) {
+        (None, Some(m)) if !m.is_empty() => {
+            return Err("Pick a provider before setting a model".into());
+        }
+        (Some(pid), m) => {
+            let Some(provider) = providers.iter().find(|p| p.id == *pid) else {
+                return Err("The selected provider no longer exists".into());
+            };
+            if let Some(model) = m {
+                if model.is_empty() {
+                    return Err("Model cannot be blank when a provider is set".into());
+                }
+                if !provider.models.is_empty()
+                    && !provider.models.iter().any(|known| known == model)
+                {
+                    return Err(format!(
+                        "\"{model}\" is not in {}'s model list",
+                        provider.name
+                    ));
+                }
+            }
+        }
+        _ => {}
+    }
+    if let Some(tools) = &def.tools {
+        if tools.iter().any(|t| t.trim().is_empty()) {
+            return Err("Tool allowlist entries cannot be blank".into());
+        }
+    }
+    Ok(())
+}
+
+/// The default subagent definitions seeded into a fresh config. Ids and
+/// timestamps are assigned at insertion time.
+fn default_subagent_defs(now: &str) -> Vec<SubagentConfig> {
+    vec![
+        SubagentConfig {
+            id: Store::new_id(),
+            name: "General-Purpose".into(),
+            description: "General-purpose helper for any self-contained task: research, \
+                          multi-step work, or changes that benefit from an isolated context. \
+                          Has every tool and can spawn its own subagents."
+                .into(),
+            system_prompt: String::new(),
+            provider_id: None,
+            model: None,
+            effort: None,
+            tools: None,
+            created_at: now.into(),
+        },
+        SubagentConfig {
+            id: Store::new_id(),
+            name: "Explore".into(),
+            description: "Read-only search agent for broad fan-out searches — sweeping many \
+                          files, directories, or web pages where only the conclusion matters. \
+                          It locates code; it doesn't review or audit it. Use for \"where is X \
+                          defined\" or \"which files implement Y\" questions."
+                .into(),
+            system_prompt: "You are a read-only search agent for broad fan-out searches: when \
+                            the task means sweeping many files, directories, or web pages and \
+                            only the conclusion matters, you are the right tool. You locate \
+                            code and information; you do not review or audit what you find.\n\n\
+                            Work breadth-first: start from wide searches (file-name search, \
+                            directory listings, web search) and drill into individual files \
+                            only where the trail is hot. Read excerpts rather than whole \
+                            files; skip anything that clearly isn't relevant. Never modify \
+                            anything — you have no tools that write, so don't attempt \
+                            workarounds.\n\n\
+                            Report conclusions, not file dumps: file paths with line numbers \
+                            (path:line) and one-line statements of what each contains. When \
+                            several places implement the same thing, list them all. Say \
+                            plainly when you could not find something — an honest \"not \
+                            found\" is more useful than a guess."
+                .into(),
+            provider_id: None,
+            model: None,
+            effort: None,
+            tools: Some(vec![
+                crate::builtin::fs::LIST.to_string(),
+                crate::builtin::fs::READ.to_string(),
+                crate::builtin::fs::SEARCH.to_string(),
+                crate::builtin::web::FETCH.to_string(),
+                crate::builtin::web::SEARCH.to_string(),
+            ]),
+            created_at: now.into(),
+        },
+    ]
+}
+
+/// Insert any default subagent whose name is not already present (case-
+/// insensitive). Never overwrites existing entries, including user edits of
+/// the defaults. Returns how many were added.
+pub fn restore_missing_default_subagents(cfg: &mut AppConfig, now: &str) -> usize {
+    let mut added = 0;
+    for def in default_subagent_defs(now) {
+        if !cfg
+            .subagents
+            .iter()
+            .any(|s| s.name.trim().eq_ignore_ascii_case(&def.name))
+        {
+            cfg.subagents.push(def);
+            added += 1;
+        }
+    }
+    added
+}
+
 /// One `/undo` snapshot: the state of the project repository just before the
 /// user message at index `user_index` was sent. `tree` is a git tree hash in
 /// Ducky's private snapshot repo (see `snapshot.rs`); `wd` is the repository
@@ -371,6 +541,12 @@ pub struct AppConfig {
     pub providers: Vec<ProviderConfig>,
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
+    #[serde(default)]
+    pub subagents: Vec<SubagentConfig>,
+    /// Whether the default subagents have been seeded once. Lets the user
+    /// delete every subagent without them reappearing on the next launch.
+    #[serde(default)]
+    pub subagents_seeded: bool,
     #[serde(default)]
     pub settings: AppSettings,
     #[serde(default)]
@@ -550,12 +726,6 @@ pub const CONNECTOR_SUGGESTIONS: &[ConnectorSuggestion] = &[
         args: &["-y", "@modelcontextprotocol/server-filesystem", "~"],
     },
     ConnectorSuggestion {
-        name: "Fetch",
-        description: "Let the AI fetch pages from the web and read them for you.",
-        command: "npx",
-        args: &["-y", "@modelcontextprotocol/server-fetch"],
-    },
-    ConnectorSuggestion {
         name: "Memory",
         description: "A simple knowledge graph the AI can remember things in.",
         command: "npx",
@@ -637,7 +807,28 @@ impl Store {
             secrets: Mutex::new(secrets),
         };
         store.hydrate_empty_titles()?;
+        store.seed_default_subagents()?;
         Ok(store)
+    }
+
+    /// Seed General-Purpose and Explore into a config that predates
+    /// configurable subagents (or a brand-new one). Runs once; afterwards the
+    /// list is entirely the user's.
+    fn seed_default_subagents(&self) -> anyhow::Result<()> {
+        let mut dirty = false;
+        {
+            let mut cfg = self.config.lock().unwrap();
+            if !cfg.subagents_seeded {
+                let now = chrono::Utc::now().to_rfc3339();
+                cfg.subagents.extend(default_subagent_defs(&now));
+                cfg.subagents_seeded = true;
+                dirty = true;
+            }
+        }
+        if dirty {
+            self.save_config()?;
+        }
+        Ok(())
     }
 
     fn hydrate_empty_titles(&self) -> anyhow::Result<()> {
@@ -1287,5 +1478,154 @@ mod tests {
         let meta = parse_chat(r#", "mcp_ids": ["a"]"#);
         assert!(meta.allows_mcp("a"));
         assert!(!meta.allows_mcp("b"));
+    }
+
+    // -- subagents ---------------------------------------------------------
+
+    fn subagent(name: &str) -> SubagentConfig {
+        SubagentConfig {
+            id: format!("id-{name}"),
+            name: name.into(),
+            description: "does things".into(),
+            system_prompt: String::new(),
+            provider_id: None,
+            model: None,
+            effort: None,
+            tools: None,
+            created_at: "t".into(),
+        }
+    }
+
+    #[test]
+    fn fresh_config_seeds_default_subagents_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let store = Store::new(tmp.path(), tmp.path().to_path_buf()).unwrap();
+            let cfg = store.config.lock().unwrap();
+            assert!(cfg.subagents_seeded);
+            let names: Vec<&str> = cfg.subagents.iter().map(|s| s.name.as_str()).collect();
+            assert_eq!(names, ["General-Purpose", "Explore"]);
+            let explore = cfg.subagents.iter().find(|s| s.name == "Explore").unwrap();
+            let expected: Vec<String> = [
+                "ducky__fs_list",
+                "ducky__fs_read",
+                "ducky__fs_search",
+                "ducky__web_fetch",
+                "ducky__web_search",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+            assert_eq!(explore.tools, Some(expected));
+        }
+        // reopening neither duplicates nor re-seeds
+        let store2 = Store::new(tmp.path(), tmp.path().to_path_buf()).unwrap();
+        let cfg = store2.config.lock().unwrap();
+        assert_eq!(cfg.subagents.len(), 2);
+    }
+
+    #[test]
+    fn deleting_all_subagents_stays_deleted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(tmp.path(), tmp.path().to_path_buf()).unwrap();
+        {
+            let mut cfg = store.config.lock().unwrap();
+            cfg.subagents.clear();
+        }
+        store.save_config().unwrap();
+        let store2 = Store::new(tmp.path(), tmp.path().to_path_buf()).unwrap();
+        assert!(store2.config.lock().unwrap().subagents.is_empty());
+    }
+
+    #[test]
+    fn config_without_subagents_field_parses() {
+        // old config.json files predate the subagents field
+        let json = r#"{"version": 1}"#;
+        let cfg: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.subagents.is_empty());
+        assert!(!cfg.subagents_seeded);
+    }
+
+    #[test]
+    fn restore_defaults_skips_existing_names() {
+        let mut cfg = AppConfig::default();
+        assert_eq!(restore_missing_default_subagents(&mut cfg, "t"), 2);
+        // user-edited Explore keeps its description; General-Purpose comes back
+        cfg.subagents[1].description = "my custom description".into();
+        cfg.subagents.remove(0);
+        assert_eq!(restore_missing_default_subagents(&mut cfg, "t"), 1);
+        assert_eq!(cfg.subagents.len(), 2);
+        let explore = cfg.subagents.iter().find(|s| s.name == "Explore").unwrap();
+        assert_eq!(explore.description, "my custom description");
+        // a user subagent named "explore" (different case) also counts
+        let mut cfg = AppConfig {
+            subagents: vec![subagent("EXPLORE")],
+            ..Default::default()
+        };
+        assert_eq!(restore_missing_default_subagents(&mut cfg, "t"), 1);
+        assert_eq!(cfg.subagents.len(), 2);
+    }
+
+    #[test]
+    fn validate_subagent_rules() {
+        let providers = vec![ProviderConfig {
+            id: "p1".into(),
+            kind: "custom".into(),
+            name: "Test".into(),
+            base_url: "https://x".into(),
+            api_type: ApiType::OpenAi,
+            default_model: None,
+            models: vec!["m1".into(), "m2".into()],
+            created_at: "t".into(),
+        }];
+        let others = vec![subagent("Existing")];
+
+        // happy path
+        assert!(validate_subagent(&subagent("New"), &providers, &others).is_ok());
+        // with overrides
+        let mut def = subagent("New");
+        def.provider_id = Some("p1".into());
+        def.model = Some("m2".into());
+        def.effort = Some(EffortLevel::High);
+        def.tools = Some(vec!["builtin/*".into()]);
+        assert!(validate_subagent(&def, &providers, &others).is_ok());
+
+        // name rules
+        let mut def = subagent("  ");
+        assert!(validate_subagent(&def, &providers, &[]).is_err());
+        let def = subagent(&"x".repeat(65));
+        assert!(validate_subagent(&def, &providers, &[]).is_err());
+        assert!(validate_subagent(&subagent("existing"), &providers, &others).is_err());
+
+        // description rules
+        let mut def = subagent("New");
+        def.description = "  ".into();
+        assert!(validate_subagent(&def, &providers, &[]).is_err());
+        def.description = "d".repeat(1001);
+        assert!(validate_subagent(&def, &providers, &[]).is_err());
+
+        // override rules
+        let mut def = subagent("New");
+        def.model = Some("m1".into());
+        assert!(validate_subagent(&def, &providers, &[]).is_err());
+        def.provider_id = Some("gone".into());
+        def.model = None;
+        assert!(validate_subagent(&def, &providers, &[]).is_err());
+        def.provider_id = Some("p1".into());
+        def.model = Some("nope".into());
+        assert!(validate_subagent(&def, &providers, &[]).is_err());
+        // empty model string with a provider is rejected too
+        def.model = Some("  ".into());
+        assert!(validate_subagent(&def, &providers, &[]).is_err());
+        // a provider with no cached model list accepts any model string
+        let mut unlisted = providers.clone();
+        unlisted[0].models = Vec::new();
+        def.model = Some("anything".into());
+        assert!(validate_subagent(&def, &unlisted, &[]).is_ok());
+
+        // tool entries must be non-blank
+        let mut def = subagent("New");
+        def.tools = Some(vec![" ".into()]);
+        assert!(validate_subagent(&def, &providers, &[]).is_err());
     }
 }

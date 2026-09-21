@@ -11,6 +11,9 @@ pub struct SubagentMeta {
     /// Effort as a display string ("low"…"max"); absent = provider default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// The configured agent type the spawn resolved to; absent = generic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

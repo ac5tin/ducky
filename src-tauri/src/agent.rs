@@ -23,13 +23,81 @@ const MAX_SUBAGENT_DEPTH: u32 = 3;
 /// Extra `ducky__subagent` calls in the same message run sequentially.
 const MAX_CONCURRENT_SUBAGENTS: usize = 4;
 
+/// A configured subagent definition resolved at spawn time into an owned
+/// snapshot, so config edits mid-run cannot change a running subagent's
+/// persona, overrides or tool allowlist.
+#[derive(Clone)]
+struct SubagentSpec {
+    name: String,
+    description: String,
+    system_prompt: String,
+    provider_id: Option<String>,
+    model: Option<String>,
+    effort: Option<crate::config::EffortLevel>,
+    tools: Option<Vec<String>>,
+}
+
+impl From<crate::config::SubagentConfig> for SubagentSpec {
+    fn from(def: crate::config::SubagentConfig) -> Self {
+        Self {
+            name: def.name,
+            description: def.description,
+            system_prompt: def.system_prompt,
+            provider_id: def.provider_id,
+            model: def.model,
+            effort: def.effort,
+            tools: def.tools,
+        }
+    }
+}
+
+/// Whether a tool passes a subagent's allowlist. Entries match an exact tool
+/// name (`ducky__fs_read`, `server/tool`), a whole server (`server` or
+/// `server/*`).
+fn tool_allowed(allow: &[String], server_id: &str, qualified_name: &str) -> bool {
+    allow.iter().any(|raw| {
+        let entry = raw.trim();
+        entry == qualified_name
+            || entry == server_id
+            || entry.strip_suffix("/*").is_some_and(|p| p == server_id)
+    })
+}
+
+/// Resolve a subagent's (provider, model): the definition's overrides when
+/// its provider still exists in the config, else the conversation's current
+/// choice. An overridden provider with no model set resolves to the empty
+/// string — `provider_for` then falls back to that provider's default model.
+/// A stale provider override drops the model override too, since the model
+/// string belongs to the removed provider.
+fn resolve_spec_model(
+    cfg: &crate::config::AppConfig,
+    spec: Option<&SubagentSpec>,
+    conv_provider: String,
+    conv_model: String,
+) -> (String, String) {
+    match spec.and_then(|s| s.provider_id.as_deref()) {
+        Some(pid) if cfg.providers.iter().any(|p| p.id == pid) => (
+            pid.to_string(),
+            spec.and_then(|s| s.model.clone())
+                .filter(|m| !m.is_empty())
+                .unwrap_or_default(),
+        ),
+        _ => (conv_provider, conv_model),
+    }
+}
+
 /// Which kind of run is executing the loop. Subagent runs share the tool
 /// pipeline and approvals but stream into their parent's tool card instead
 /// of the conversation, and never touch the conversation file.
 #[derive(Clone)]
 enum RunScope {
     Main,
-    Subagent { tool_call_id: String, depth: u32 },
+    Subagent {
+        tool_call_id: String,
+        depth: u32,
+        /// Persona and overrides when spawned via a configured agent type.
+        spec: Option<SubagentSpec>,
+    },
 }
 
 impl RunScope {
@@ -50,6 +118,22 @@ impl RunScope {
     fn is_main(&self) -> bool {
         matches!(self, RunScope::Main)
     }
+
+    /// The subagent definition's effort override, if any.
+    fn subagent_effort(&self) -> Option<crate::config::EffortLevel> {
+        match self {
+            RunScope::Main => None,
+            RunScope::Subagent { spec, .. } => spec.as_ref().and_then(|s| s.effort),
+        }
+    }
+
+    /// This run's tool allowlist, when it has one.
+    fn tool_allowlist(&self) -> Option<&[String]> {
+        match self {
+            RunScope::Main => None,
+            RunScope::Subagent { spec, .. } => spec.as_ref().and_then(|s| s.tools.as_deref()),
+        }
+    }
 }
 
 pub struct Agent {
@@ -61,7 +145,8 @@ pub struct Agent {
 
 /// Per-round system message (never persisted). Rebuilt each round so
 /// working-directory changes apply mid-turn. Subagent runs get a preamble
-/// describing their contract: isolated context, autonomous, final answer.
+/// describing their contract: isolated context, autonomous, final answer;
+/// spawns via a configured agent type also get that type's persona.
 fn system_message(cwd: &std::path::Path, scope: &RunScope) -> Msg {
     let grounding = format!(
         "Working directory: {}. Resolve relative file paths the user mentions \
@@ -74,14 +159,34 @@ fn system_message(cwd: &std::path::Path, scope: &RunScope) -> Msg {
     );
     let text = match scope {
         RunScope::Main => grounding,
-        RunScope::Subagent { .. } => format!(
-            "You are a subagent: an autonomous helper spawned by another agent to \
-             complete one specific task. The task description is your entire context — \
-             you cannot see the conversation that spawned you and cannot ask it \
-             questions, so make reasonable autonomous decisions instead. Work with the \
-             available tools and finish with a complete, self-contained final answer; \
-             the agent that spawned you only sees that final answer.\n\n{grounding}"
-        ),
+        RunScope::Subagent { spec, .. } => {
+            let mut text = format!(
+                "You are a subagent: an autonomous helper spawned by another agent to \
+                 complete one specific task. The task description is your entire context — \
+                 you cannot see the conversation that spawned you and cannot ask it \
+                 questions, so make reasonable autonomous decisions instead. Work with the \
+                 available tools and finish with a complete, self-contained final answer; \
+                 the agent that spawned you only sees that final answer.\n\n{grounding}"
+            );
+            if let Some(spec) = spec {
+                text.push_str(&format!(
+                    "\n\n# Your role\nYou are \"{}\": {}",
+                    spec.name, spec.description
+                ));
+                if !spec.system_prompt.trim().is_empty() {
+                    text.push_str("\n\n");
+                    text.push_str(spec.system_prompt.trim());
+                }
+                if let Some(tools) = &spec.tools {
+                    text.push_str(&format!(
+                        "\n\nYou only have access to the following tools: {}. Do not \
+                         attempt anything else — other tools are not available to you.",
+                        tools.join(", ")
+                    ));
+                }
+            }
+            text
+        }
     };
     Msg::System { text }
 }
@@ -326,7 +431,9 @@ impl Agent {
                 model: model.clone(),
             }));
 
-            // Collect tools from connected servers this chat allows, plus the builtins.
+            // Collect tools from connected servers this chat allows, plus the
+            // builtins. A subagent running under a tool allowlist only sees
+            // the tools that pass it — the model never learns the rest exist.
             let allow = {
                 let cfg = self.store.config.lock().unwrap();
                 cfg.conversations
@@ -334,7 +441,8 @@ impl Agent {
                     .find(|c| c.id == conversation_id)
                     .cloned()
             };
-            let tool_entries: Vec<_> = self
+            let tool_filter = scope.tool_allowlist();
+            let mut tools: Vec<ToolDef> = self
                 .manager
                 .aggregated_tools()
                 .into_iter()
@@ -344,16 +452,29 @@ impl Agent {
                         .map(|m| m.allows_mcp(&t.server_id))
                         .unwrap_or(true)
                 })
-                .collect();
-            let mut tools: Vec<ToolDef> = tool_entries
-                .iter()
+                .filter(|t| {
+                    tool_filter
+                        .map(|a| tool_allowed(a, &t.server_id, &t.qualified_name))
+                        .unwrap_or(true)
+                })
                 .map(|t| ToolDef {
                     name: t.qualified_name.clone(),
                     description: t.description.clone().unwrap_or_default(),
                     parameters: t.input_schema.clone(),
                 })
                 .collect();
-            tools.extend(crate::builtin::tool_defs());
+            let mut builtin_defs = crate::builtin::tool_defs();
+            // With configured agent types the subagent tool gains an `agent`
+            // enum describing them; with none it stays the generic static def.
+            let subagent_defs = self.store.config.lock().unwrap().subagents.clone();
+            if !subagent_defs.is_empty() {
+                builtin_defs.retain(|t| t.name != crate::builtin::SUBAGENT);
+                builtin_defs.push(crate::builtin::subagent_tool_def(&subagent_defs));
+            }
+            if let Some(a) = tool_filter {
+                builtin_defs.retain(|t| tool_allowed(a, crate::builtin::SERVER_ID, &t.name));
+            }
+            tools.extend(builtin_defs);
 
             // Stream one assistant turn. The provider sees a snapshot of the
             // history plus a system message with the current working
@@ -365,13 +486,14 @@ impl Agent {
             };
             let mut snapshot = history.clone();
             snapshot.insert(0, system_message(&cwd, scope));
-            let effort = {
+            let conversation_effort = {
                 let cfg = self.store.config.lock().unwrap();
                 cfg.conversations
                     .iter()
                     .find(|c| c.id == conversation_id)
                     .and_then(|c| c.effort)
             };
+            let effort = scope.subagent_effort().or(conversation_effort);
             let options = crate::providers::ChatOptions {
                 model: model.clone(),
                 max_tokens: None,
@@ -503,14 +625,20 @@ impl Agent {
                 if call.name != crate::builtin::SUBAGENT {
                     continue;
                 }
-                let Ok(task) = self
+                let Ok((task, spec)) = self
                     .prepare_subagent(conversation_id, call, scope, ct)
                     .await
                 else {
                     continue; // denied or invalid — settled in the ordered pass
                 };
-                let handle =
-                    self.spawn_subagent_task(conversation_id, task, call.id.clone(), scope.depth(), ct);
+                let handle = self.spawn_subagent_task(
+                    conversation_id,
+                    task,
+                    spec,
+                    call.id.clone(),
+                    scope.depth(),
+                    ct,
+                );
                 spawned.insert(call.id.clone(), handle);
             }
 
@@ -529,10 +657,11 @@ impl Agent {
                 } else if call.name == crate::builtin::SUBAGENT {
                     // past the concurrency cap: gate, spawn, wait inline
                     match self.prepare_subagent(conversation_id, &call, scope, ct).await {
-                        Ok(task) => {
+                        Ok((task, spec)) => {
                             let handle = self.spawn_subagent_task(
                                 conversation_id,
                                 task,
+                                spec,
                                 call.id.clone(),
                                 scope.depth(),
                                 ct,
@@ -616,15 +745,16 @@ impl Agent {
 
     /// Approval gate + card updates for one `ducky__subagent` call, done
     /// before the call is spawned so parallel spawns still ask in order.
-    /// `Ok(task)` = approved and may run; `Err(text)` = settled (denied,
-    /// invalid arguments or past the nesting limit), with the card updated.
+    /// `Ok((task, spec))` = approved and may run (`spec` is set when spawned
+    /// via a configured agent type); `Err(text)` = settled (denied, invalid
+    /// arguments or past the nesting limit), with the card updated.
     async fn prepare_subagent(
         &self,
         conversation_id: &str,
         call: &ToolCall,
         scope: &RunScope,
         ct: &CancellationToken,
-    ) -> Result<String, String> {
+    ) -> Result<(String, Option<SubagentSpec>), String> {
         let parent = scope.parent_tool_call_id();
         let (entry, server_title) = match self.resolve_tool(&call.name) {
             Ok(v) => v,
@@ -639,6 +769,72 @@ impl Agent {
                 return Err(format!("Error: {e}"));
             }
         };
+
+        // resolve the `agent` type before asking for consent, so an invalid
+        // spawn fails fast instead of prompting the user. Omitting `agent`
+        // resolves to the General-Purpose definition when it exists; with it
+        // deleted, the spawn stays base-generic.
+        let agent_name = call
+            .arguments
+            .get("agent")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let (lookup_name, explicit) = match agent_name {
+            Some(name) => (name, true),
+            None => (crate::builtin::DEFAULT_SUBAGENT_NAME, false),
+        };
+        let spec = {
+            let cfg = self.store.config.lock().unwrap();
+            match cfg
+                .subagents
+                .iter()
+                .find(|s| s.name.trim().eq_ignore_ascii_case(lookup_name))
+                .cloned()
+            {
+                Some(def) => Some(SubagentSpec::from(def)),
+                None if explicit => {
+                    let available: Vec<String> =
+                        cfg.subagents.iter().map(|s| s.name.clone()).collect();
+                    drop(cfg);
+                    let msg = if available.is_empty() {
+                        "no subagent types are configured; omit `agent` to spawn a generic \
+                         subagent"
+                            .to_string()
+                    } else {
+                        format!(
+                            "unknown subagent type \"{lookup_name}\". Available types: {}.",
+                            available.join(", ")
+                        )
+                    };
+                    self.emit_tool_update(
+                        conversation_id,
+                        &call.id,
+                        "error",
+                        serde_json::json!({ "result_text": msg, "is_error": true }),
+                        parent,
+                    );
+                    return Err(format!("Error: {msg}"));
+                }
+                None => None,
+            }
+        };
+
+        // defense in depth: a subagent under an allowlist cannot spawn at all
+        // unless the subagent tool itself is allowlisted
+        if let Some(allow) = scope.tool_allowlist() {
+            if !tool_allowed(allow, &entry.server_id, &entry.qualified_name) {
+                let msg = "this subagent type does not have access to the subagent tool".to_string();
+                self.emit_tool_update(
+                    conversation_id,
+                    &call.id,
+                    "error",
+                    serde_json::json!({ "result_text": msg, "is_error": true }),
+                    parent,
+                );
+                return Err(format!("Error: {msg}"));
+            }
+        }
 
         self.emit_tool_update(
             conversation_id,
@@ -703,28 +899,41 @@ impl Agent {
             conversation_id,
             &call.id,
             "running",
-            serde_json::json!({ "subagent": self.subagent_meta(conversation_id) }),
+            serde_json::json!({ "subagent": self.subagent_meta(conversation_id, spec.as_ref()) }),
             parent,
         );
-        Ok(task)
+        Ok((task, spec))
     }
 
     /// Display metadata for a subagent spawn: the provider, model and effort
-    /// the subagent inherits from this conversation at spawn time.
-    fn subagent_meta(&self, conversation_id: &str) -> crate::events::SubagentMeta {
-        let cfg = self.store.config.lock().unwrap();
-        let (provider_id, model, effort) = match cfg
-            .conversations
-            .iter()
-            .find(|c| c.id == conversation_id)
-        {
-            Some(m) => (m.provider_id.clone(), m.model.clone(), m.effort),
-            None => (String::new(), String::new(), None),
+    /// the subagent will actually run with — the definition's overrides when
+    /// set, else what it inherits from this conversation at spawn time.
+    fn subagent_meta(
+        &self,
+        conversation_id: &str,
+        spec: Option<&SubagentSpec>,
+    ) -> crate::events::SubagentMeta {
+        let (conversation_effort, provider_id, model) = {
+            let cfg = self.store.config.lock().unwrap();
+            let (conv_provider, conv_model, conv_effort) = match cfg
+                .conversations
+                .iter()
+                .find(|c| c.id == conversation_id)
+            {
+                Some(m) => (m.provider_id.clone(), m.model.clone(), m.effort),
+                None => (String::new(), String::new(), None),
+            };
+            let (provider_id, model) = resolve_spec_model(&cfg, spec, conv_provider, conv_model);
+            (conv_effort, provider_id, model)
         };
-        // an empty conversation model falls back to the provider default,
-        // matching how provider_for resolves it
+        // an empty model falls back to the provider default, matching how
+        // provider_for resolves it
         let model = if model.is_empty() {
-            cfg.providers
+            self.store
+                .config
+                .lock()
+                .unwrap()
+                .providers
                 .iter()
                 .find(|p| p.id == provider_id)
                 .and_then(|p| {
@@ -740,7 +949,11 @@ impl Agent {
         crate::events::SubagentMeta {
             provider_id,
             model,
-            effort: effort.map(|e| e.as_str().to_string()),
+            effort: spec
+                .and_then(|s| s.effort)
+                .or(conversation_effort)
+                .map(|e| e.as_str().to_string()),
+            agent: spec.map(|s| s.name.clone()),
         }
     }
 
@@ -752,6 +965,7 @@ impl Agent {
         &self,
         conversation_id: &str,
         task: String,
+        spec: Option<SubagentSpec>,
         call_id: String,
         depth: u32,
         ct: &CancellationToken,
@@ -765,7 +979,9 @@ impl Agent {
         let conversation = conversation_id.to_string();
         let ct = ct.clone();
         tokio::spawn(async move {
-            agent.run_subagent(&conversation, task, &call_id, depth, &ct).await
+            agent
+                .run_subagent(&conversation, task, &call_id, depth, spec, &ct)
+                .await
         })
     }
 
@@ -796,25 +1012,30 @@ impl Agent {
 
     /// Run one approved subagent to completion and return its result text.
     /// The subagent inherits the conversation's provider, model and effort
-    /// (read from config each round, like the main loop), starts from a
-    /// fresh context containing only its task, and never touches the
-    /// conversation file — only its final answer flows back as the tool
-    /// result. Cancelling `ct` cancels the subagent via a child token.
+    /// (read from config each round, like the main loop) unless its agent
+    /// definition overrides them; it starts from a fresh context containing
+    /// only its task, and never touches the conversation file — only its
+    /// final answer flows back as the tool result. Cancelling `ct` cancels
+    /// the subagent via a child token.
     async fn run_subagent(
         &self,
         conversation_id: &str,
         task: String,
         tool_call_id: &str,
         depth: u32,
+        spec: Option<SubagentSpec>,
         ct: &CancellationToken,
     ) -> String {
-        // inherit the conversation's current provider + model at spawn time
+        // resolve provider + model at spawn time: the definition's overrides,
+        // else the conversation's current choice
         let (provider_id, model) = {
             let cfg = self.store.config.lock().unwrap();
-            match cfg.conversations.iter().find(|c| c.id == conversation_id) {
-                Some(meta) => (meta.provider_id.clone(), meta.model.clone()),
-                None => (String::new(), String::new()),
-            }
+            let (conv_provider, conv_model) =
+                match cfg.conversations.iter().find(|c| c.id == conversation_id) {
+                    Some(meta) => (meta.provider_id.clone(), meta.model.clone()),
+                    None => (String::new(), String::new()),
+                };
+            resolve_spec_model(&cfg, spec.as_ref(), conv_provider, conv_model)
         };
         let max_iterations = self
             .store
@@ -828,6 +1049,7 @@ impl Agent {
         let scope = RunScope::Subagent {
             tool_call_id: tool_call_id.to_string(),
             depth: depth + 1,
+            spec,
         };
         let mut history = vec![Msg::User {
             text: task,
@@ -899,6 +1121,23 @@ impl Agent {
                 return format!("Error: {e}");
             }
         };
+
+        // defense in depth: a subagent under an allowlist only ever executes
+        // allowlisted tools, even if the model tries something else
+        if let Some(allow) = scope.tool_allowlist() {
+            if !tool_allowed(allow, &entry.server_id, &entry.qualified_name) {
+                let msg =
+                    format!("{} is not in this subagent's tool allowlist", entry.qualified_name);
+                self.emit_tool_update(
+                    conversation_id,
+                    &call.id,
+                    "error",
+                    serde_json::json!({ "tool": call.name, "result_text": msg, "is_error": true }),
+                    parent,
+                );
+                return format!("Error: {msg}");
+            }
+        }
 
         self.emit_tool_update(
             conversation_id,

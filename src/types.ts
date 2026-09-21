@@ -108,11 +108,34 @@ export interface ConversationMeta {
         updated_at: string;
 }
 
+/** A reusable subagent definition (persona the model spawns via `agent`). */
+export interface SubagentConfig {
+        id: string;
+        /** Display name; also the `agent` enum value. Unique case-insensitively. */
+        name: string;
+        /** When-to-use hint shown to the parent model. */
+        description: string;
+        /** Persona system prompt appended after the generic preamble. */
+        system_prompt: string;
+        /** Provider override; null = inherit the conversation's. */
+        provider_id: string | null;
+        /** Model override; only used together with provider_id. */
+        model: string | null;
+        /** Effort override; null = inherit the conversation's. */
+        effort: EffortLevel | null;
+        /** Tool allowlist entries (tool name, `server/tool`, or `server`/`server/*`); null = all tools. */
+        tools: string[] | null;
+        created_at: string;
+}
+
 export interface AppConfig {
         version: number;
         onboarding_complete: boolean;
         providers: ProviderConfig[];
         mcp_servers: McpServerConfig[];
+        subagents: SubagentConfig[];
+        /** Whether the default subagents have been seeded once. */
+        subagents_seeded: boolean;
         settings: AppSettings;
         conversations: ConversationMeta[];
 }
@@ -249,6 +272,8 @@ export interface ToolCallState {
                 provider_id: string;
                 model: string;
                 effort?: string | null;
+                /** Agent type the spawn resolved to; null = generic. */
+                agent?: string | null;
         };
 }
 

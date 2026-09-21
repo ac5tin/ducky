@@ -424,3 +424,66 @@ async fn oauth_connect_reaches_server_before_needs_auth() {
         .expect("connect should reach the server")
         .expect("server request signal");
 }
+
+/// A stdio server that exits immediately (e.g. `npx` on a missing package)
+/// must surface its stderr in both the error detail and the summary logs —
+/// that output is the only real diagnosis (npm's E404, crash traces, …).
+#[cfg(unix)] // spawns `sh`
+#[tokio::test]
+async fn stdio_connect_failure_quotes_stderr_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::new(dir.path(), dir.path().to_path_buf()).unwrap());
+    store
+        .config
+        .lock()
+        .unwrap()
+        .mcp_servers
+        .push(McpServerConfig {
+            id: "die-server".into(),
+            name: "Die Server".into(),
+            transport: McpTransport::Stdio {
+                command: "sh".into(),
+                args: vec!["-c".into(), "echo ducky-boom-404 >&2".into()],
+                env: HashMap::new(),
+            },
+            auth: HttpAuth::None,
+            enabled: true,
+            auto_start: false,
+            oauth_client_id: None,
+            oauth_redirect_port: None,
+            created_at: "now".into(),
+        });
+    let sink = Arc::new(CollectingSink::default());
+    let bridge = Arc::new(InteractiveBridge::new(sink.clone(), store.clone()));
+    let manager = McpManager::new(store, bridge, sink);
+
+    let status = manager.connect("die-server").await.unwrap();
+    let ServerStatus::Error { message } = status else {
+        panic!("expected error status, got {status:?}")
+    };
+    assert!(
+        message.contains("ducky-boom-404"),
+        "error should quote stderr; got: {message}"
+    );
+    let summary = manager.summary("die-server");
+    assert!(
+        summary.logs.iter().any(|l| l.contains("ducky-boom-404")),
+        "summary logs should carry stderr; got: {:?}",
+        summary.logs
+    );
+
+    // removing the server drops the captured output along with its status
+    manager.forget("die-server");
+    assert!(manager.summary("die-server").logs.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_paths_puts_login_shell_first() {
+    use super::manager::merge_paths;
+    assert_eq!(
+        merge_paths("/nvm/bin", "/usr/bin:/bin"),
+        "/nvm/bin:/usr/bin:/bin"
+    );
+    assert_eq!(merge_paths("/nvm/bin", ""), "/nvm/bin");
+}

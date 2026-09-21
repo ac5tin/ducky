@@ -9,8 +9,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::ConversationRuntime;
 use crate::config::{
-    self, AppConfig, ConversationMeta, McpServerConfig, ProviderConfig, Store, Theme, ToolRule,
-    UndoRecord,
+    self, AppConfig, ConversationMeta, McpServerConfig, ProviderConfig, Store, SubagentConfig,
+    Theme, ToolRule, UndoRecord,
 };
 use crate::mcp::bridge::ApprovalDecision;
 use crate::providers::Msg;
@@ -69,6 +69,102 @@ pub fn get_bootstrap(state: State<'_, Arc<AppState>>) -> Bootstrap {
 #[tauri::command]
 pub fn get_config(state: State<'_, Arc<AppState>>) -> AppConfig {
     state.store.config.lock().unwrap().clone()
+}
+
+// ---------------------------------------------------------------------------
+// Subagents
+// ---------------------------------------------------------------------------
+
+/// Trim user-typed free text and drop blank-but-present overrides so they
+/// behave as "inherit".
+fn normalize_subagent(def: SubagentConfig) -> SubagentConfig {
+    SubagentConfig {
+        name: def.name.trim().to_string(),
+        description: def.description.trim().to_string(),
+        provider_id: def
+            .provider_id
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty()),
+        model: def
+            .model
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty()),
+        ..def
+    }
+}
+
+#[tauri::command]
+pub fn subagent_add(
+    state: State<'_, Arc<AppState>>,
+    def: SubagentConfig,
+) -> Result<SubagentConfig, String> {
+    let def = normalize_subagent(def);
+    let created = {
+        let mut c = state.store.config.lock().unwrap();
+        let def = SubagentConfig {
+            id: uuid(),
+            created_at: now(),
+            ..def
+        };
+        config::validate_subagent(&def, &c.providers, &c.subagents)?;
+        c.subagents.push(def.clone());
+        def
+    };
+    state.store.save_config().map_err(|e| e.to_string())?;
+    Ok(created)
+}
+
+#[tauri::command]
+pub fn subagent_update(
+    state: State<'_, Arc<AppState>>,
+    def: SubagentConfig,
+) -> Result<SubagentConfig, String> {
+    let def = normalize_subagent(def);
+    let updated = {
+        let mut c = state.store.config.lock().unwrap();
+        let Some(existing) = c.subagents.iter().find(|s| s.id == def.id) else {
+            return Err("Unknown subagent".into());
+        };
+        let others: Vec<SubagentConfig> = c
+            .subagents
+            .iter()
+            .filter(|s| s.id != def.id)
+            .cloned()
+            .collect();
+        let def = SubagentConfig {
+            created_at: existing.created_at.clone(),
+            ..def
+        };
+        config::validate_subagent(&def, &c.providers, &others)?;
+        *c.subagents.iter_mut().find(|s| s.id == def.id).unwrap() = def.clone();
+        def
+    };
+    state.store.save_config().map_err(|e| e.to_string())?;
+    Ok(updated)
+}
+
+#[tauri::command]
+pub fn subagent_remove(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
+    {
+        let mut c = state.store.config.lock().unwrap();
+        c.subagents.retain(|s| s.id != id);
+    }
+    state.store.save_config().map_err(|e| e.to_string())
+}
+
+/// Re-insert any default subagent (General-Purpose, Explore) whose name is
+/// missing. Existing entries — including user edits of the defaults — are
+/// never overwritten. Returns how many were added.
+#[tauri::command]
+pub fn subagent_restore_defaults(state: State<'_, Arc<AppState>>) -> Result<usize, String> {
+    let added = {
+        let mut c = state.store.config.lock().unwrap();
+        config::restore_missing_default_subagents(&mut c, &now())
+    };
+    if added > 0 {
+        state.store.save_config().map_err(|e| e.to_string())?;
+    }
+    Ok(added)
 }
 
 // ---------------------------------------------------------------------------
@@ -1090,6 +1186,7 @@ pub fn mcp_update(state: State<'_, Arc<AppState>>, server: McpServerConfig) -> R
 #[tauri::command]
 pub async fn mcp_remove(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
     state.manager.disconnect(&id).await;
+    state.manager.forget(&id);
     {
         let mut c = state.store.config.lock().unwrap();
         c.mcp_servers.retain(|s| s.id != id);

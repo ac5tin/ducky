@@ -13,6 +13,7 @@ import type {
   ProviderPreset,
   RawMessage,
   ServerSummary,
+  SubagentConfig,
   TerminalCreated,
   ToolRule,
 } from "./types";
@@ -102,6 +103,23 @@ export const settingsSet = (settings: {
 
 export const toolRuleSet = (key: string, rule: ToolRule | null) =>
   invoke<void>("tool_rule_set", { key, rule });
+
+// ---------------------------------------------------------------------------
+// Subagents
+// ---------------------------------------------------------------------------
+
+export const subagentAdd = (def: SubagentConfig) =>
+  invoke<SubagentConfig>("subagent_add", { def });
+
+export const subagentUpdate = (def: SubagentConfig) =>
+  invoke<SubagentConfig>("subagent_update", { def });
+
+export const subagentRemove = (id: string) =>
+  invoke<void>("subagent_remove", { id });
+
+/** Re-insert missing default subagents (never overwrites existing entries). */
+export const subagentRestoreDefaults = () =>
+  invoke<number>("subagent_restore_defaults");
 
 // ---------------------------------------------------------------------------
 // Conversations & chat

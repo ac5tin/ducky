@@ -11,15 +11,22 @@ export interface SubagentHeader {
 }
 
 /** Display name + concise brief for a spawn. `name`/`description` are
- * optional schema params; the brief falls back to the task's first line. */
+ * optional schema params; the name falls back to the configured `agent`
+ * type's name, then "Subagent"; the brief falls back to the task's first
+ * line. */
 export function subagentHeader(args: unknown): SubagentHeader {
   const a = (args && typeof args === "object" ? args : {}) as {
     task?: unknown;
     name?: unknown;
     description?: unknown;
+    agent?: unknown;
   };
   const name =
-    typeof a.name === "string" && a.name.trim() ? a.name.trim() : "Subagent";
+    typeof a.name === "string" && a.name.trim()
+      ? a.name.trim()
+      : typeof a.agent === "string" && a.agent.trim()
+        ? a.agent.trim()
+        : "Subagent";
   let brief = "";
   if (typeof a.description === "string" && a.description.trim()) {
     brief = a.description.trim();
@@ -37,6 +44,22 @@ export function subagentTask(args: unknown): string {
     if (typeof task === "string") return task;
   }
   return "";
+}
+
+/** Which configured agent type a spawn resolved to, for card labeling.
+ * Live meta is authoritative (a present meta with no agent = generic);
+ * replayed or pre-approval cards fall back to the raw `agent` argument. */
+export function subagentType(
+  meta: { agent?: string | null } | null | undefined,
+  args: unknown,
+): string {
+  if (meta) return meta.agent ?? "Generic";
+  const a = (args && typeof args === "object" ? args : {}) as {
+    agent?: unknown;
+  };
+  return typeof a.agent === "string" && a.agent.trim()
+    ? a.agent.trim()
+    : "Generic";
 }
 
 /** Activity line for a tool the subagent itself is running. */

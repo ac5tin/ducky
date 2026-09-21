@@ -495,6 +495,9 @@ pub struct McpManager {
     handles: Mutex<HashMap<String, Arc<ServerHandle>>>,
     statuses: Arc<Mutex<HashMap<String, ServerStatus>>>,
     auth: Arc<AuthCoordinator>,
+    /// stderr tail from the most recent *failed* connect attempt per server,
+    /// served by `summary()` so the detail view has logs to show.
+    connect_logs: Mutex<HashMap<String, VecDeque<String>>>,
 }
 
 /// A transport ready to be served, in either flavour.
@@ -502,6 +505,9 @@ enum BuiltTransport {
     Stdio(TokioChildProcess),
     Http(StreamableHttpClientTransport<AuthHttpClient>),
 }
+
+/// Rolling tail of a stdio server's stderr for connect-failure diagnostics.
+type StderrTail = Arc<Mutex<VecDeque<String>>>;
 
 impl McpManager {
     pub fn new(
@@ -522,6 +528,7 @@ impl McpManager {
             handles: Mutex::new(HashMap::new()),
             statuses,
             auth,
+            connect_logs: Mutex::new(HashMap::new()),
         }
     }
 
@@ -632,6 +639,8 @@ impl McpManager {
         // Drop any existing connection first.
         self.disconnect(server_id).await;
         self.set_status(server_id, ServerStatus::Connecting);
+        // a fresh attempt invalidates the previous failure's captured output
+        self.connect_logs.lock().unwrap().remove(server_id);
 
         // Make sure OAuth tokens are fresh (no-op for other auth modes).
         if let McpTransport::Http { .. } = &cfg.transport {
@@ -671,7 +680,7 @@ impl McpManager {
         };
 
         let ct = CancellationToken::new();
-        let built = match self.build_transport(&cfg) {
+        let (built, stderr_tail) = match self.build_transport(&cfg) {
             Ok(t) => t,
             Err(e) => {
                 self.set_status(server_id, ServerStatus::Error { message: e });
@@ -716,12 +725,14 @@ impl McpManager {
             Ok(inner) => inner,
             Err(_) => {
                 ct.cancel();
-                self.set_status(
-                    server_id,
-                    ServerStatus::Error {
-                        message: "Timed out connecting to the server".into(),
-                    },
-                );
+                let message = self
+                    .capture_failure_output(
+                        server_id,
+                        "Timed out connecting to the server".into(),
+                        stderr_tail.as_ref(),
+                    )
+                    .await;
+                self.set_status(server_id, ServerStatus::Error { message });
                 return Ok(self.status(server_id));
             }
         };
@@ -748,12 +759,10 @@ impl McpManager {
                     );
                     return Ok(self.status(server_id));
                 }
-                self.set_status(
-                    server_id,
-                    ServerStatus::Error {
-                        message: describe_init_error(&e),
-                    },
-                );
+                let message = self
+                    .capture_failure_output(server_id, describe_init_error(&e), stderr_tail.as_ref())
+                    .await;
+                self.set_status(server_id, ServerStatus::Error { message });
                 return Ok(self.status(server_id));
             }
         };
@@ -814,6 +823,40 @@ impl McpManager {
         self.auth.emit_status(server_id, "disconnected", None, None);
     }
 
+    /// After a failed connect: let the stderr drain catch up, remember the
+    /// tail for the detail view, and quote the last few lines in the error.
+    async fn capture_failure_output(
+        &self,
+        server_id: &str,
+        message: String,
+        tail: Option<&StderrTail>,
+    ) -> String {
+        let Some(tail) = tail else {
+            return message;
+        };
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let lines: Vec<String> = tail.lock().unwrap().iter().cloned().collect();
+        if lines.is_empty() {
+            return message;
+        }
+        {
+            let mut map = self.connect_logs.lock().unwrap();
+            let entry = map.entry(server_id.to_string()).or_default();
+            entry.extend(lines.iter().cloned());
+            while entry.len() > 300 {
+                entry.pop_front();
+            }
+        }
+        let quoted: Vec<&str> = lines.iter().rev().take(5).rev().map(|l| l.as_str()).collect();
+        format!("{message}\n\nLast server output:\n{}", quoted.join("\n"))
+    }
+
+    /// Drop manager-side state for a server that was removed from the config.
+    pub fn forget(&self, server_id: &str) {
+        self.connect_logs.lock().unwrap().remove(server_id);
+        self.statuses.lock().unwrap().remove(server_id);
+    }
+
     /// Connect every enabled server that is not already connected.
     pub async fn connect_enabled(&self) {
         let ids: Vec<(String, bool)> = {
@@ -835,7 +878,10 @@ impl McpManager {
         }
     }
 
-    fn build_transport(&self, cfg: &McpServerConfig) -> Result<BuiltTransport, String> {
+    fn build_transport(
+        &self,
+        cfg: &McpServerConfig,
+    ) -> Result<(BuiltTransport, Option<StderrTail>), String> {
         match &cfg.transport {
             McpTransport::Stdio { command, args, env } => {
                 let cwd = self
@@ -855,37 +901,42 @@ impl McpManager {
 
                 let mut cmd = tokio::process::Command::new(command);
                 cmd.args(&args).envs(&env).current_dir(&cwd);
+                // an explicit per-server PATH wins over our augmentation
+                if !env.contains_key("PATH") {
+                    augment_command_path(&mut cmd);
+                }
                 let (child, stderr) = TokioChildProcess::builder(cmd)
                     .stderr(std::process::Stdio::piped())
                     .spawn()
                     .map_err(|e| {
-                        format!(
-                            "Could not start `{command}`: {e}. Make sure the command exists \
-                             (and that Node.js is installed for npx-based servers)."
-                        )
+                        format!("Could not start `{command}`: {e}.{}", spawn_hint(command))
                     })?;
+                // keep a tail of the server's stderr so a failed handshake can
+                // quote it (npm 404s, missing-runtime errors, crash traces)
+                let tail: StderrTail = Arc::new(Mutex::new(VecDeque::new()));
                 if let Some(stderr) = stderr {
                     let server_id = cfg.id.clone();
                     let sink = self.sink.clone();
+                    let tail = tail.clone();
                     tokio::spawn(async move {
                         use tokio::io::AsyncBufReadExt;
                         let mut lines = tokio::io::BufReader::new(stderr).lines();
-                        loop {
-                            match lines.next_line().await {
-                                Ok(Some(line)) => {
-                                    // forward server logs as an event the UI
-                                    // can render in the connector detail view
-                                    sink.emit(BackendEvent::ServerDataChanged {
-                                        server_id: server_id.clone(),
-                                        what: format!("log:{line}"),
-                                    });
-                                }
-                                _ => break,
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            // forward server logs as an event the UI
+                            // can render in the connector detail view
+                            sink.emit(BackendEvent::ServerDataChanged {
+                                server_id: server_id.clone(),
+                                what: format!("log:{line}"),
+                            });
+                            let mut t = tail.lock().unwrap();
+                            t.push_back(line);
+                            while t.len() > 300 {
+                                t.pop_front();
                             }
                         }
                     });
                 }
-                Ok(BuiltTransport::Stdio(child))
+                Ok((BuiltTransport::Stdio(child), Some(tail)))
             }
             McpTransport::Http { url, headers } => {
                 let mut config = StreamableHttpClientTransportConfig::with_uri(url.clone());
@@ -910,11 +961,12 @@ impl McpManager {
                 let notify: AuthNotifier = Arc::new(move |reason, detail| {
                     auth.notify_needs_auth(&server_id, reason, detail);
                 });
-                Ok(BuiltTransport::Http(
-                    StreamableHttpClientTransport::with_client(
+                Ok((
+                    BuiltTransport::Http(StreamableHttpClientTransport::with_client(
                         AuthHttpClient::new(cfg.clone(), self.store.clone(), notify),
                         config,
-                    ),
+                    )),
+                    None,
                 ))
             }
         }
@@ -1264,17 +1316,28 @@ impl McpManager {
                         logs,
                     )
                 }
-                None => (
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    None,
-                    None,
-                    None,
-                    None,
-                    Vec::new(),
-                ),
+                None => {
+                    // a failed connect keeps its stderr tail so the detail
+                    // view has something to show
+                    let logs = self
+                        .connect_logs
+                        .lock()
+                        .unwrap()
+                        .get(server_id)
+                        .map(|q| q.iter().cloned().collect())
+                        .unwrap_or_default();
+                    (
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        logs,
+                    )
+                }
             };
 
         ServerSummary {
@@ -1371,13 +1434,81 @@ fn summarise_challenge(challenge: &str) -> (String, AuthReason) {
     }
 }
 
+/// Runtime-specific guidance for a spawn failure, so the hint matches how the
+/// command is usually installed (npx → Node.js, uvx → uv).
+fn spawn_hint(command: &str) -> &'static str {
+    let base = command.rsplit(['/', '\\']).next().unwrap_or(command);
+    match base {
+        "node" | "npm" | "npx" | "bun" | "bunx" => {
+            " Make sure it is installed and on your PATH (Node.js for npx)."
+        }
+        "uv" | "uvx" => " Make sure uv (Python) is installed and on your PATH.",
+        _ => " Make sure the command exists and is on your PATH.",
+    }
+}
+
+/// Prepend the login shell's PATH to stdio server spawns. A desktop-launched
+/// app inherits the GUI session's minimal PATH, which misses version-manager
+/// toolchains (nvm/fnm/volta) that only extend PATH in shell profiles.
+/// No-op outside Unix. See docs/adr/0003-stdio-server-spawn-path.md.
+#[cfg(unix)]
+fn augment_command_path(cmd: &mut tokio::process::Command) {
+    if let Some(path) = augmented_path() {
+        cmd.env("PATH", path);
+    }
+}
+
+#[cfg(not(unix))]
+fn augment_command_path(_cmd: &mut tokio::process::Command) {}
+
+/// The login-shell PATH plus the inherited one as fallback, or None when the
+/// login shell couldn't be sourced.
+#[cfg(unix)]
+fn augmented_path() -> Option<String> {
+    let login = login_shell_path()?;
+    let inherited = std::env::var("PATH").unwrap_or_default();
+    Some(merge_paths(&login, &inherited))
+}
+
+/// `$SHELL -l`'s PATH, sourced once per process (spawning a shell is slow).
+#[cfg(unix)]
+fn login_shell_path() -> Option<String> {
+    static LOGIN_PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    LOGIN_PATH
+        .get_or_init(|| {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+            let output = std::process::Command::new(shell)
+                .args(["-l", "-c", "printf %s \"$PATH\""])
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let path = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+            if path.contains('/') {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .clone()
+}
+
+#[cfg(unix)]
+pub(super) fn merge_paths(login: &str, inherited: &str) -> String {
+    if inherited.is_empty() {
+        login.to_owned()
+    } else {
+        format!("{login}:{inherited}")
+    }
+}
+
 fn describe_init_error(e: &rmcp::service::ClientInitializeError) -> String {
     use rmcp::service::ClientInitializeError as E;
     match e {
-        E::ConnectionClosed(msg) => format!(
-            "The server closed the connection immediately ({msg}). For npx-based servers, \
-             check that Node.js is installed."
-        ),
+        E::ConnectionClosed(msg) => {
+            format!("The server closed the connection immediately ({msg}).")
+        }
         E::NoCompatibleProtocolVersion {
             client_supported,
             server_supported,

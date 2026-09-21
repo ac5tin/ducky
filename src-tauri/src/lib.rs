@@ -72,6 +72,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_bootstrap,
             commands::get_config,
+            commands::subagent_add,
+            commands::subagent_update,
+            commands::subagent_remove,
+            commands::subagent_restore_defaults,
             commands::provider_add,
             commands::provider_update,
             commands::provider_delete,

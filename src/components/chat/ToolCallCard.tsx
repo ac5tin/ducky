@@ -7,6 +7,7 @@ import {
   SUBAGENT_TOOL,
   subagentHeader,
   subagentTask,
+  subagentType,
 } from "../../subagents";
 import { Icon, StatusDot } from "../icons";
 import { Markdown } from "../Markdown";
@@ -67,6 +68,8 @@ export const ToolCallCard = memo(function ToolCallCard({
   const isSubagent = state.tool === SUBAGENT_TOOL;
   const header = isSubagent ? subagentHeader(state.args) : null;
   const taskText = isSubagent ? subagentTask(state.args) : "";
+  // which configured type the spawn resolved to (or "Generic")
+  const typeLabel = isSubagent ? subagentType(state.subagent, state.args) : "";
   const providerName = useStore((s) =>
     isSubagent
       ? s.config?.providers.find(
@@ -141,6 +144,18 @@ export const ToolCallCard = memo(function ToolCallCard({
             (state.tool ?? "tool")
           )}
         </span>
+        {isSubagent && (
+          <span
+            title={
+              typeLabel === "Generic"
+                ? "Spawned without a configured agent type"
+                : `Agent type: ${typeLabel}`
+            }
+            className="inline-flex shrink-0 rounded-md bg-sky-100 px-2 py-0.5 text-xs font-medium text-sky-700 dark:bg-sky-950 dark:text-sky-300"
+          >
+            {typeLabel}
+          </span>
+        )}
         {state.server_title && (
           <span className="hidden items-center gap-1.5 rounded-md bg-slate-100 px-2 py-0.5 text-xs text-slate-500 sm:inline-flex dark:bg-slate-800 dark:text-slate-400">
             <StatusDot status="connected" />
@@ -158,21 +173,28 @@ export const ToolCallCard = memo(function ToolCallCard({
 
       {open && (
         <div className="border-t border-slate-100 px-3.5 py-3 dark:border-slate-800">
-          {isSubagent && state.subagent && (
+          {isSubagent && (state.subagent || typeLabel) && (
             <div className="mb-3 flex flex-wrap items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400">
-              {providerName && (
+              {typeLabel && (
+                <span className="rounded-md bg-sky-100 px-2 py-0.5 font-medium text-sky-700 dark:bg-sky-950 dark:text-sky-300">
+                  {typeLabel}
+                </span>
+              )}
+              {state.subagent && providerName && (
                 <span className="rounded-md bg-slate-100 px-2 py-0.5 dark:bg-slate-800">
                   {providerName}
                 </span>
               )}
-              {state.subagent.model && (
+              {state.subagent?.model && (
                 <span className="rounded-md bg-slate-100 px-2 py-0.5 font-mono dark:bg-slate-800">
                   {state.subagent.model}
                 </span>
               )}
-              <span className="rounded-md bg-slate-100 px-2 py-0.5 dark:bg-slate-800">
-                effort: {state.subagent.effort ?? "default"}
-              </span>
+              {state.subagent && (
+                <span className="rounded-md bg-slate-100 px-2 py-0.5 dark:bg-slate-800">
+                  effort: {state.subagent.effort ?? "default"}
+                </span>
+              )}
             </div>
           )}
           {isSubagent && state.subagent_activity && status === "running" && (

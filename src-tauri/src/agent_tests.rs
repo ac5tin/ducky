@@ -11,7 +11,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::Agent;
-use crate::config::{ApprovalMode, ConversationMeta, Store};
+use crate::config::{
+    ApprovalMode, ConversationMeta, EffortLevel, ProviderConfig, Store, SubagentConfig,
+};
 use crate::events::{BackendEvent, CollectingSink};
 use crate::mcp::bridge::InteractiveBridge;
 use crate::mcp::manager::McpManager;
@@ -41,6 +43,28 @@ type ScriptMap = Arc<Mutex<HashMap<String, VecDeque<MockRound>>>>;
 static SCRIPTS: LazyLock<ScriptMap> =
     LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
+/// What the mock saw in one request: the tools offered and the options used,
+/// so tests can assert on the system prompt, tool allowlist and overrides.
+#[derive(Clone, Debug)]
+struct CapturedRound {
+    tool_names: Vec<String>,
+    system: String,
+    model: String,
+    effort: Option<String>,
+}
+
+static CAPTURES: LazyLock<Mutex<HashMap<String, Vec<CapturedRound>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn captures_for(key: &str) -> Vec<CapturedRound> {
+    CAPTURES
+        .lock()
+        .unwrap()
+        .get(key)
+        .cloned()
+        .unwrap_or_default()
+}
+
 /// The provider `Agent::provider_for` returns in test builds.
 pub(crate) fn provider_override() -> Option<Arc<dyn LlmProvider>> {
     Some(Arc::new(MockProvider))
@@ -60,8 +84,8 @@ impl LlmProvider for MockProvider {
     async fn stream_chat(
         &self,
         messages: &[Msg],
-        _tools: &[ToolDef],
-        _opts: &ChatOptions,
+        tools: &[ToolDef],
+        opts: &ChatOptions,
         tx: mpsc::Sender<ProviderEvent>,
     ) -> anyhow::Result<StopReason> {
         let key = messages
@@ -72,6 +96,23 @@ impl LlmProvider for MockProvider {
                 _ => None,
             })
             .unwrap_or_default();
+        CAPTURES
+            .lock()
+            .unwrap()
+            .entry(key.clone())
+            .or_default()
+            .push(CapturedRound {
+                tool_names: tools.iter().map(|t| t.name.clone()).collect(),
+                system: messages
+                    .iter()
+                    .find_map(|m| match m {
+                        Msg::System { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default(),
+                model: opts.model.clone(),
+                effort: opts.effort.map(|e| e.as_str().to_string()),
+            });
         let round = SCRIPTS
             .lock()
             .unwrap()
@@ -193,6 +234,23 @@ fn subagent_text(sink: &CollectingSink) -> String {
         .collect()
 }
 
+/// The running card's subagent meta (the first `running` card with meta).
+fn sink_meta(sink: &CollectingSink) -> crate::events::SubagentMeta {
+    sink.events
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|e| match e {
+            BackendEvent::ToolCallUpdate {
+                status,
+                subagent: Some(m),
+                ..
+            } if status == "running" => Some(m.clone()),
+            _ => None,
+        })
+        .expect("running card carries subagent meta")
+}
+
 fn chat_text(sink: &CollectingSink) -> String {
     sink.events
         .lock()
@@ -258,22 +316,14 @@ async fn spawns_subagent_and_returns_final_answer() {
         s == "pending_approval" && t.as_deref() == Some(SUBAGENT) && !parent
     }));
     // the running card tells the user what the subagent inherits
-    let meta = sink
-        .events
-        .lock()
-        .unwrap()
-        .iter()
-        .find_map(|e| match e {
-            BackendEvent::ToolCallUpdate {
-                status,
-                subagent: Some(m),
-                ..
-            } if status == "running" => Some(m.clone()),
-            _ => None,
-        })
-        .expect("running card carries subagent meta");
+    let meta = sink_meta(&sink);
     assert_eq!(meta.provider_id, "mock");
     assert_eq!(meta.model, "mock-model");
+    // an untyped spawn resolves to the seeded General-Purpose definition
+    assert_eq!(meta.agent.as_deref(), Some("General-Purpose"));
+    let sub = captures_for("t1-sub");
+    assert_eq!(sub.len(), 1);
+    assert!(sub[0].system.contains("You are \"General-Purpose\""));
     assert!(sink
         .events
         .lock()
@@ -431,4 +481,209 @@ async fn cancelling_the_turn_cancels_subagents() {
     assert!(tool_cards(&sink)
         .iter()
         .any(|(s, _, r, _)| s == "error" && r.as_deref() == Some("cancelled by user")));
+}
+
+#[tokio::test]
+async fn agent_type_applies_persona_and_tool_allowlist() {
+    script(
+        "t6-main",
+        vec![
+            MockRound::Tools(vec![(
+                SUBAGENT.into(),
+                serde_json::json!({"task": "t6-sub", "agent": "Explore"}),
+            )]),
+            MockRound::Text("main done".into()),
+        ],
+    );
+    script("t6-sub", vec![MockRound::Text("explore answer".into())]);
+
+    let (agent, sink, store) = test_agent("t6-conv");
+    run(&agent, "t6-conv", "t6-main", &CancellationToken::new()).await;
+
+    assert_eq!(
+        tool_results(&store, "t6-conv"),
+        vec!["explore answer".to_string()]
+    );
+    // the Explore run's request carried its persona and only its tools
+    let sub = captures_for("t6-sub");
+    assert_eq!(sub.len(), 1);
+    assert!(sub[0].system.contains("# Your role"));
+    assert!(sub[0].system.contains("You are \"Explore\""));
+    assert!(sub[0].system.contains("read-only search agent"));
+    assert!(sub[0].tool_names.contains(&"ducky__fs_read".to_string()));
+    assert!(sub[0].tool_names.contains(&"ducky__web_search".to_string()));
+    assert!(!sub[0].tool_names.contains(&"ducky__fs_write".to_string()));
+    assert!(!sub[0].tool_names.contains(&"ducky__fs_mkdir".to_string()));
+    assert!(!sub[0].tool_names.contains(&SUBAGENT.to_string()));
+    // the running card names the resolved type
+    let meta = sink_meta(&sink);
+    assert_eq!(meta.agent.as_deref(), Some("Explore"));
+    // the main run stays unfiltered
+    let main = captures_for("t6-main");
+    assert_eq!(main.len(), 2);
+    assert!(main[0].tool_names.contains(&"ducky__fs_write".to_string()));
+    assert!(main[0].tool_names.contains(&SUBAGENT.to_string()));
+    assert!(!main[0].system.contains("# Your role"));
+}
+
+#[tokio::test]
+async fn agent_type_model_and_effort_overrides_apply() {
+    script(
+        "t7-main",
+        vec![
+            MockRound::Tools(vec![(
+                SUBAGENT.into(),
+                serde_json::json!({"task": "t7-sub", "agent": "Fast"}),
+            )]),
+            MockRound::Text("main done".into()),
+        ],
+    );
+    script("t7-sub", vec![MockRound::Text("fast answer".into())]);
+
+    let (agent, sink, _store) = test_agent("t7-conv");
+    {
+        let mut cfg = agent.store.config.lock().unwrap();
+        cfg.providers.push(ProviderConfig {
+            id: "mock".into(),
+            kind: "custom".into(),
+            name: "Mock".into(),
+            base_url: "http://localhost".into(),
+            api_type: crate::config::ApiType::OpenAi,
+            default_model: None,
+            models: vec!["mock-model".into(), "mock-fast".into()],
+            created_at: "t".into(),
+        });
+        cfg.subagents.push(SubagentConfig {
+            id: "fast".into(),
+            name: "Fast".into(),
+            description: "quick helper".into(),
+            system_prompt: "Be quick.".into(),
+            provider_id: Some("mock".into()),
+            model: Some("mock-fast".into()),
+            effort: Some(EffortLevel::High),
+            tools: None,
+            created_at: "t".into(),
+        });
+    }
+    run(&agent, "t7-conv", "t7-main", &CancellationToken::new()).await;
+
+    // the running card reflects the resolved overrides
+    let meta = sink_meta(&sink);
+    assert_eq!(meta.provider_id, "mock");
+    assert_eq!(meta.model, "mock-fast");
+    assert_eq!(meta.effort.as_deref(), Some("high"));
+    assert_eq!(meta.agent.as_deref(), Some("Fast"));
+    // the subagent's request actually used them
+    let sub = captures_for("t7-sub");
+    assert_eq!(sub.len(), 1);
+    assert_eq!(sub[0].model, "mock-fast");
+    assert_eq!(sub[0].effort.as_deref(), Some("high"));
+    assert!(sub[0].system.contains("Be quick."));
+}
+
+#[tokio::test]
+async fn unknown_agent_type_fails_fast() {
+    script(
+        "t8-main",
+        vec![
+            MockRound::Tools(vec![(
+                SUBAGENT.into(),
+                serde_json::json!({"task": "t8-sub", "agent": "Nope"}),
+            )]),
+            MockRound::Text("main done".into()),
+        ],
+    );
+    script("t8-sub", vec![MockRound::Text("must never run".into())]);
+
+    let (agent, sink, store) = test_agent("t8-conv");
+    run(&agent, "t8-conv", "t8-main", &CancellationToken::new()).await;
+
+    assert!(tool_cards(&sink).iter().any(|(s, _t, r, _parent)| {
+        s == "error" && r.as_deref().is_some_and(|t| t.contains("unknown subagent type"))
+    }));
+    assert_eq!(
+        tool_results(&store, "t8-conv"),
+        vec![
+            "Error: unknown subagent type \"Nope\". Available types: General-Purpose, Explore."
+                .to_string()
+        ]
+    );
+    assert!(!subagent_text(&sink).contains("must never run"));
+    assert!(chat_text(&sink).contains("main done"));
+}
+
+#[tokio::test]
+async fn restricted_subagent_cannot_spawn_subagents() {
+    script(
+        "t9-main",
+        vec![
+            MockRound::Tools(vec![(
+                SUBAGENT.into(),
+                serde_json::json!({"task": "t9-sub", "agent": "Explore"}),
+            )]),
+            MockRound::Text("main done".into()),
+        ],
+    );
+    // the Explore subagent tries to delegate anyway
+    script(
+        "t9-sub",
+        vec![
+            MockRound::Tools(vec![(
+                SUBAGENT.into(),
+                serde_json::json!({"task": "t9-inner"}),
+            )]),
+            MockRound::Text("explored anyway".into()),
+        ],
+    );
+    script("t9-inner", vec![MockRound::Text("must never run".into())]);
+
+    let (agent, sink, store) = test_agent("t9-conv");
+    run(&agent, "t9-conv", "t9-main", &CancellationToken::new()).await;
+
+    // the nested spawn is rejected with an error card attributed to the parent
+    assert!(tool_cards(&sink).iter().any(|(s, _, r, parent)| {
+        s == "error"
+            && *parent
+            && r.as_deref()
+                .is_some_and(|t| t.contains("does not have access to the subagent tool"))
+    }));
+    assert!(!subagent_text(&sink).contains("must never run"));
+    // the Explore run still finishes with its own answer
+    assert_eq!(
+        tool_results(&store, "t9-conv"),
+        vec!["explored anyway".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn untyped_spawn_without_definitions_stays_generic() {
+    script(
+        "t10-main",
+        vec![
+            MockRound::Tools(vec![(
+                SUBAGENT.into(),
+                serde_json::json!({"task": "t10-sub"}),
+            )]),
+            MockRound::Text("main done".into()),
+        ],
+    );
+    script("t10-sub", vec![MockRound::Text("generic answer".into())]);
+
+    let (agent, sink, store) = test_agent("t10-conv");
+    {
+        let mut cfg = agent.store.config.lock().unwrap();
+        cfg.subagents.clear();
+    }
+    run(&agent, "t10-conv", "t10-main", &CancellationToken::new()).await;
+
+    assert_eq!(
+        tool_results(&store, "t10-conv"),
+        vec!["generic answer".to_string()]
+    );
+    // no definitions at all: no resolved type, no role block — base generic
+    let meta = sink_meta(&sink);
+    assert_eq!(meta.agent, None);
+    let sub = captures_for("t10-sub");
+    assert_eq!(sub.len(), 1);
+    assert!(!sub[0].system.contains("# Your role"));
 }

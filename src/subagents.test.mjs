@@ -5,6 +5,7 @@ import {
   subagentActivityLabel,
   subagentHeader,
   subagentTask,
+  subagentType,
 } from "./subagents.ts";
 
 const toolItem = (id, state = {}) => ({
@@ -52,6 +53,24 @@ test("subagentHeader prefers name + description, falls back to task", () => {
   assert.deepEqual(subagentHeader(undefined), { name: "Subagent", brief: "" });
 });
 
+test("subagentHeader name falls back to the agent type before Subagent", () => {
+  // explicit name still wins
+  assert.deepEqual(
+    subagentHeader({ agent: "Explore", name: "scout", task: "t" }),
+    { name: "scout", brief: "t" },
+  );
+  // no name: the configured agent type names the card
+  assert.deepEqual(subagentHeader({ agent: "Explore", task: "find things" }), {
+    name: "Explore",
+    brief: "find things",
+  });
+  // blank agent is ignored
+  assert.deepEqual(subagentHeader({ agent: "  ", task: "t" }), {
+    name: "Subagent",
+    brief: "t",
+  });
+});
+
 test("subagentHeader caps the brief at 80 chars", () => {
   const long = "y".repeat(120);
   const { brief } = subagentHeader({ description: long });
@@ -69,4 +88,16 @@ test("subagentTask returns the full task text", () => {
 test("subagentActivityLabel names the tool and status", () => {
   assert.equal(subagentActivityLabel("ducky__fs_read", "running"), "ducky__fs_read · running");
   assert.equal(subagentActivityLabel(undefined, "done"), "tool · done");
+});
+
+test("subagentType prefers live meta, falls back to args, then Generic", () => {
+  // live meta is authoritative — including a present-but-null agent
+  assert.equal(subagentType({ agent: "Explore" }, { agent: "ignored" }), "Explore");
+  assert.equal(subagentType({ agent: null }, { agent: "Explore" }), "Generic");
+  assert.equal(subagentType({}, { agent: "Explore" }), "Generic");
+  // no meta (replay / pre-approval): the raw argument decides
+  assert.equal(subagentType(undefined, { agent: "Explore" }), "Explore");
+  assert.equal(subagentType(null, { agent: "  " }), "Generic");
+  assert.equal(subagentType(undefined, {}), "Generic");
+  assert.equal(subagentType(undefined, undefined), "Generic");
 });

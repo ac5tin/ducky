@@ -22,6 +22,10 @@ pub const SERVER_TITLE: &str = "Ducky";
 /// chat engine, not just a cwd.
 pub const SUBAGENT: &str = "ducky__subagent";
 
+/// The definition an omitted `agent` argument resolves to (when it exists in
+/// the user's config; otherwise the spawn stays base-generic).
+pub const DEFAULT_SUBAGENT_NAME: &str = "General-Purpose";
+
 pub struct BuiltinTool {
     pub name: &'static str,
     pub description: &'static str,
@@ -50,6 +54,53 @@ pub fn tool_defs() -> Vec<ToolDef> {
             parameters: t.schema.clone(),
         })
         .collect()
+}
+
+/// The `ducky__subagent` tool definition built from the configured subagent
+/// definitions: the static entry's schema plus an `agent` enum whose
+/// description carries each type's name and when-to-use hint. Used instead of
+/// the registry entry whenever at least one subagent is configured.
+pub fn subagent_tool_def(defs: &[crate::config::SubagentConfig]) -> ToolDef {
+    let registry_entry = lookup(SUBAGENT).expect("subagent tool is registered");
+    let mut schema = registry_entry.schema.clone();
+    let list = defs
+        .iter()
+        .map(|d| format!("- {}: {}", d.name, d.description))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let omit_hint = if defs
+        .iter()
+        .any(|d| d.name.trim().eq_ignore_ascii_case(DEFAULT_SUBAGENT_NAME))
+    {
+        format!("Omitting it uses {DEFAULT_SUBAGENT_NAME}.")
+    } else {
+        "Omit it for a generic subagent with every tool.".to_string()
+    };
+    schema["properties"]["agent"] = serde_json::json!({
+        "type": "string",
+        "enum": defs.iter().map(|d| d.name.clone()).collect::<Vec<_>>(),
+        "description": format!(
+            "Kind of subagent to run, picked by matching the task against each \
+             type's description. {omit_hint} Available types:\n{list}"
+        )
+    });
+    ToolDef {
+        name: SUBAGENT.to_string(),
+        description: "Spawn a subagent: an autonomous helper with a fresh context \
+                      that works on one self-contained task and returns its final \
+                      answer. Set `agent` to the type whose description fits the \
+                      task, or omit it for a generic subagent that has the same \
+                      tools you have. Subagents can spawn their own subagents \
+                      (up to 3 levels deep), though some types are restricted to \
+                      specific tools. The subagent cannot see this conversation, \
+                      so `task` must contain everything it needs. Give each spawn \
+                      a short `name` and a one-line `description` so the user can \
+                      see at a glance what is running. To run subagents in \
+                      parallel, make several ducky__subagent calls in the same \
+                      message."
+            .to_string(),
+        parameters: schema,
+    }
 }
 
 /// Run a builtin tool. `cwd` is the effective working directory (fs tools are
