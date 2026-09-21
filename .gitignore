@@ -16,3 +16,6 @@ flatpak-repo/
 .idea/
 *.swp
 .DS_Store
+
+# superpowers design specs (kept local, not committed)
+docs/superpowers/
