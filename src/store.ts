@@ -1150,8 +1150,13 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
           ...stripEvent(event),
         };
         if (event.status === "running") {
-          // a fresh attempt invalidates progress from any previous task run
+          // a fresh attempt invalidates progress and results from any
+          // previous run of this call (e.g. a retry after re-auth)
           delete state.task;
+          delete state.result_text;
+          delete state.structured;
+          delete state.content;
+          delete state.is_error;
         }
         if (idx >= 0) {
           items[idx] = { kind: "tool", id: event.tool_call_id, state };
@@ -1318,18 +1323,28 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
 function stripEvent(
   event: Extract<BackendEvent, { type: "tool_call_update" }>,
 ): ToolCallState {
-  return {
+  // Absent fields arrive as null (serde writes Option::None as null); keep
+  // only what the event actually carries so a partial patch (e.g. the bare
+  // `running` update) doesn't wipe the tool/args set by an earlier update.
+  const state: Record<string, unknown> = {
     tool_call_id: event.tool_call_id,
     status: event.status,
-    server: event.server,
-    server_title: event.server_title,
-    tool: event.tool,
-    args: event.args,
-    result_text: event.result_text,
-    structured: event.structured,
-    content: event.content,
-    is_error: event.is_error,
   };
+  for (const key of [
+    "server",
+    "server_title",
+    "tool",
+    "args",
+    "result_text",
+    "structured",
+    "content",
+    "is_error",
+    "subagent",
+  ] as const) {
+    const value = event[key];
+    if (value !== null && value !== undefined) state[key] = value;
+  }
+  return state as unknown as ToolCallState;
 }
 
 function statusFromEvent(

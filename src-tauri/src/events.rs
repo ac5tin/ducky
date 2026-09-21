@@ -3,6 +3,16 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Identity/config of a `ducky__subagent` run, shown on its tool card.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentMeta {
+    pub provider_id: String,
+    pub model: String,
+    /// Effort as a display string ("low"…"max"); absent = provider default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BackendEvent {
@@ -42,13 +52,16 @@ pub enum BackendEvent {
     /// Tool call lifecycle updates. `status` is one of
     /// `pending_approval | running | awaiting_input | done | denied | error`.
     /// `parent_tool_call_id` is set when the call belongs to a subagent run:
-    /// it names the `ducky__subagent` call that spawned it.
+    /// it names the `ducky__subagent` call that spawned it. `subagent` is the
+    /// spawn's display metadata (provider/model/effort it inherits).
     ToolCallUpdate {
         conversation_id: String,
         tool_call_id: String,
         status: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_tool_call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent: Option<SubagentMeta>,
         server: Option<String>,
         server_title: Option<String>,
         tool: Option<String>,

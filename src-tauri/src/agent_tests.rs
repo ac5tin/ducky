@@ -257,6 +257,23 @@ async fn spawns_subagent_and_returns_final_answer() {
     assert!(tool_cards(&sink).iter().any(|(s, t, _, parent)| {
         s == "pending_approval" && t.as_deref() == Some(SUBAGENT) && !parent
     }));
+    // the running card tells the user what the subagent inherits
+    let meta = sink
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|e| match e {
+            BackendEvent::ToolCallUpdate {
+                status,
+                subagent: Some(m),
+                ..
+            } if status == "running" => Some(m.clone()),
+            _ => None,
+        })
+        .expect("running card carries subagent meta");
+    assert_eq!(meta.provider_id, "mock");
+    assert_eq!(meta.model, "mock-model");
     assert!(sink
         .events
         .lock()

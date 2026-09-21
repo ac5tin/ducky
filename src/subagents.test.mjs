@@ -3,7 +3,8 @@ import test from "node:test";
 import {
   applySubagentDeltas,
   subagentActivityLabel,
-  subagentTaskSnippet,
+  subagentHeader,
+  subagentTask,
 } from "./subagents.ts";
 
 const toolItem = (id, state = {}) => ({
@@ -32,18 +33,37 @@ test("applySubagentDeltas is a no-op without matches", () => {
   assert.equal(applySubagentDeltas(items, { other: "x" }), items);
 });
 
-test("subagentTaskSnippet takes the first line, capped at 80 chars", () => {
-  assert.equal(subagentTaskSnippet({ task: "Do a thing" }), "Do a thing");
-  assert.equal(
-    subagentTaskSnippet({ task: "  first line\nsecond line" }),
-    "first line",
+test("subagentHeader prefers name + description, falls back to task", () => {
+  assert.deepEqual(
+    subagentHeader({
+      name: "repo-explorer",
+      description: "find all callers of run_turn",
+      task: "long task text\nsecond line",
+    }),
+    { name: "repo-explorer", brief: "find all callers of run_turn" },
   );
-  const long = "x".repeat(120);
-  assert.equal(subagentTaskSnippet({ task: long }).length, 80);
-  assert.ok(subagentTaskSnippet({ task: long }).endsWith("…"));
-  assert.equal(subagentTaskSnippet({}), "");
-  assert.equal(subagentTaskSnippet({ task: "   " }), "");
-  assert.equal(subagentTaskSnippet(undefined), "");
+  // brief falls back to the task's first line
+  assert.deepEqual(subagentHeader({ task: "  first line\nsecond" }), {
+    name: "Subagent",
+    brief: "first line",
+  });
+  // nothing usable at all
+  assert.deepEqual(subagentHeader({}), { name: "Subagent", brief: "" });
+  assert.deepEqual(subagentHeader(undefined), { name: "Subagent", brief: "" });
+});
+
+test("subagentHeader caps the brief at 80 chars", () => {
+  const long = "y".repeat(120);
+  const { brief } = subagentHeader({ description: long });
+  assert.equal(brief.length, 80);
+  assert.ok(brief.endsWith("…"));
+});
+
+test("subagentTask returns the full task text", () => {
+  assert.equal(subagentTask({ task: "do\nit" }), "do\nit");
+  assert.equal(subagentTask({ task: "" }), "");
+  assert.equal(subagentTask({}), "");
+  assert.equal(subagentTask(undefined), "");
 });
 
 test("subagentActivityLabel names the tool and status", () => {

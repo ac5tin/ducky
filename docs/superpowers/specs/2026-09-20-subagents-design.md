@@ -70,11 +70,25 @@ construction, not by parameter.
 - `tool_call_update` events with `parent_tool_call_id` become a one-line
   activity label (`ducky__fs_read · running`) on the subagent card instead of
   a card of their own.
-- `ToolCallCard` renders a subagent variant: "Subagent — <first line of
-  task>" header, live transcript (markdown, streaming caret) while running,
-  final answer as the normal result section. On conversation reload the
-  transcript is session state and falls back to the persisted final answer —
-  same behavior as reasoning today.
+- **Card identity (2026-09-21):** the spawn schema has optional `name` (short
+  label, e.g. "repo-explorer") and `description` (one-line brief) params;
+  the card header shows `{name} — {brief}` with fallbacks to "Subagent" and
+  the task's first line. The `running` card event carries `subagent`
+  (`SubagentMeta`: provider_id, model, effort — read from the conversation
+  meta at spawn, model falling back to the provider default), rendered as
+  chips above the transcript. The body shows the meta chips, live transcript
+  (markdown, streaming caret), an activity line, the full task as readable
+  text (replacing the raw Arguments JSON for subagent cards), and the final
+  answer as the result section. Name/brief survive reload via persisted
+  args; transcript and meta are session state — same behavior as reasoning
+  today.
+- **Null-patch fix (2026-09-21):** `stripEvent` previously mapped absent
+  event fields to `null` own-properties, so a partial patch (the bare
+  `running` update) wiped the `tool`/`args` set by `pending_approval` —
+  cards showed the "tool" fallback and `Arguments: null` (pre-existing for
+  all tool cards, exposed by subagents). It now keeps only fields the event
+  actually carries, and a fresh `running` attempt clears stale
+  result/content fields alongside `task`.
 
 ## Testing
 

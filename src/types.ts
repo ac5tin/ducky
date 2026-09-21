@@ -244,6 +244,12 @@ export interface ToolCallState {
         subagent_text?: string;
         /** Last tool the subagent is running, e.g. `ducky__fs_read · running`. */
         subagent_activity?: string;
+        /** Inherited run config of a `ducky__subagent` spawn (session-only). */
+        subagent?: {
+                provider_id: string;
+                model: string;
+                effort?: string | null;
+        };
 }
 
 export type ContentBlockValue =

@@ -4,14 +4,37 @@ import type { ChatItem } from "./store";
 
 export const SUBAGENT_TOOL = "ducky__subagent";
 
-/** One-line task summary for the subagent card header. */
-export function subagentTaskSnippet(args: unknown): string {
+/** Header identity for a subagent card: a name and a one-line brief. */
+export interface SubagentHeader {
+  name: string;
+  brief: string;
+}
+
+/** Display name + concise brief for a spawn. `name`/`description` are
+ * optional schema params; the brief falls back to the task's first line. */
+export function subagentHeader(args: unknown): SubagentHeader {
+  const a = (args && typeof args === "object" ? args : {}) as {
+    task?: unknown;
+    name?: unknown;
+    description?: unknown;
+  };
+  const name =
+    typeof a.name === "string" && a.name.trim() ? a.name.trim() : "Subagent";
+  let brief = "";
+  if (typeof a.description === "string" && a.description.trim()) {
+    brief = a.description.trim();
+  } else if (typeof a.task === "string" && a.task.trim()) {
+    brief = a.task.trim().split("\n")[0] ?? "";
+  }
+  if (brief.length > 80) brief = `${brief.slice(0, 79)}…`;
+  return { name, brief };
+}
+
+/** The full task text delegated to the subagent, if parseable. */
+export function subagentTask(args: unknown): string {
   if (args && typeof args === "object" && "task" in args) {
     const task = (args as { task?: unknown }).task;
-    if (typeof task === "string" && task.trim()) {
-      const line = task.trim().split("\n")[0] ?? "";
-      return line.length > 80 ? `${line.slice(0, 79)}…` : line;
-    }
+    if (typeof task === "string") return task;
   }
   return "";
 }

@@ -699,8 +699,49 @@ impl Agent {
             return Err(format!("Error: {msg}"));
         };
 
-        self.emit_tool_update(conversation_id, &call.id, "running", serde_json::json!({}), parent);
+        self.emit_tool_update(
+            conversation_id,
+            &call.id,
+            "running",
+            serde_json::json!({ "subagent": self.subagent_meta(conversation_id) }),
+            parent,
+        );
         Ok(task)
+    }
+
+    /// Display metadata for a subagent spawn: the provider, model and effort
+    /// the subagent inherits from this conversation at spawn time.
+    fn subagent_meta(&self, conversation_id: &str) -> crate::events::SubagentMeta {
+        let cfg = self.store.config.lock().unwrap();
+        let (provider_id, model, effort) = match cfg
+            .conversations
+            .iter()
+            .find(|c| c.id == conversation_id)
+        {
+            Some(m) => (m.provider_id.clone(), m.model.clone(), m.effort),
+            None => (String::new(), String::new(), None),
+        };
+        // an empty conversation model falls back to the provider default,
+        // matching how provider_for resolves it
+        let model = if model.is_empty() {
+            cfg.providers
+                .iter()
+                .find(|p| p.id == provider_id)
+                .and_then(|p| {
+                    p.default_model
+                        .clone()
+                        .filter(|m| !m.is_empty())
+                        .or_else(|| p.models.first().cloned())
+                })
+                .unwrap_or_default()
+        } else {
+            model
+        };
+        crate::events::SubagentMeta {
+            provider_id,
+            model,
+            effort: effort.map(|e| e.as_str().to_string()),
+        }
     }
 
     /// Spawn one approved subagent as its own task. Every subagent run goes

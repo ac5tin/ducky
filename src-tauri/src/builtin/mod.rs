@@ -178,8 +178,9 @@ static REGISTRY: LazyLock<Vec<BuiltinTool>> = LazyLock::new(|| {
                       isolated context — parallel research across files or pages, or \
                       independent subtasks you combine afterwards. The subagent cannot \
                       see this conversation, so `task` must contain everything it needs. \
-                      To run subagents in parallel, make several ducky__subagent calls \
-                      in the same message.",
+                      Give each spawn a short `name` and a one-line `description` so the \
+                      user can see at a glance what is running. To run subagents in \
+                      parallel, make several ducky__subagent calls in the same message.",
             schema: obj(
                 &["task"],
                 serde_json::json!({
@@ -187,6 +188,16 @@ static REGISTRY: LazyLock<Vec<BuiltinTool>> = LazyLock::new(|| {
                         "type": "string",
                         "description": "Complete, self-contained instructions for the subagent, \
                                         including any context it needs from this conversation."
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Short label for this subagent shown to the user while it \
+                                        runs, e.g. \"repo-explorer\" or \"doc-writer\"."
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "One-line summary of the delegated task shown to the user, \
+                                        e.g. \"find all callers of run_turn\"."
                     }
                 }),
             ),
