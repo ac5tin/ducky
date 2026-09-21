@@ -16,6 +16,13 @@ pub enum BackendEvent {
         conversation_id: String,
         text: String,
     },
+    /// A subagent spawned via `ducky__subagent` streamed some text. Keyed to
+    /// the parent's tool call so the UI can show it inside that card.
+    SubagentDelta {
+        conversation_id: String,
+        tool_call_id: String,
+        text: String,
+    },
     /// A full assistant turn (text + tool calls) is complete.
     MessageDone {
         conversation_id: String,
@@ -34,10 +41,14 @@ pub enum BackendEvent {
     },
     /// Tool call lifecycle updates. `status` is one of
     /// `pending_approval | running | awaiting_input | done | denied | error`.
+    /// `parent_tool_call_id` is set when the call belongs to a subagent run:
+    /// it names the `ducky__subagent` call that spawned it.
     ToolCallUpdate {
         conversation_id: String,
         tool_call_id: String,
         status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_tool_call_id: Option<String>,
         server: Option<String>,
         server_title: Option<String>,
         tool: Option<String>,

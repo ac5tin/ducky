@@ -41,13 +41,41 @@ type Pending<T> = Arc<Mutex<HashMap<String, oneshot::Sender<T>>>>;
 pub struct InteractiveBridge {
     sink: Arc<dyn EventSink>,
     store: Arc<Store>,
-    /// Conversation the current tool call belongs to (for UI attribution).
-    conversation_ctx: Mutex<Option<String>>,
+    /// Conversation the active runs belong to (for UI attribution), with a
+    /// refcount so nested subagent runs of the same conversation share it:
+    /// `(conversation_id, live run count)`.
+    conversation_ctx: Mutex<Option<(String, u64)>>,
     /// Sampling backend for the active conversation (set by the agent).
     sampling_backend: Mutex<Option<SamplingBackend>>,
     approvals: Pending<ApprovalDecision>,
     elicitations: Pending<ElicitResult>,
     sampling_slots: Pending<bool>,
+}
+
+/// Keeps the conversation context attributed while an agent run (main turn
+/// or subagent) is live. Dropping the last guard for a conversation clears
+/// the slot and the sampling backend.
+pub struct CtxGuard<'a> {
+    bridge: &'a InteractiveBridge,
+}
+
+impl Drop for CtxGuard<'_> {
+    fn drop(&mut self) {
+        let mut ctx = self.bridge.conversation_ctx.lock().unwrap();
+        let last = match ctx.as_mut() {
+            Some((_, n)) if *n > 1 => {
+                *n -= 1;
+                false
+            }
+            Some(_) => true,
+            None => false,
+        };
+        if last {
+            *ctx = None;
+            drop(ctx);
+            *self.bridge.sampling_backend.lock().unwrap() = None;
+        }
+    }
 }
 
 impl InteractiveBridge {
@@ -63,9 +91,17 @@ impl InteractiveBridge {
         }
     }
 
-    /// Attribute subsequent interactive requests to a conversation.
-    pub fn set_conversation_ctx(&self, conversation_id: Option<String>) {
-        *self.conversation_ctx.lock().unwrap() = conversation_id;
+    /// Attribute interactive requests to a conversation until the returned
+    /// guard is dropped. Reentrant for the same conversation (nested
+    /// subagent runs refcount); acquiring for a different conversation
+    /// replaces the slot, matching the previous single-slot behaviour.
+    pub fn acquire_conversation_ctx(&self, conversation_id: &str) -> CtxGuard<'_> {
+        let mut ctx = self.conversation_ctx.lock().unwrap();
+        match ctx.as_mut() {
+            Some((id, n)) if id == conversation_id => *n += 1,
+            _ => *ctx = Some((conversation_id.to_string(), 1)),
+        }
+        CtxGuard { bridge: self }
     }
 
     /// Set the provider used to fulfil sampling requests.
@@ -74,7 +110,11 @@ impl InteractiveBridge {
     }
 
     fn conversation_ctx_opt(&self) -> Option<String> {
-        self.conversation_ctx.lock().unwrap().clone()
+        self.conversation_ctx
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(id, _)| id.clone())
     }
 
     /// Resolve every pending interactive request opened for a conversation
@@ -459,6 +499,29 @@ mod tests {
         assert_eq!(handle.await.unwrap(), ApprovalDecision::AllowOnce);
         // second resolve is a no-op
         assert!(!b.resolve_approval(&request_id, ApprovalDecision::Deny));
+    }
+
+    #[test]
+    fn ctx_guard_refcounts_nested_runs() {
+        let b = bridge();
+        assert!(b.conversation_ctx_opt().is_none());
+
+        let outer = b.acquire_conversation_ctx("c1");
+        assert_eq!(b.conversation_ctx_opt().as_deref(), Some("c1"));
+        {
+            // a nested run of the same conversation must not clear the slot
+            let inner = b.acquire_conversation_ctx("c1");
+            assert_eq!(b.conversation_ctx_opt().as_deref(), Some("c1"));
+            drop(inner);
+            assert_eq!(b.conversation_ctx_opt().as_deref(), Some("c1"));
+        }
+        assert_eq!(b.conversation_ctx_opt().as_deref(), Some("c1"));
+        drop(outer);
+        assert!(b.conversation_ctx_opt().is_none());
+
+        // a different conversation takes over the single slot
+        let _other = b.acquire_conversation_ctx("c2");
+        assert_eq!(b.conversation_ctx_opt().as_deref(), Some("c2"));
     }
 
     #[allow(deprecated)] // SEP-2577; rmcp 3.1.4 still exposes the compatibility API.

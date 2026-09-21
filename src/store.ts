@@ -5,6 +5,10 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import * as api from "./api";
 import { resolveDraftModel } from "./chatDraft";
 import { expandInitPrompt, parseSlashCommand } from "./slashCommands";
+import {
+  applySubagentDeltas,
+  subagentActivityLabel,
+} from "./subagents";
 import { dispatchTerminalEvent } from "./terminalBus";
 import type {
   AppConfig,
@@ -864,13 +868,25 @@ type GetFn = () => StoreState;
 // per few characters, and applying each one straight to the store re-rendered
 // (and re-parsed) the whole conversation per chunk — quadratic in response
 // length, worst on markdown tables.
-let pending: { convId: string; text: string; reasoning: string } | null = null;
+let pending: {
+  convId: string;
+  text: string;
+  reasoning: string;
+  /** subagent_call_id → streamed transcript chunks */
+  subagents: Record<string, string>;
+} | null = null;
 let pendingFrame = 0;
 
 const scheduleFrame: (cb: () => void) => number =
   typeof requestAnimationFrame === "function"
     ? (cb) => requestAnimationFrame(cb)
     : (cb) => setTimeout(cb, 0);
+
+function pendingFor(convId: string, set: SetFn, get: GetFn) {
+  if (pending && pending.convId !== convId) flushPending(set, get);
+  pending ??= { convId, text: "", reasoning: "", subagents: {} };
+  return pending;
+}
 
 function enqueueDelta(
   convId: string,
@@ -879,10 +895,21 @@ function enqueueDelta(
   set: SetFn,
   get: GetFn,
 ) {
-  if (pending && pending.convId !== convId) flushPending(set, get);
-  pending ??= { convId, text: "", reasoning: "" };
-  pending.text += text;
-  pending.reasoning += reasoning;
+  const p = pendingFor(convId, set, get);
+  p.text += text;
+  p.reasoning += reasoning;
+  if (!pendingFrame) pendingFrame = scheduleFrame(() => flushPending(set, get));
+}
+
+function enqueueSubagentDelta(
+  convId: string,
+  toolCallId: string,
+  text: string,
+  set: SetFn,
+  get: GetFn,
+) {
+  const p = pendingFor(convId, set, get);
+  p.subagents[toolCallId] = (p.subagents[toolCallId] ?? "") + text;
   if (!pendingFrame) pendingFrame = scheduleFrame(() => flushPending(set, get));
 }
 
@@ -897,25 +924,27 @@ function flushPending(set: SetFn, get: GetFn) {
   set((s) => {
     const items = [...s.items];
     const last = items[items.length - 1];
-    if (last?.kind === "assistant" && last.streaming) {
-      items[items.length - 1] = {
-        ...last,
-        text: last.text + p.text,
-        reasoning: p.reasoning
-          ? (last.reasoning ?? "") + p.reasoning
-          : last.reasoning,
-      };
-    } else {
-      items.push({
-        kind: "assistant",
-        id: `a-live-${Date.now()}`,
-        text: p.text,
-        ts: new Date().toISOString(),
-        reasoning: p.reasoning || undefined,
-        streaming: true,
-      });
+    if (p.text || p.reasoning) {
+      if (last?.kind === "assistant" && last.streaming) {
+        items[items.length - 1] = {
+          ...last,
+          text: last.text + p.text,
+          reasoning: p.reasoning
+            ? (last.reasoning ?? "") + p.reasoning
+            : last.reasoning,
+        };
+      } else {
+        items.push({
+          kind: "assistant",
+          id: `a-live-${Date.now()}`,
+          text: p.text,
+          ts: new Date().toISOString(),
+          reasoning: p.reasoning || undefined,
+          streaming: true,
+        });
+      }
     }
-    return { items };
+    return { items: applySubagentDeltas(items, p.subagents) };
   });
 }
 
@@ -993,7 +1022,11 @@ function drainQueue(convId: string, set: SetFn, get: GetFn) {
 }
 
 function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
-  if (event.type !== "chat_delta" && event.type !== "reasoning_delta") {
+  if (
+    event.type !== "chat_delta" &&
+    event.type !== "reasoning_delta" &&
+    event.type !== "subagent_delta"
+  ) {
     flushPending(set, get);
   }
   switch (event.type) {
@@ -1005,6 +1038,17 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
     case "reasoning_delta": {
       if (event.conversation_id !== get().activeConversationId) return;
       enqueueDelta(event.conversation_id, "", event.text, set, get);
+      break;
+    }
+    case "subagent_delta": {
+      if (event.conversation_id !== get().activeConversationId) return;
+      enqueueSubagentDelta(
+        event.conversation_id,
+        event.tool_call_id,
+        event.text,
+        set,
+        get,
+      );
       break;
     }
     case "message_done": {
@@ -1075,6 +1119,27 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
     }
     case "tool_call_update": {
       if (event.conversation_id !== get().activeConversationId) return;
+      if (event.parent_tool_call_id) {
+        // a subagent's internal tool call: an activity line on the subagent
+        // card, not a card of its own
+        set((s) => ({
+          items: s.items.map((item) =>
+            item.kind === "tool" && item.id === event.parent_tool_call_id
+              ? {
+                  ...item,
+                  state: {
+                    ...item.state,
+                    subagent_activity: subagentActivityLabel(
+                      event.tool,
+                      event.status,
+                    ),
+                  },
+                }
+              : item,
+          ),
+        }));
+        break;
+      }
       set((s) => {
         const items = [...s.items];
         const idx = items.findIndex(

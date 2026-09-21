@@ -17,6 +17,11 @@ use crate::providers::ToolDef;
 pub const SERVER_ID: &str = "builtin";
 pub const SERVER_TITLE: &str = "Ducky";
 
+/// The subagent tool. Registered here so the model sees it like any other
+/// tool, but executed by the agent itself (`agent.rs`) because it needs the
+/// chat engine, not just a cwd.
+pub const SUBAGENT: &str = "ducky__subagent";
+
 pub struct BuiltinTool {
     pub name: &'static str,
     pub description: &'static str,
@@ -165,6 +170,29 @@ static REGISTRY: LazyLock<Vec<BuiltinTool>> = LazyLock::new(|| {
             read_only: true,
         },
         BuiltinTool {
+            name: SUBAGENT,
+            description: "Spawn a subagent: an autonomous helper with a fresh context \
+                      that works on one self-contained task and returns its final answer. \
+                      The subagent has the same tools you have and can spawn its own \
+                      subagents (up to 3 levels deep). Use it for work that deserves an \
+                      isolated context — parallel research across files or pages, or \
+                      independent subtasks you combine afterwards. The subagent cannot \
+                      see this conversation, so `task` must contain everything it needs. \
+                      To run subagents in parallel, make several ducky__subagent calls \
+                      in the same message.",
+            schema: obj(
+                &["task"],
+                serde_json::json!({
+                    "task": {
+                        "type": "string",
+                        "description": "Complete, self-contained instructions for the subagent, \
+                                        including any context it needs from this conversation."
+                    }
+                }),
+            ),
+            read_only: false,
+        },
+        BuiltinTool {
             name: web::SEARCH,
             description: "Search the web (DuckDuckGo) and return the top results with \
                       titles, URLs and snippets. Use this to find pages before \
@@ -190,7 +218,7 @@ mod tests {
 
     #[test]
     fn registry_is_well_formed() {
-        assert!(REGISTRY.len() >= 7);
+        assert!(REGISTRY.len() >= 8);
         for tool in tools() {
             assert!(
                 tool.name.starts_with("ducky__"),

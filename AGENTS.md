@@ -25,7 +25,7 @@ Rust 1.85+ required (`rust-version` in Cargo.toml). Linux builds need `webkit2gt
 - `src/` — React + TS (strict, `noUnusedLocals`/`noUnusedParameters`), Tailwind v4 (CSS-first, no config file), zustand (`store.ts`), no router; components under `chat/`, `connectors/`, `modals/`, `settings/`. No import aliases — use relative paths.
 - `src-tauri/src/commands.rs` — the ~40-command Tauri command surface; frontend calls backend only through these.
 - `src-tauri/src/events.rs` — `BackendEvent` stream to the webview on `backend://event`.
-- `src-tauri/src/agent.rs` — chat loop: stream → tool calls → approvals → tool results.
+- `src-tauri/src/agent.rs` — chat loop: stream → tool calls → approvals → tool results; also subagents (`ducky__subagent` tool: parallel/nested runs via `RunScope`, depth-capped, inheriting the conversation's model/effort — see `docs/superpowers/specs/2026-09-20-subagents-design.md`).
 - `src-tauri/src/mcp/` — `manager.rs` (one rmcp client per server, caches, subscriptions), `handler.rs` (client capabilities: elicitation/sampling/roots), `bridge.rs` (interactive approvals ↔ UI events), `tests.rs`.
 - `src-tauri/src/providers/` — `openai.rs` + `anthropic.rs` adapters.
 - Also: `config.rs` (AppConfig + secrets), `oauth.rs` (OAuth 2.1 for remote MCP servers), `terminal.rs` (portable-pty), `builtin/` (built-in fs/html/web tools), `catalog.rs`, `title.rs`, `compact.rs` (`/compact` summarisation), `snapshot.rs` (hidden git repos backing `/undo` — see ADR-0002).

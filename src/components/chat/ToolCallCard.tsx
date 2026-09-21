@@ -3,6 +3,10 @@ import type { ToolCallState, ContentBlockValue } from "../../types";
 import { useStore } from "../../store";
 import * as api from "../../api";
 import { initialToolDetailsOpen } from "../../toolDetails";
+import {
+  SUBAGENT_TOOL,
+  subagentTaskSnippet,
+} from "../../subagents";
 import { Icon, StatusDot } from "../icons";
 import { Markdown } from "../Markdown";
 import { Button } from "../modals/Modal";
@@ -59,6 +63,8 @@ export const ToolCallCard = memo(function ToolCallCard({
   const refreshServer = useStore((s) => s.refreshServer);
   const toast = useStore((s) => s.toast);
   const status = state.status;
+  const isSubagent = state.tool === SUBAGENT_TOOL;
+  const taskSnippet = isSubagent ? subagentTaskSnippet(state.args) : "";
   const icon =
     status === "done"
       ? "check"
@@ -112,7 +118,19 @@ export const ToolCallCard = memo(function ToolCallCard({
           className={`h-4 w-4 shrink-0 ${tone} ${status === "running" || status === "awaiting_input" ? "animate-spin" : ""}`}
         />
         <span className="min-w-0 flex-1 truncate font-mono text-[13px] font-medium">
-          {state.tool ?? "tool"}
+          {isSubagent ? (
+            <>
+              <span className="font-sans font-semibold">Subagent</span>
+              {taskSnippet && (
+                <span className="font-sans font-normal text-slate-500 dark:text-slate-400">
+                  {" "}
+                  — {taskSnippet}
+                </span>
+              )}
+            </>
+          ) : (
+            (state.tool ?? "tool")
+          )}
         </span>
         {state.server_title && (
           <span className="hidden items-center gap-1.5 rounded-md bg-slate-100 px-2 py-0.5 text-xs text-slate-500 sm:inline-flex dark:bg-slate-800 dark:text-slate-400">
@@ -131,6 +149,25 @@ export const ToolCallCard = memo(function ToolCallCard({
 
       {open && (
         <div className="border-t border-slate-100 px-3.5 py-3 dark:border-slate-800">
+          {isSubagent && state.subagent_activity && status === "running" && (
+            <p className="mb-3 truncate font-mono text-[11px] text-slate-400">
+              {state.subagent_activity}
+            </p>
+          )}
+          {isSubagent && state.subagent_text && (
+            <>
+              <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                Subagent transcript
+              </div>
+              <div
+                className={`mb-3 max-h-72 overflow-auto rounded-lg bg-slate-50 px-3 py-2 dark:bg-slate-800/80 ${
+                  status === "running" ? "caret" : ""
+                }`}
+              >
+                <Markdown text={state.subagent_text} />
+              </div>
+            </>
+          )}
           {showAuthPanel && (
             <div className="mb-3 rounded-xl border border-amber-200 bg-amber-50 p-3 dark:border-amber-900 dark:bg-amber-950/40">
               <p className="text-sm font-medium text-amber-900 dark:text-amber-200">

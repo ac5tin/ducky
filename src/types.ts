@@ -240,6 +240,10 @@ export interface ToolCallState {
                 status: TaskStatus;
                 status_message?: string | null;
         };
+        /** Live transcript of a `ducky__subagent` run (session-only). */
+        subagent_text?: string;
+        /** Last tool the subagent is running, e.g. `ducky__fs_read · running`. */
+        subagent_activity?: string;
 }
 
 export type ContentBlockValue =
@@ -267,6 +271,12 @@ export type ContentBlockValue =
 export type BackendEvent =
         | { type: "chat_delta"; conversation_id: string; text: string }
         | { type: "reasoning_delta"; conversation_id: string; text: string }
+        | {
+                  type: "subagent_delta";
+                  conversation_id: string;
+                  tool_call_id: string;
+                  text: string;
+          }
         | { type: "message_done"; conversation_id: string; message_id: string }
         | { type: "chat_error"; conversation_id: string; error: string }
         | {
@@ -280,6 +290,9 @@ export type BackendEvent =
                   conversation_id: string;
                   tool_call_id: string;
                   status: ToolCallState["status"];
+                  /** Set when the call belongs to a subagent run: the
+                   * `ducky__subagent` call that spawned it. */
+                  parent_tool_call_id?: string;
           } & Partial<ToolCallState>)
         | {
                   type: "approval_requested";
