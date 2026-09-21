@@ -23,6 +23,24 @@ const MAX_SUBAGENT_DEPTH: u32 = 3;
 /// Extra `ducky__subagent` calls in the same message run sequentially.
 const MAX_CONCURRENT_SUBAGENTS: usize = 4;
 
+/// How long a provider stream may stay silent (no events at all) before the
+/// turn fails with a stall error. Generous on purpose: reasoning models can
+/// think silently for a while — but 5 minutes of nothing means the connection
+/// is dead or the provider is stuck, and "Working…" forever is worse than an
+/// error the user can act on.
+fn stream_idle_timeout() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        // tests use scripted providers that respond instantly; anything this
+        // idle in a test is a genuine deadlock or the watchdog under test
+        std::time::Duration::from_secs(2)
+    }
+    #[cfg(not(test))]
+    {
+        std::time::Duration::from_secs(300)
+    }
+}
+
 /// A configured subagent definition resolved at spawn time into an owned
 /// snapshot, so config edits mid-run cannot change a running subagent's
 /// persona, overrides or tool allowlist.
@@ -514,7 +532,22 @@ impl Agent {
                     _ = ct.cancelled() => {
                         return Err("cancelled".into());
                     }
-                    ev = rx.recv() => {
+                    // idle watchdog: the HTTP client only bounds the connect
+                    // phase, so a stream that goes silent (dead connection,
+                    // stuck server) must fail loudly instead of hanging the
+                    // turn — and a whole subagent tree — forever
+                    ev = tokio::time::timeout(stream_idle_timeout(), rx.recv()) => {
+                        let ev = match ev {
+                            Ok(ev) => ev,
+                            Err(_) => {
+                                return Err(format!(
+                                    "The model stream stalled — no data for {} seconds. \
+                                     The connection may have died or the provider is \
+                                     overloaded; try sending again.",
+                                    stream_idle_timeout().as_secs()
+                                ));
+                            }
+                        };
                         match ev {
                             Some(ProviderEvent::TextDelta(t)) => {
                                 text.push_str(&t);

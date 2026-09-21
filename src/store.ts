@@ -6,6 +6,7 @@ import * as api from "./api";
 import { resolveDraftModel } from "./chatDraft";
 import { expandInitPrompt, parseSlashCommand } from "./slashCommands";
 import {
+  activityTool,
   applySubagentDeltas,
   subagentActivityLabel,
 } from "./subagents";
@@ -1121,7 +1122,8 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
       if (event.conversation_id !== get().activeConversationId) return;
       if (event.parent_tool_call_id) {
         // a subagent's internal tool call: an activity line on the subagent
-        // card, not a card of its own
+        // card, not a card of its own. Later patches (running/done) don't
+        // carry `tool`, so keep the name from the previous line.
         set((s) => ({
           items: s.items.map((item) =>
             item.kind === "tool" && item.id === event.parent_tool_call_id
@@ -1130,7 +1132,8 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
                   state: {
                     ...item.state,
                     subagent_activity: subagentActivityLabel(
-                      event.tool,
+                      event.tool ??
+                        activityTool(item.state.subagent_activity),
                       event.status,
                     ),
                   },

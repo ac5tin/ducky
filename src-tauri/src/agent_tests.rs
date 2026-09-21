@@ -687,3 +687,93 @@ async fn untyped_spawn_without_definitions_stays_generic() {
     assert_eq!(sub.len(), 1);
     assert!(!sub[0].system.contains("# Your role"));
 }
+
+#[tokio::test]
+async fn subagent_internal_builtin_tool_completes() {
+    // the path the live QA exercised: a subagent running ordinary built-in
+    // tools round after round must keep making progress and finish
+    script(
+        "t13-main",
+        vec![
+            MockRound::Tools(vec![(
+                SUBAGENT.into(),
+                serde_json::json!({"task": "t13-sub"}),
+            )]),
+            MockRound::Text("main done".into()),
+        ],
+    );
+    script(
+        "t13-sub",
+        vec![
+            MockRound::Tools(vec![
+                ("ducky__fs_list".into(), serde_json::json!({})),
+                ("ducky__fs_list".into(), serde_json::json!({})),
+            ]),
+            MockRound::Text("listed everything".into()),
+        ],
+    );
+
+    let (agent, sink, store) = test_agent("t13-conv");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        run(&agent, "t13-conv", "t13-main", &CancellationToken::new()),
+    )
+    .await
+    .expect("subagent with internal tool calls must not hang");
+
+    assert_eq!(
+        tool_results(&store, "t13-conv"),
+        vec!["listed everything".to_string()]
+    );
+    // the internal calls surface as activity updates on the parent card
+    assert!(tool_cards(&sink)
+        .iter()
+        .any(|(s, _, _, parent)| s == "running" && *parent));
+    assert!(tool_cards(&sink)
+        .iter()
+        .any(|(s, _, _, parent)| s == "done" && *parent));
+}
+
+#[tokio::test]
+async fn stalled_subagent_stream_fails_loudly() {
+    // a subagent whose provider stream goes silent must error out (idle
+    // watchdog) instead of leaving the turn "Working…" forever
+    script(
+        "t14-main",
+        vec![
+            MockRound::Tools(vec![(
+                SUBAGENT.into(),
+                serde_json::json!({"task": "t14-sub"}),
+            )]),
+            MockRound::Text("main recovered".into()),
+        ],
+    );
+    script("t14-sub", vec![MockRound::Hang]);
+
+    let (agent, sink, store) = test_agent("t14-conv");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        run(&agent, "t14-conv", "t14-main", &CancellationToken::new()),
+    )
+    .await
+    .expect("the idle watchdog must fire instead of hanging");
+
+    // the subagent's stall surfaces as an error on its own card (parentless —
+    // it IS the subagent card) and an error result, and the main agent
+    // still finishes its turn
+    assert!(tool_cards(&sink).iter().any(|(s, _, r, parent)| {
+        s == "error" && !parent && r.as_deref().is_some_and(|t| t.contains("stream stalled"))
+    }));
+    assert_eq!(
+        tool_results(&store, "t14-conv").len(),
+        1,
+        "the stalled subagent's error is its single tool result"
+    );
+    assert!(chat_text(&sink).contains("main recovered"));
+    assert!(sink
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| matches!(e, BackendEvent::MessageDone { .. })));
+}

@@ -70,6 +70,14 @@ export function subagentActivityLabel(
   return `${tool ?? "tool"} · ${status}`;
 }
 
+/** The tool name embedded in an activity line, unless it's the fallback.
+ * `done`/`running` card patches don't carry `tool`, so the previous line is
+ * the only place the current tool's name lives. */
+export function activityTool(activity: string | undefined): string | undefined {
+  const t = activity?.split(" · ")[0];
+  return t && t !== "tool" ? t : undefined;
+}
+
 /** Append `deltas` (tool_call_id → text chunk) onto the matching tool items'
  * `subagent_text`. Returns the input array unchanged when nothing applies, so
  * callers skip needless store updates. */

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  activityTool,
   applySubagentDeltas,
   subagentActivityLabel,
   subagentHeader,
@@ -88,6 +89,17 @@ test("subagentTask returns the full task text", () => {
 test("subagentActivityLabel names the tool and status", () => {
   assert.equal(subagentActivityLabel("ducky__fs_read", "running"), "ducky__fs_read · running");
   assert.equal(subagentActivityLabel(undefined, "done"), "tool · done");
+});
+
+test("activityTool recovers the tool name from a previous line", () => {
+  assert.equal(activityTool("ducky__fs_list · running"), "ducky__fs_list");
+  // the fallback placeholder is not a real name
+  assert.equal(activityTool("tool · done"), undefined);
+  assert.equal(activityTool(undefined), undefined);
+  assert.equal(activityTool(""), undefined);
+  // round trip: a label built without a tool stays nameless
+  const label = subagentActivityLabel(undefined, "done");
+  assert.equal(activityTool(label), undefined);
 });
 
 test("subagentType prefers live meta, falls back to args, then Generic", () => {
