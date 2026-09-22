@@ -1017,3 +1017,36 @@ async fn default_mode_allows_the_same_write() {
 
     assert!(dir.join("allowed.txt").exists());
 }
+
+// ---------------------------------------------------------------------------
+// Mode text in the system prompt
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn mode_text_reaches_the_model_and_default_adds_none() {
+    script("m7-plan", vec![MockRound::Text("ok".into())]);
+    let (agent, _s, _st) = test_agent_in_mode("m7a-conv", AgentMode::Plan);
+    run(&agent, "m7a-conv", "m7-plan", &CancellationToken::new()).await;
+    let system = captures_for("m7-plan")[0].system.clone();
+    assert!(system.contains("# Plan mode"), "{system}");
+    assert!(system.contains("ducky__present_plan"), "{system}");
+
+    script("m7-read", vec![MockRound::Text("ok".into())]);
+    let (agent, _s, _st) = test_agent_in_mode("m7b-conv", AgentMode::ReadOnly);
+    run(&agent, "m7b-conv", "m7-read", &CancellationToken::new()).await;
+    assert!(captures_for("m7-read")[0].system.contains("# Read-only mode"));
+
+    script("m7-auto", vec![MockRound::Text("ok".into())]);
+    let (agent, _s, _st) = test_agent_in_mode("m7c-conv", AgentMode::Auto);
+    run(&agent, "m7c-conv", "m7-auto", &CancellationToken::new()).await;
+    assert!(captures_for("m7-auto")[0].system.contains("# Auto mode"));
+
+    // default mode adds no mode text at all
+    script("m7-default", vec![MockRound::Text("ok".into())]);
+    let (agent, _s, _st) = test_agent_in_mode("m7d-conv", AgentMode::Default);
+    run(&agent, "m7d-conv", "m7-default", &CancellationToken::new()).await;
+    let system = captures_for("m7-default")[0].system.clone();
+    assert!(!system.contains("# Plan mode"), "{system}");
+    assert!(!system.contains("# Read-only mode"), "{system}");
+    assert!(!system.contains("# Auto mode"), "{system}");
+}

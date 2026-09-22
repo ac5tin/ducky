@@ -211,13 +211,72 @@ pub struct Agent {
     pub sink: Arc<dyn EventSink>,
 }
 
+/// The mode block for the system prompt. `Default` returns `None` so default
+/// mode keeps the pre-modes prompt byte for byte.
+fn mode_prompt(mode: AgentMode, scope: &RunScope) -> Option<&'static str> {
+    if !scope.is_main() {
+        return match mode {
+            AgentMode::Default | AgentMode::Auto => None,
+            AgentMode::ReadOnly => Some(
+                "This run is in read-only mode: only read-only tools are available to \
+                 you. Report what should change instead of changing it.",
+            ),
+            AgentMode::Plan => Some(
+                "This run is in plan mode: only read-only tools are available to you. \
+                 Report what should change instead of changing it.",
+            ),
+        };
+    }
+    match mode {
+        AgentMode::Default => None,
+        AgentMode::ReadOnly => Some(
+            "# Read-only mode\n\
+             Read-only mode is active: only read-only tools are available, and a write \
+             attempt fails. Answer from what you can read. When the task needs a change, \
+             describe exactly what you would change — which files, which edits, in what \
+             order — instead of doing it, and say that the user can switch to plan or \
+             default mode to have you carry it out.",
+        ),
+        AgentMode::Plan => Some(
+            "# Plan mode\n\
+             Plan mode is active: only read-only tools are available, and a write attempt \
+             fails. Research first — read files, search, fetch pages, spawn read-only \
+             subagents for parallel research — then design the implementation.\n\n\
+             When the plan is ready, call ducky__present_plan with the full plan. The user \
+             reads it and either approves it or asks for changes. Approval ends plan mode \
+             and you continue in default mode with the plan still in context, so start \
+             implementing it then. Never ask for approval in plain text — the tool call is \
+             the request. If the user asks for changes, revise the plan and call the tool \
+             again.",
+        ),
+        AgentMode::Auto => Some(
+            "# Auto mode\n\
+             You decide how much freedom this task needs, by calling ducky__set_mode \
+             before doing the work:\n\
+             - `plan` for a task with design decisions, several files to touch, or unclear \
+             requirements. You then work read-only, research, and present a plan for \
+             approval.\n\
+             - `readonly` when you will only investigate and report.\n\
+             - `default` for unrestricted work.\n\
+             Do not switch modes for a small, obvious change — just do it. Leaving plan \
+             mode always needs the user's approval of a plan.",
+        ),
+    }
+}
+
 /// Per-round system message (never persisted). Rebuilt each round so
 /// working-directory changes apply mid-turn. Main runs append the custom
 /// system prompt from settings after the grounding text. Subagent runs get
 /// a preamble describing their contract: isolated context, autonomous,
 /// final answer; spawns via a configured agent type also get that type's
-/// persona.
-fn system_message(cwd: &std::path::Path, scope: &RunScope, main_prompt: &str) -> Msg {
+/// persona. Main runs in a non-default mode get that mode's block; subagent
+/// runs get only a short read-only/plan variant.
+fn system_message(
+    cwd: &std::path::Path,
+    scope: &RunScope,
+    main_prompt: &str,
+    mode: AgentMode,
+) -> Msg {
     let grounding = format!(
         "Working directory: {}. Resolve relative file paths the user mentions \
          against this directory. Built-in file tools are confined to the \
@@ -234,6 +293,10 @@ fn system_message(cwd: &std::path::Path, scope: &RunScope, main_prompt: &str) ->
             if !prompt.is_empty() {
                 text.push_str("\n\n");
                 text.push_str(prompt);
+            }
+            if let Some(mode_text) = mode_prompt(mode, scope) {
+                text.push_str("\n\n");
+                text.push_str(mode_text);
             }
             text
         }
@@ -262,6 +325,10 @@ fn system_message(cwd: &std::path::Path, scope: &RunScope, main_prompt: &str) ->
                         tools.join(", ")
                     ));
                 }
+            }
+            if let Some(mode_text) = mode_prompt(mode, scope) {
+                text.push_str("\n\n");
+                text.push_str(mode_text);
             }
             text
         }
@@ -590,7 +657,7 @@ impl Agent {
                 )
             };
             let mut snapshot = history.clone();
-            snapshot.insert(0, system_message(&cwd, scope, &main_prompt));
+            snapshot.insert(0, system_message(&cwd, scope, &main_prompt, mode));
             let conversation_effort = {
                 let cfg = self.store.config.lock().unwrap();
                 cfg.conversations
