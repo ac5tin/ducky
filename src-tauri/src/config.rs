@@ -5,7 +5,7 @@
 //! webview.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -568,6 +568,121 @@ pub struct UndoRecord {
     pub wd: String,
 }
 
+/// A named, coloured group of chats.
+///
+/// `conversation_ids` carries both membership and display order: a chat belongs
+/// to the group that lists its id, and nothing else stores that fact.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatGroup {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub collapsed: bool,
+    /// Dot colour as `#rrggbb`, lowercase.
+    #[serde(default = "default_group_color")]
+    pub color: String,
+    #[serde(default)]
+    pub conversation_ids: Vec<String>,
+}
+
+/// The order-only payload for `group_apply_layout`. It deliberately carries no
+/// title, colour or collapsed flag, so a bad payload cannot erase them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupLayout {
+    pub id: String,
+    #[serde(default)]
+    pub conversation_ids: Vec<String>,
+}
+
+/// The five preset group colours, at the Tailwind 500 weight.
+pub const GROUP_COLORS: [&str; 5] = ["#64748b", "#ef4444", "#f59e0b", "#22c55e", "#0ea5e9"];
+
+pub const DEFAULT_GROUP_TITLE: &str = "New group";
+
+pub fn default_group_color() -> String {
+    GROUP_COLORS[0].to_string()
+}
+
+/// A blank title becomes the default, so a group is never nameless.
+pub fn normalize_group_title(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        DEFAULT_GROUP_TITLE.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Accepts `#rgb` or `#rrggbb` in either case and returns lowercase `#rrggbb`.
+/// Anything else is rejected, so the stored value is always a safe CSS colour.
+pub fn normalize_group_color(raw: &str) -> Result<String, String> {
+    const ERR: &str = "Colour must be a hex value like #0ea5e9";
+    let hex = raw.trim().strip_prefix('#').ok_or(ERR)?;
+    let expanded = match hex.len() {
+        3 => hex.chars().flat_map(|c| [c, c]).collect::<String>(),
+        6 => hex.to_string(),
+        _ => return Err(ERR.to_string()),
+    };
+    if !expanded.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ERR.to_string());
+    }
+    Ok(format!("#{}", expanded.to_ascii_lowercase()))
+}
+
+/// Rewrites group order and membership from an order-only payload.
+///
+/// Title, colour and collapsed flag always come from the server record. A group
+/// the payload does not mention keeps its chats and is appended after the
+/// mentioned groups, so the rewrite is lossless. A conversation id that is
+/// unknown, or already claimed by an earlier payload entry, is dropped.
+pub fn apply_group_layout(
+    groups: &mut Vec<ChatGroup>,
+    incoming: &[GroupLayout],
+    known_conversations: &HashSet<String>,
+) {
+    let mut claimed: HashSet<String> = HashSet::new();
+    for entry in incoming {
+        let Some(group) = groups.iter_mut().find(|g| g.id == entry.id) else {
+            continue;
+        };
+        let mut next = Vec::new();
+        for id in &entry.conversation_ids {
+            if !known_conversations.contains(id) || !claimed.insert(id.clone()) {
+                continue;
+            }
+            next.push(id.clone());
+        }
+        group.conversation_ids = next;
+    }
+
+    let mut ordered: Vec<ChatGroup> = Vec::with_capacity(groups.len());
+    for entry in incoming {
+        if let Some(pos) = groups.iter().position(|g| g.id == entry.id) {
+            ordered.push(groups.remove(pos));
+        }
+    }
+    ordered.append(groups);
+    *groups = ordered;
+}
+
+/// Puts a chat at the top of a group and expands it, so the new chat is
+/// visible. Returns false when the group is gone.
+pub fn insert_conversation_into_group(
+    groups: &mut [ChatGroup],
+    group_id: &str,
+    conversation_id: &str,
+) -> bool {
+    let Some(group) = groups.iter_mut().find(|g| g.id == group_id) else {
+        return false;
+    };
+    group.conversation_ids.retain(|id| id != conversation_id);
+    group
+        .conversation_ids
+        .insert(0, conversation_id.to_string());
+    group.collapsed = false;
+    true
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AppConfig {
     pub version: u32,
@@ -587,6 +702,8 @@ pub struct AppConfig {
     pub settings: AppSettings,
     #[serde(default)]
     pub conversations: Vec<ConversationMeta>,
+    #[serde(default)]
+    pub groups: Vec<ChatGroup>,
 }
 
 /// Values that must never reach the webview.
@@ -1063,6 +1180,9 @@ impl Store {
         }
         let mut cfg = self.config.lock().unwrap();
         cfg.conversations.retain(|c| c.id != id);
+        for group in cfg.groups.iter_mut() {
+            group.conversation_ids.retain(|c| c != id);
+        }
         drop(cfg);
         self.save_config()
     }
@@ -1702,5 +1822,165 @@ mod tests {
         let mut def = subagent("New");
         def.tools = Some(vec![" ".into()]);
         assert!(validate_subagent(&def, &providers, &[]).is_err());
+    }
+
+    fn test_group(id: &str, title: &str, members: &[&str]) -> ChatGroup {
+        ChatGroup {
+            id: id.into(),
+            title: title.into(),
+            collapsed: false,
+            color: default_group_color(),
+            conversation_ids: members.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    impl ChatGroup {
+        fn colored(mut self, color: &str) -> Self {
+            self.color = color.into();
+            self
+        }
+
+        fn collapsed(mut self, collapsed: bool) -> Self {
+            self.collapsed = collapsed;
+            self
+        }
+    }
+
+    #[test]
+    fn group_color_is_normalized_or_rejected() {
+        assert_eq!(normalize_group_color("#ABC").unwrap(), "#aabbcc");
+        assert_eq!(normalize_group_color("#0EA5E9").unwrap(), "#0ea5e9");
+        assert_eq!(normalize_group_color("  #0ea5e9  ").unwrap(), "#0ea5e9");
+        assert!(normalize_group_color("red").is_err());
+        assert!(normalize_group_color("#12345").is_err());
+        assert!(normalize_group_color("#gggggg").is_err());
+        assert!(normalize_group_color("").is_err());
+    }
+
+    #[test]
+    fn group_title_defaults_when_blank() {
+        assert_eq!(normalize_group_title(""), DEFAULT_GROUP_TITLE);
+        assert_eq!(normalize_group_title("   "), DEFAULT_GROUP_TITLE);
+        assert_eq!(normalize_group_title("  Work  "), "Work");
+    }
+
+    #[test]
+    fn groups_survive_a_config_roundtrip_with_defaults() {
+        // An older config has no `groups` key at all.
+        let cfg: AppConfig = serde_json::from_str(r#"{"version":1}"#).unwrap();
+        assert!(cfg.groups.is_empty());
+
+        // A hand-edited group may be missing `color`, `collapsed` or members.
+        let group: ChatGroup = serde_json::from_str(r#"{"id":"g1","title":"Work"}"#).unwrap();
+        assert_eq!(group.color, "#64748b");
+        assert!(!group.collapsed);
+        assert!(group.conversation_ids.is_empty());
+    }
+
+    #[test]
+    fn apply_group_layout_keeps_metadata_and_is_lossless() {
+        let mut groups = vec![
+            test_group("g1", "Work", &["c1", "c2"]),
+            test_group("g2", "Home", &["c3"]),
+            test_group("g3", "Old", &["c4"]),
+        ];
+        let known: HashSet<String> = ["c1", "c2", "c3", "c4"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let incoming = vec![
+            GroupLayout {
+                id: "g2".into(),
+                conversation_ids: vec!["c3".into(), "c1".into()],
+            },
+            // Unknown group: skipped whole, so its c4 claim never lands anywhere.
+            GroupLayout {
+                id: "ghost".into(),
+                conversation_ids: vec!["c4".into()],
+            },
+            GroupLayout {
+                id: "g1".into(),
+                conversation_ids: vec!["c2".into()],
+            },
+        ];
+
+        apply_group_layout(&mut groups, &incoming, &known);
+
+        let ids: Vec<&str> = groups.iter().map(|g| g.id.as_str()).collect();
+        assert_eq!(ids, ["g2", "g1", "g3"]); // payload order, then the group nobody mentioned
+        assert_eq!(groups[0].title, "Home"); // metadata comes from the server record
+        assert_eq!(groups[0].conversation_ids, ["c3", "c1"]); // c1 moved in
+        assert_eq!(groups[1].conversation_ids, ["c2"]); // c1 moved out
+        assert_eq!(groups[2].conversation_ids, ["c4"]); // untouched
+    }
+
+    #[test]
+    fn apply_group_layout_preserves_color_and_collapsed() {
+        let mut groups = vec![test_group("g1", "Work", &[])
+            .colored("#ef4444")
+            .collapsed(true)];
+        let incoming = vec![GroupLayout {
+            id: "g1".into(),
+            conversation_ids: vec![],
+        }];
+
+        apply_group_layout(&mut groups, &incoming, &HashSet::new());
+
+        assert_eq!(groups[0].color, "#ef4444");
+        assert!(groups[0].collapsed);
+    }
+
+    #[test]
+    fn apply_group_layout_drops_unknown_and_duplicate_conversations() {
+        let mut groups = vec![
+            test_group("g1", "Work", &["c1"]),
+            test_group("g2", "Home", &[]),
+        ];
+        let known: HashSet<String> = ["c1", "c2"].iter().map(|s| s.to_string()).collect();
+        let incoming = vec![
+            GroupLayout {
+                id: "g1".into(),
+                conversation_ids: vec!["c1".into(), "c1".into(), "gone".into()],
+            },
+            GroupLayout {
+                id: "g2".into(),
+                conversation_ids: vec!["c1".into(), "c2".into()],
+            },
+        ];
+
+        apply_group_layout(&mut groups, &incoming, &known);
+
+        assert_eq!(groups[0].conversation_ids, ["c1"]); // duplicate and unknown dropped
+        assert_eq!(groups[1].conversation_ids, ["c2"]); // c1 already claimed by g1
+    }
+
+    #[test]
+    fn insert_conversation_into_group_puts_it_first_and_expands() {
+        let mut groups = vec![test_group("g1", "Work", &["old"]).collapsed(true)];
+
+        assert!(insert_conversation_into_group(&mut groups, "g1", "new"));
+        assert_eq!(groups[0].conversation_ids, ["new", "old"]);
+        assert!(!groups[0].collapsed);
+
+        // A group that no longer exists changes nothing and reports the miss.
+        let mut groups = vec![test_group("g1", "Work", &["old"])];
+        assert!(!insert_conversation_into_group(&mut groups, "ghost", "new"));
+        assert_eq!(groups[0].conversation_ids, ["old"]);
+    }
+
+    #[test]
+    fn deleting_a_conversation_removes_it_from_groups() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(tmp.path(), tmp.path().to_path_buf()).unwrap();
+        {
+            let mut cfg = store.config.lock().unwrap();
+            cfg.groups.push(test_group("g1", "Work", &["c1", "c2"]));
+        }
+        store.save_config().unwrap();
+
+        store.delete_conversation("c1").unwrap();
+
+        let cfg = store.config.lock().unwrap();
+        assert_eq!(cfg.groups[0].conversation_ids, ["c2"]);
     }
 }
