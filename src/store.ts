@@ -4,6 +4,7 @@ import { check as updaterCheck, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import * as api from "./api";
 import { resolveDraftModel } from "./chatDraft";
+import { toLayout } from "./groups";
 import { expandInitPrompt, parseSlashCommand } from "./slashCommands";
 import {
   activityTool,
@@ -16,6 +17,7 @@ import type {
   AppConfig,
   AuthReason,
   BackendEvent,
+  ChatGroup,
   ConnectorSuggestion,
   EffortLevel,
   PlanRequest,
@@ -156,6 +158,8 @@ interface StoreState {
 
   view: View;
   activeConversationId: string | null;
+  /** Group a chat created from a group's `+` button should land in. */
+  draftGroupId: string | null;
   /** Model staged on the draft page; null = no pick, defaults apply. */
   draftModel: string | null;
   /** Effort staged on the draft page; undefined = untouched (creation seeds
@@ -207,6 +211,15 @@ interface StoreState {
   newConversation: () => Promise<void>;
   deleteConversation: (id: string) => Promise<void>;
   renameConversation: (id: string, title: string) => Promise<void>;
+  createGroup: () => Promise<string | null>;
+  renameGroup: (id: string, title: string) => Promise<void>;
+  deleteGroup: (id: string) => Promise<void>;
+  setGroupCollapsed: (id: string, collapsed: boolean) => Promise<void>;
+  setAllGroupsCollapsed: (collapsed: boolean) => Promise<void>;
+  setGroupColor: (id: string, color: string) => Promise<void>;
+  /** Commit a drop: the full layout the sidebar already rendered. */
+  applyGroupLayout: (groups: ChatGroup[]) => Promise<void>;
+  newConversationInGroup: (groupId: string) => Promise<void>;
   generateTitle: (id: string) => Promise<void>;
   cancelTitle: (id: string) => Promise<void>;
   setActiveModel: (providerId: string, model: string) => Promise<void>;
@@ -319,6 +332,7 @@ export const useStore = create<StoreState>((set, get) => ({
 
   view: "chat",
   activeConversationId: null,
+  draftGroupId: null,
   draftModel: null,
   draftEffort: undefined,
   draftMode: null,
@@ -456,6 +470,7 @@ export const useStore = create<StoreState>((set, get) => ({
       draftModel: null,
       draftEffort: undefined,
       draftMode: null,
+      draftGroupId: null,
       items: [],
       view: "chat",
     });
@@ -508,6 +523,113 @@ export const useStore = create<StoreState>((set, get) => ({
       set({ activeConversationId: null, items: [] });
     }
     await state.refreshConfig();
+  },
+
+  async createGroup() {
+    try {
+      const group = await api.groupCreate();
+      await get().refreshConfig();
+      return group.id;
+    } catch (e) {
+      get().toast("error", `Could not create that group: ${e}`);
+      return null;
+    }
+  },
+
+  async renameGroup(id, title) {
+    try {
+      await api.groupRename(id, title);
+      await get().refreshConfig();
+    } catch (e) {
+      get().toast("error", `Could not rename that group: ${e}`);
+    }
+  },
+
+  async deleteGroup(id) {
+    try {
+      await api.groupDelete(id);
+      if (get().draftGroupId === id) set({ draftGroupId: null });
+      await get().refreshConfig();
+    } catch (e) {
+      get().toast("error", `Could not delete that group: ${e}`);
+    }
+  },
+
+  // The view updates first so a click never waits for the round trip. On a
+  // failure the config is re-read, which restores the backend's truth.
+  async setGroupCollapsed(id, collapsed) {
+    set((s) =>
+      s.config
+        ? {
+            config: {
+              ...s.config,
+              groups: (s.config.groups ?? []).map((g) =>
+                g.id === id ? { ...g, collapsed } : g,
+              ),
+            },
+          }
+        : {},
+    );
+    try {
+      await api.groupSetCollapsed(id, collapsed);
+    } catch (e) {
+      get().toast("error", `Could not update that group: ${e}`);
+      await get().refreshConfig();
+    }
+  },
+
+  async setAllGroupsCollapsed(collapsed) {
+    const groups = get().config?.groups ?? [];
+    set((s) =>
+      s.config
+        ? { config: { ...s.config, groups: groups.map((g) => ({ ...g, collapsed })) } }
+        : {},
+    );
+    try {
+      // Sequential: each command rewrites the whole config file.
+      for (const group of groups) {
+        await api.groupSetCollapsed(group.id, collapsed);
+      }
+    } catch (e) {
+      get().toast("error", `Could not update the groups: ${e}`);
+    }
+    await get().refreshConfig();
+  },
+
+  async setGroupColor(id, color) {
+    set((s) =>
+      s.config
+        ? {
+            config: {
+              ...s.config,
+              groups: (s.config.groups ?? []).map((g) => (g.id === id ? { ...g, color } : g)),
+            },
+          }
+        : {},
+    );
+    try {
+      await api.groupSetColor(id, color);
+    } catch (e) {
+      get().toast("error", `Could not recolour that group: ${e}`);
+      await get().refreshConfig();
+    }
+  },
+
+  async applyGroupLayout(groups) {
+    set((s) => (s.config ? { config: { ...s.config, groups } } : {}));
+    try {
+      await api.groupApplyLayout(toLayout(groups));
+      await get().refreshConfig();
+    } catch (e) {
+      get().toast("error", `Could not update the group order: ${e}`);
+      await get().refreshConfig();
+    }
+  },
+
+  async newConversationInGroup(groupId) {
+    // `newConversation` clears the draft, so the group is set afterwards.
+    await get().newConversation();
+    set({ draftGroupId: groupId });
   },
 
   async setActiveModel(providerId, model) {
@@ -630,7 +752,7 @@ export const useStore = create<StoreState>((set, get) => ({
           return;
         }
         const model = resolveDraftModel(get().draftModel, config, provider);
-        const meta = await api.conversationCreate(provider.id, model);
+        const meta = await api.conversationCreate(provider.id, model, get().draftGroupId);
         const { draftEffort } = get();
         if (draftEffort !== undefined) {
           // non-fatal: the chat proceeds with the default effort if this fails
@@ -641,7 +763,7 @@ export const useStore = create<StoreState>((set, get) => ({
           // non-fatal: the chat keeps the app default if this fails
           await api.conversationSetMode(meta.id, draftMode).catch(() => {});
         }
-        set({ draftModel: null, draftEffort: undefined, draftMode: null });
+        set({ draftModel: null, draftEffort: undefined, draftMode: null, draftGroupId: null });
         await get().refreshConfig();
         id = meta.id;
       } catch (e) {
