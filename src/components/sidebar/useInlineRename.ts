@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import type { ChangeEvent, KeyboardEvent, MouseEvent } from "react";
+import type { ChangeEvent, FocusEvent, KeyboardEvent, MouseEvent } from "react";
 
 /** Inline rename behaviour shared by chat rows and group headers: Enter
  *  commits, Escape cancels, blur commits. Same rules as the chat rename that
@@ -10,6 +10,7 @@ export function useInlineRename(initial: string, onCommit: (title: string) => vo
   const skipBlur = useRef(false);
 
   const start = () => {
+    skipBlur.current = false;
     setDraft(initial);
     setEditing(true);
   };
@@ -31,6 +32,7 @@ export function useInlineRename(initial: string, onCommit: (title: string) => vo
     cancel,
     inputProps: {
       autoFocus: true,
+      onFocus: (e: FocusEvent<HTMLInputElement>) => e.currentTarget.select(),
       value: draft,
       onChange: (e: ChangeEvent<HTMLInputElement>) => setDraft(e.target.value),
       onClick: (e: MouseEvent) => e.stopPropagation(),
