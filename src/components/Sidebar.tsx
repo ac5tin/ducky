@@ -256,7 +256,7 @@ export function Sidebar() {
               disabled={groups.length === 0}
               onClick={() => setAllGroupsCollapsed(false).catch((e) => console.error(e))}
             >
-              <Icon name="chevron" className="h-3.5 w-3.5 rotate-90" />
+              <Icon name="chevron" className="h-3.5 w-3.5" />
             </button>
           </div>
         </div>

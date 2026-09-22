@@ -237,3 +237,27 @@ test("a group dropped on an ungrouped chat goes to the end of the group list", (
   );
   assert.deepEqual(shape(next), ["g2:[b]", "g1:[a]"]);
 });
+
+test("a group dropped after another group takes that position", () => {
+  const origin = [group("g1", ["a"]), group("g2", ["b"]), group("g3", ["c"])];
+  const built = view(origin, [chat("a"), chat("b"), chat("c")]);
+  const next = computeDropLayout(
+    built,
+    { kind: "group", id: "g1" },
+    { kind: "group-over", groupId: "g3" },
+    "after",
+  );
+  assert.deepEqual(shape(next), ["g2:[b]", "g3:[c]", "g1:[a]"]);
+});
+
+test("a group dropped on a chat of another group lands next to that group", () => {
+  const origin = [group("g1", ["a"]), group("g2", ["b"])];
+  const built = view(origin, [chat("a"), chat("b")]);
+  const next = computeDropLayout(
+    built,
+    { kind: "group", id: "g2" },
+    { kind: "chat", conversationId: "a" },
+    "before",
+  );
+  assert.deepEqual(shape(next), ["g2:[b]", "g1:[a]"]);
+});

@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { GROUP_COLORS, normalizeGroupColor } from "../../groups";
 import { useStore } from "../../store";
 import type { ChatGroup } from "../../types";
@@ -28,6 +28,19 @@ export function GroupColorPicker({
     commit();
     onClose();
   };
+
+  // The listener subscribes once per mount, so it reaches the newest `close`
+  // through a ref — `close` closes over `draft`, which changes as the wheel moves.
+  const closeRef = useRef(close);
+  closeRef.current = close;
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") closeRef.current();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   const pickPreset = (color: string) => {
     setGroupColor(group.id, color).catch((e) => console.error(e));
