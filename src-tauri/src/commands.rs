@@ -1,6 +1,6 @@
 //! Tauri commands — the whole backend API surface the webview talks to.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -9,8 +9,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::ConversationRuntime;
 use crate::config::{
-    self, AppConfig, ConversationMeta, McpServerConfig, ProviderConfig, Store, SubagentConfig,
-    Theme, ToolRule, UndoRecord,
+    self, AppConfig, ChatGroup, ConversationMeta, GroupLayout, McpServerConfig, ProviderConfig,
+    Store, SubagentConfig, Theme, ToolRule, UndoRecord,
 };
 use crate::mcp::bridge::{ApprovalDecision, PlanDecision};
 use crate::providers::Msg;
@@ -501,6 +501,7 @@ pub fn conversation_create(
     state: State<'_, Arc<AppState>>,
     provider_id: String,
     model: String,
+    group_id: Option<String>,
 ) -> ConversationMeta {
     let (effort, mode) = {
         let cfg = state.store.config.lock().unwrap();
@@ -521,6 +522,9 @@ pub fn conversation_create(
     {
         let mut c = state.store.config.lock().unwrap();
         c.conversations.insert(0, meta.clone());
+        if let Some(group_id) = group_id.as_deref() {
+            config::insert_conversation_into_group(&mut c.groups, group_id, &meta.id);
+        }
     }
     let _ = state.store.save_config();
     let _ = state.store.save_conversation(&meta, &[], &[]);
@@ -621,6 +625,104 @@ pub fn conversation_set_mcp_ids(
             return Err("Unknown conversation".into());
         };
         meta.mcp_ids = mcp_ids;
+    }
+    state.store.save_config().map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Chat groups
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn group_create(
+    state: State<'_, Arc<AppState>>,
+    title: Option<String>,
+) -> Result<ChatGroup, String> {
+    let group = {
+        let mut c = state.store.config.lock().unwrap();
+        let group = ChatGroup {
+            id: uuid(),
+            title: config::normalize_group_title(title.as_deref().unwrap_or("")),
+            collapsed: false,
+            color: config::default_group_color(),
+            conversation_ids: Vec::new(),
+        };
+        c.groups.insert(0, group.clone());
+        group
+    };
+    state.store.save_config().map_err(|e| e.to_string())?;
+    Ok(group)
+}
+
+#[tauri::command]
+pub fn group_rename(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    title: String,
+) -> Result<(), String> {
+    let title = config::normalize_group_title(&title);
+    {
+        let mut c = state.store.config.lock().unwrap();
+        let Some(group) = c.groups.iter_mut().find(|g| g.id == id) else {
+            return Err("Unknown group".into());
+        };
+        group.title = title;
+    }
+    state.store.save_config().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn group_set_collapsed(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    collapsed: bool,
+) -> Result<(), String> {
+    {
+        let mut c = state.store.config.lock().unwrap();
+        let Some(group) = c.groups.iter_mut().find(|g| g.id == id) else {
+            return Err("Unknown group".into());
+        };
+        group.collapsed = collapsed;
+    }
+    state.store.save_config().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn group_set_color(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    color: String,
+) -> Result<(), String> {
+    let color = config::normalize_group_color(&color)?;
+    {
+        let mut c = state.store.config.lock().unwrap();
+        let Some(group) = c.groups.iter_mut().find(|g| g.id == id) else {
+            return Err("Unknown group".into());
+        };
+        group.color = color;
+    }
+    state.store.save_config().map_err(|e| e.to_string())
+}
+
+/// Ungroup and delete: the record goes, the chats stay and become ungrouped.
+#[tauri::command]
+pub fn group_delete(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
+    {
+        let mut c = state.store.config.lock().unwrap();
+        c.groups.retain(|g| g.id != id);
+    }
+    state.store.save_config().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn group_apply_layout(
+    state: State<'_, Arc<AppState>>,
+    groups: Vec<GroupLayout>,
+) -> Result<(), String> {
+    {
+        let mut c = state.store.config.lock().unwrap();
+        let known: HashSet<String> = c.conversations.iter().map(|c| c.id.clone()).collect();
+        config::apply_group_layout(&mut c.groups, &groups, &known);
     }
     state.store.save_config().map_err(|e| e.to_string())
 }
