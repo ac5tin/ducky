@@ -26,6 +26,14 @@ Rust 1.85+ required (`rust-version` in Cargo.toml). Linux builds need `webkit2gt
 - `src-tauri/src/commands.rs` — the ~40-command Tauri command surface; frontend calls backend only through these.
 - `src-tauri/src/events.rs` — `BackendEvent` stream to the webview on `backend://event`.
 - `src-tauri/src/agent.rs` — chat loop: stream → tool calls → approvals → tool results; also subagents (`ducky__subagent` tool: parallel/nested runs via `RunScope`, depth-capped; spawns take an optional `agent` type resolving to a user-editable `SubagentConfig` in Settings — persona, optional model/effort overrides, enforced tool allowlists; defaults General-Purpose + Explore are seeded into config once — see `docs/superpowers/specs/2026-09-20-subagents-design.md` and `2026-09-21-subagent-definitions-design.md`).
+- Agent modes (`Default`/`ReadOnly`/`Plan`/`Auto`) are enforced by one predicate,
+  `mode_allows` in `agent.rs`: it filters the tool list the model sees *and* gates
+  `execute_tool`, so the two cannot disagree. The mode is read from the conversation
+  on every loop iteration, which is why a switch applies mid-turn. `ducky__present_plan`
+  and `ducky__set_mode` are "control tools": chat flow, main-scope only, and they skip
+  the approval gate. MCP tools are allowed in read-only modes only when the server sets
+  `readOnlyHint` — the one sanctioned exception to the untrusted-annotation posture, per
+  `docs/adr/0004-trust-mcp-readonly-hint-for-readonly-modes.md`.
 - `src-tauri/src/mcp/` — `manager.rs` (one rmcp client per server, caches, subscriptions), `handler.rs` (client capabilities: elicitation/sampling/roots), `bridge.rs` (interactive approvals ↔ UI events), `tests.rs`.
 - `src-tauri/src/providers/` — `openai.rs` + `anthropic.rs` adapters.
 - Also: `config.rs` (AppConfig + secrets), `oauth.rs` (OAuth 2.1 for remote MCP servers), `terminal.rs` (portable-pty), `builtin/` (built-in fs/html/web tools), `catalog.rs`, `title.rs`, `compact.rs` (`/compact` summarisation), `snapshot.rs` (hidden git repos backing `/undo` — see ADR-0002).

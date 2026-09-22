@@ -22,6 +22,11 @@ Built with **Rust + Tauri 2** for a small footprint and native performance.
 - **Full MCP 2026-07-28 support** — the newest protocol revision, implemented on the official [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk) SDK (Tier 1 conformance).
 - **Architecture decisions** — compatibility and maintenance decisions are recorded in [`docs/adr`](docs/adr/).
 - **Human in the loop** — every tool call asks before it runs (configurable), with plain-language approval cards.
+- **Agent modes** — Default, Read-only, Plan and Auto. Read-only and Plan block every
+  tool that is not marked read-only, including inside subagents; Plan makes the agent
+  research and present a plan you approve before it changes anything, and approval
+  returns the chat to Default. Auto lets the agent pick the mode itself. Switch from the
+  chat toolbar or with `Shift+Tab`.
 - **Multi-provider** — switch models mid-conversation. Local models (Ollama, LM Studio) work with no API key.
 - **Reasoning effort levels** — pick an effort per conversation straight from the model picker. Supported levels come from [models.dev](https://models.dev) (e.g. `low/high/max` for GLM‑5.3, `none…xhigh` for GPT‑5.x) and are mapped to each provider's native API: `reasoning_effort` (+ `thinking`) for OpenAI-compatible endpoints, extended-thinking budgets for Claude.
 - **Private by design** — API keys are stored in a `0600`-permission secrets file, never sent to the webview.

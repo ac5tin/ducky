@@ -663,9 +663,14 @@ export const useStore = create<StoreState>((set, get) => ({
     const id = get().activeConversationId;
     if (id) {
       // the cancel settles a pending plan review in the backend, so drop its
-      // card here too: `plans` is otherwise only cleared by a response
-      set((s) => ({ plans: s.plans.filter((p) => p.conversation_id !== id) }));
-      api.chatCancel(id).catch(() => {});
+      // card here once the cancel succeeded: `plans` is otherwise only cleared
+      // by a response, and on failure the card stays so Stop can be pressed again
+      api
+        .chatCancel(id)
+        .then(() =>
+          set((s) => ({ plans: s.plans.filter((p) => p.conversation_id !== id) })),
+        )
+        .catch(() => {});
     }
   },
 
