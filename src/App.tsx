@@ -8,6 +8,7 @@ import { Onboarding } from "./components/Onboarding";
 import { ElicitationModal } from "./components/modals/ElicitationModal";
 import { SamplingModal } from "./components/modals/SamplingModal";
 import { ApprovalModal } from "./components/modals/ApprovalModal";
+import { PlanModal } from "./components/modals/PlanModal";
 import { UpdateModal } from "./components/modals/UpdateModal";
 import { Toasts } from "./components/Toasts";
 import { Icon } from "./components/icons";
@@ -42,6 +43,7 @@ export default function App() {
 
       {/* Global interactive modals (MCP client features) */}
       <ApprovalModal />
+      <PlanModal />
       <ElicitationModal />
       <SamplingModal />
       <UpdateModal />
