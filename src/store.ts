@@ -455,6 +455,7 @@ export const useStore = create<StoreState>((set, get) => ({
       activeConversationId: null,
       draftModel: null,
       draftEffort: undefined,
+      draftMode: null,
       items: [],
       view: "chat",
     });
