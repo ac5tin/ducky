@@ -53,6 +53,7 @@ pub fn resolve_title_model(settings: &AppSettings, chat: &ConversationMeta) -> T
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AgentMode;
 
     fn chat() -> ConversationMeta {
         ConversationMeta {
@@ -62,6 +63,7 @@ mod tests {
             model: "chat-m".into(),
             effort: Some(EffortLevel::High),
             mcp_ids: None,
+            mode: AgentMode::Default,
             created_at: "t".into(),
             updated_at: "t".into(),
         }

@@ -184,6 +184,7 @@ fn test_agent(conversation_id: &str) -> (Arc<Agent>, Arc<CollectingSink>, Arc<St
             model: "mock-model".into(),
             effort: None,
             mcp_ids: None,
+            mode: crate::config::AgentMode::Default,
             created_at: now.clone(),
             updated_at: now,
         });

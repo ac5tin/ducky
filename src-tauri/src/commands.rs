@@ -417,6 +417,9 @@ pub async fn settings_set(
         if let Some(v) = settings.system_prompt {
             c.settings.system_prompt = v;
         }
+        if let Some(v) = settings.default_mode {
+            c.settings.default_mode = v;
+        }
     }
     state.store.save_config().map_err(|e| e.to_string())?;
 
@@ -466,6 +469,7 @@ pub struct AppSettingsPatch {
     pub update_mode: Option<config::UpdateMode>,
     pub update_check_interval_hours: Option<u32>,
     pub system_prompt: Option<String>,
+    pub default_mode: Option<config::AgentMode>,
 }
 
 #[tauri::command]
@@ -498,7 +502,10 @@ pub fn conversation_create(
     provider_id: String,
     model: String,
 ) -> ConversationMeta {
-    let effort = state.store.config.lock().unwrap().settings.default_effort;
+    let (effort, mode) = {
+        let cfg = state.store.config.lock().unwrap();
+        (cfg.settings.default_effort, cfg.settings.default_mode)
+    };
     let meta = ConversationMeta {
         id: uuid(),
         title: String::new(),
@@ -506,6 +513,7 @@ pub fn conversation_create(
         model,
         effort,
         mcp_ids: None,
+        mode,
         created_at: now(),
         updated_at: now(),
     };

@@ -172,6 +172,23 @@ pub enum ApprovalMode {
     AutoApproveAll,
 }
 
+/// How much the agent may change. `Auto` lets the model pick between
+/// `Default`, `ReadOnly` and `Plan` with the `ducky__set_mode` tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentMode {
+    /// No restriction beyond the approval rules. The pre-modes behaviour.
+    #[default]
+    Default,
+    /// Only tools that do not change the workspace or remote state.
+    #[serde(rename = "readonly")]
+    ReadOnly,
+    /// Read-only research, then a plan the user must approve.
+    Plan,
+    /// Starts as `Default`; the model may switch to `ReadOnly` or `Plan`.
+    Auto,
+}
+
 /// Sampling request policy (a server asking Ducky's model for help).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -280,6 +297,10 @@ pub struct AppSettings {
     /// Empty or whitespace means none.
     #[serde(default)]
     pub system_prompt: String,
+    /// Mode new chats start in. `conversation_create` copies it into the new
+    /// conversation, so changing it never affects existing chats.
+    #[serde(default)]
+    pub default_mode: AgentMode,
 }
 
 impl Default for AppSettings {
@@ -303,6 +324,7 @@ impl Default for AppSettings {
             update_mode: UpdateMode::Prompt,
             update_check_interval_hours: default_update_check_interval_hours(),
             system_prompt: String::new(),
+            default_mode: AgentMode::Default,
         }
     }
 }
@@ -342,6 +364,10 @@ pub struct ConversationMeta {
     /// MCP servers this chat may use. None = all globally enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_ids: Option<Vec<String>>,
+    /// How much the agent may change in this chat. Read fresh on every agent
+    /// loop iteration, so a switch applies to the next round trip.
+    #[serde(default)]
+    pub mode: AgentMode,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -1204,6 +1230,7 @@ mod tests {
             model: "m".into(),
             effort: Some(EffortLevel::High),
             mcp_ids: None,
+            mode: AgentMode::Default,
             created_at: "t".into(),
             updated_at: "t".into(),
         };
@@ -1248,6 +1275,7 @@ mod tests {
             model: "m".into(),
             effort: None,
             mcp_ids: None,
+            mode: AgentMode::Default,
             created_at: "t".into(),
             updated_at: "t".into(),
         };
@@ -1275,6 +1303,7 @@ mod tests {
             model: "m".into(),
             effort: None,
             mcp_ids: None,
+            mode: AgentMode::Default,
             created_at: "t".into(),
             updated_at: "t".into(),
         };
@@ -1301,6 +1330,7 @@ mod tests {
             model: "m".into(),
             effort: None,
             mcp_ids: None,
+            mode: AgentMode::Default,
             created_at: "t".into(),
             updated_at: "t".into(),
         };
@@ -1335,6 +1365,7 @@ mod tests {
             model: "m".into(),
             effort: None,
             mcp_ids: None,
+            mode: AgentMode::Default,
             created_at: "t".into(),
             updated_at: "t".into(),
         };
@@ -1398,6 +1429,35 @@ mod tests {
         assert_eq!(cfg.settings.title_provider_id, None);
         assert_eq!(cfg.settings.title_model, None);
         assert_eq!(cfg.settings.title_effort, None);
+    }
+
+    #[test]
+    fn config_without_mode_fields_defaults() {
+        // old config.json files predate the modes
+        let json = r#"{
+            "version": 1,
+            "settings": {
+                "theme": "dark",
+                "tool_approval": "always_ask",
+                "sampling": "ask",
+                "tool_rules": {},
+                "roots": [],
+                "max_tool_iterations": 25,
+                "show_reasoning": false
+            }
+        }"#;
+        let cfg: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.settings.default_mode, AgentMode::Default);
+        // old transcripts have no mode either
+        assert_eq!(parse_chat("").mode, AgentMode::Default);
+    }
+
+    #[test]
+    fn agent_mode_serialises_snake_case() {
+        assert_eq!(
+            serde_json::to_value(AgentMode::ReadOnly).unwrap(),
+            serde_json::json!("readonly")
+        );
     }
 
     #[test]
