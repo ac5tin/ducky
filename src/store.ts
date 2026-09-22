@@ -12,11 +12,13 @@ import {
 } from "./subagents";
 import { dispatchTerminalEvent } from "./terminalBus";
 import type {
+  AgentMode,
   AppConfig,
   AuthReason,
   BackendEvent,
   ConnectorSuggestion,
   EffortLevel,
+  PlanRequest,
   ProviderConfig,
   ProviderPreset,
   RawMessage,
@@ -159,6 +161,8 @@ interface StoreState {
   /** Effort staged on the draft page; undefined = untouched (creation seeds
    * settings.default_effort), null = explicit "Default". */
   draftEffort: EffortLevel | null | undefined;
+  /** Mode staged on the draft page; null = the app default applies. */
+  draftMode: AgentMode | null;
   items: ChatItem[];
   streaming: boolean;
   busyConversationIds: Set<string>;
@@ -178,6 +182,7 @@ interface StoreState {
   terminalHeight: number;
 
   approvals: ApprovalRequest[];
+  plans: PlanRequest[];
   elicitations: ElicitationRequest[];
   samplings: SamplingRequest[];
   toasts: Toast[];
@@ -206,6 +211,8 @@ interface StoreState {
   cancelTitle: (id: string) => Promise<void>;
   setActiveModel: (providerId: string, model: string) => Promise<void>;
   setActiveEffort: (effort: EffortLevel | null) => Promise<void>;
+  /** Set the mode for the active chat, or stage it on the draft page. */
+  setMode: (mode: AgentMode) => Promise<void>;
   setActiveMcpIds: (mcpIds: string[] | null) => Promise<void>;
 
   send: (text: string) => Promise<void>;
@@ -225,6 +232,11 @@ interface StoreState {
   respondApproval: (
     requestId: string,
     decision: "allow_once" | "always_allow" | "deny",
+  ) => Promise<void>;
+  respondPlan: (
+    requestId: string,
+    decision: "approve" | "revise",
+    feedback?: string,
   ) => Promise<void>;
   respondElicitation: (
     requestId: string,
@@ -309,6 +321,7 @@ export const useStore = create<StoreState>((set, get) => ({
   activeConversationId: null,
   draftModel: null,
   draftEffort: undefined,
+  draftMode: null,
   items: [],
   streaming: false,
   busyConversationIds: new Set(),
@@ -322,6 +335,7 @@ export const useStore = create<StoreState>((set, get) => ({
   terminalHeight: 300,
 
   approvals: [],
+  plans: [],
   elicitations: [],
   samplings: [],
   toasts: [],
@@ -516,6 +530,17 @@ export const useStore = create<StoreState>((set, get) => ({
     await get().refreshConfig();
   },
 
+  async setMode(mode) {
+    const id = get().activeConversationId;
+    if (!id) {
+      // the draft page stages the pick; the chat is created with it
+      set({ draftMode: mode });
+      return;
+    }
+    await api.conversationSetMode(id, mode);
+    await get().refreshConfig();
+  },
+
   async setActiveMcpIds(mcpIds) {
     const id = get().activeConversationId;
     if (!id) return;
@@ -610,7 +635,12 @@ export const useStore = create<StoreState>((set, get) => ({
           // non-fatal: the chat proceeds with the default effort if this fails
           await api.conversationSetEffort(meta.id, draftEffort).catch(() => {});
         }
-        set({ draftModel: null, draftEffort: undefined });
+        const { draftMode } = get();
+        if (draftMode) {
+          // non-fatal: the chat keeps the app default if this fails
+          await api.conversationSetMode(meta.id, draftMode).catch(() => {});
+        }
+        set({ draftModel: null, draftEffort: undefined, draftMode: null });
         await get().refreshConfig();
         id = meta.id;
       } catch (e) {
@@ -729,6 +759,11 @@ export const useStore = create<StoreState>((set, get) => ({
       approvals: s.approvals.filter((a) => a.request_id !== requestId),
     }));
     await api.approvalRespond(requestId, decision);
+  },
+
+  async respondPlan(requestId, decision, feedback) {
+    set((s) => ({ plans: s.plans.filter((p) => p.request_id !== requestId) }));
+    await api.planRespond(requestId, decision, feedback);
   },
 
   async respondElicitation(requestId, action, content) {
@@ -1213,6 +1248,33 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
             read_only_hint: event.read_only_hint,
           },
         ],
+      }));
+      break;
+    }
+    case "plan_presented": {
+      set((s) => ({
+        plans: [
+          ...s.plans,
+          {
+            request_id: event.request_id,
+            conversation_id: event.conversation_id ?? null,
+            plan: event.plan,
+          },
+        ],
+      }));
+      break;
+    }
+    case "mode_changed": {
+      // in place: the backend already persisted it, so no config reload
+      set((s) => ({
+        config: s.config
+          ? {
+              ...s.config,
+              conversations: s.config.conversations.map((c) =>
+                c.id === event.conversation_id ? { ...c, mode: event.mode } : c,
+              ),
+            }
+          : s.config,
       }));
       break;
     }

@@ -6,10 +6,12 @@ import {
   filterCommands,
   type SlashCommand,
 } from "../../slashCommands";
+import { nextMode, resolveShownMode } from "../../modes";
 import { Icon } from "../icons";
 import { Markdown } from "../Markdown";
 import { ToolCallCard } from "./ToolCallCard";
 import { ModelPicker } from "./ModelPicker";
+import { ModePicker } from "./ModePicker";
 import { WorkingDirChip } from "./WorkingDirChip";
 import { SlashCommandMenu } from "./SlashCommandMenu";
 import { TerminalPanel } from "./TerminalPanel";
@@ -90,6 +92,7 @@ export function ChatView() {
         <div className="flex min-w-0 items-center gap-1">
           <ModelPicker />
           <WorkingDirChip />
+          <ModePicker />
           <button
             className={`rounded-lg p-1.5 transition ${
               terminalOpen
@@ -380,6 +383,9 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
   const send = useStore((s) => s.send);
   const stop = useStore((s) => s.stop);
   const activeId = useStore((s) => s.activeConversationId);
+  const config = useStore((s) => s.config);
+  const draftMode = useStore((s) => s.draftMode);
+  const setMode = useStore((s) => s.setMode);
   const streaming = useStore(
     (s) =>
       !!s.activeConversationId &&
@@ -444,6 +450,12 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
     send(t).catch((e) => console.error(e));
   };
 
+  const cycleMode = () => {
+    const conversation = config?.conversations.find((c) => c.id === activeId);
+    const next = nextMode(resolveShownMode(conversation, draftMode, config));
+    setMode(next).catch(() => {});
+  };
+
   return (
     <div className="border-t border-slate-200 bg-white/80 px-5 py-3.5 backdrop-blur dark:border-slate-800 dark:bg-slate-950/70">
       <div className="relative mx-auto flex max-w-3xl items-end gap-2">
@@ -485,6 +497,13 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
                 e.currentTarget.style.height = `${Math.min(e.currentTarget.scrollHeight, 160)}px`;
               }}
               onKeyDown={(e) => {
+                if (e.key === "Tab" && e.shiftKey) {
+                  // Shift+Tab cycles the agent mode, before the slash menu's
+                  // plain-Tab completion below
+                  e.preventDefault();
+                  cycleMode();
+                  return;
+                }
                 if (menuOpen && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
                   e.preventDefault();
                   const step = e.key === "ArrowDown" ? 1 : slashMatches.length - 1;
@@ -572,6 +591,7 @@ function EmptyState() {
         <div className="mb-2 flex items-center justify-center gap-1">
           <ModelPicker dropUp />
           <WorkingDirChip />
+          <ModePicker dropUp />
         </div>
         <Composer autoFocus />
       </div>
