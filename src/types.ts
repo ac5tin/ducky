@@ -135,6 +135,23 @@ export interface SubagentConfig {
         created_at: string;
 }
 
+/** A named, coloured group of chats. `conversation_ids` is both the member
+ *  list and its display order — a chat belongs to the group that lists it. */
+export interface ChatGroup {
+        id: string;
+        title: string;
+        collapsed: boolean;
+        /** Dot colour as `#rrggbb`, lowercase. */
+        color: string;
+        conversation_ids: string[];
+}
+
+/** The order-only payload for `group_apply_layout`. */
+export interface GroupLayout {
+        id: string;
+        conversation_ids: string[];
+}
+
 export interface AppConfig {
         version: number;
         onboarding_complete: boolean;
@@ -145,6 +162,7 @@ export interface AppConfig {
         subagents_seeded: boolean;
         settings: AppSettings;
         conversations: ConversationMeta[];
+        groups: ChatGroup[];
 }
 
 export interface ProviderPreset {

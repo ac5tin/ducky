@@ -5,9 +5,11 @@ import type {
   AgentMode,
   AppConfig,
   BackendEvent,
+  ChatGroup,
   ConnectorSuggestion,
   ConversationMeta,
   EffortLevel,
+  GroupLayout,
   McpServerConfig,
   ToolDetailsMode,
   ProviderConfig,
@@ -128,8 +130,11 @@ export const subagentRestoreDefaults = () =>
 // Conversations & chat
 // ---------------------------------------------------------------------------
 
-export const conversationCreate = (providerId: string, model: string) =>
-  invoke<ConversationMeta>("conversation_create", { providerId, model });
+export const conversationCreate = (
+  providerId: string,
+  model: string,
+  groupId?: string | null,
+) => invoke<ConversationMeta>("conversation_create", { providerId, model, groupId });
 
 export const conversationDelete = (id: string) =>
   invoke<void>("conversation_delete", { id });
@@ -157,6 +162,23 @@ export const conversationSetMode = (id: string, mode: AgentMode) =>
 
 export const conversationSetMcpIds = (id: string, mcpIds: string[] | null) =>
   invoke<void>("conversation_set_mcp_ids", { id, mcpIds });
+
+export const groupCreate = (title?: string) =>
+  invoke<ChatGroup>("group_create", { title: title ?? null });
+
+export const groupRename = (id: string, title: string) =>
+  invoke<void>("group_rename", { id, title });
+
+export const groupSetCollapsed = (id: string, collapsed: boolean) =>
+  invoke<void>("group_set_collapsed", { id, collapsed });
+
+export const groupSetColor = (id: string, color: string) =>
+  invoke<void>("group_set_color", { id, color });
+
+export const groupDelete = (id: string) => invoke<void>("group_delete", { id });
+
+export const groupApplyLayout = (groups: GroupLayout[]) =>
+  invoke<void>("group_apply_layout", { groups });
 
 /** Effort levels the model supports per models.dev; empty = hide the selector. */
 export const effortLevels = (kind: string, model: string) =>
