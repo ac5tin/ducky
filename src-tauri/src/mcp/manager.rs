@@ -1568,3 +1568,30 @@ pub fn content_to_text(content: &[ContentBlock]) -> String {
         parts.join("\n")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The one place a server tool's `readOnlyHint` becomes the input the mode
+    /// gate and the offered list both read: `Some(true)` is what lets a
+    /// read-only mode offer and run that tool (ADR-0004). An explicit `false`
+    /// and an absent hint must both stay untrusted, so pin the derivation.
+    #[test]
+    fn tool_entry_takes_the_read_only_hint_from_the_annotations() {
+        let schema: Arc<serde_json::Map<String, serde_json::Value>> = serde_json::Map::new().into();
+        let entry = |hint: Option<bool>| {
+            let mut tool = Tool::new("read_thing", "Read a thing", schema.clone());
+            if let Some(hint) = hint {
+                tool = tool.with_annotations(rmcp::model::ToolAnnotations::new().read_only(hint));
+            }
+            tool_entry("srv", "srv", tool)
+        };
+
+        let trusted = entry(Some(true));
+        assert_eq!(trusted.read_only_hint, Some(true));
+        assert_eq!(trusted.qualified_name, "srv__read_thing");
+        assert_eq!(entry(Some(false)).read_only_hint, Some(false));
+        assert_eq!(entry(None).read_only_hint, None);
+    }
+}

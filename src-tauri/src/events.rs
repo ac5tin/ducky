@@ -188,3 +188,33 @@ impl EventSink for CollectingSink {
         self.events.lock().unwrap().push(event);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The wire shape of the two mode events is the contract with
+    /// `src/types.ts`. `plan_presented` must keep `conversation_id` even when
+    /// it is null — a `skip_serializing_if` there would break the frontend's
+    /// "is this my conversation" check silently.
+    #[test]
+    fn plan_and_mode_events_have_the_expected_wire_shape() {
+        let plan = serde_json::to_value(BackendEvent::PlanPresented {
+            request_id: "r1".to_string(),
+            conversation_id: None,
+            plan: "the plan".to_string(),
+        })
+        .unwrap();
+        assert_eq!(plan["type"], "plan_presented");
+        assert!(plan.get("conversation_id").is_some(), "{plan}");
+        assert!(plan["conversation_id"].is_null(), "{plan}");
+
+        let mode = serde_json::to_value(BackendEvent::ModeChanged {
+            conversation_id: "c1".to_string(),
+            mode: AgentMode::ReadOnly,
+        })
+        .unwrap();
+        assert_eq!(mode["type"], "mode_changed");
+        assert_eq!(mode["mode"], "readonly");
+    }
+}

@@ -566,9 +566,11 @@ impl Agent {
     }
 
     /// `ducky__set_mode`: the auto-mode tool. The model may enter plan or
-    /// read-only mode, and return to default from read-only. It can never
-    /// leave plan mode — that needs the user's approval of a plan, or the
-    /// user switching the mode themselves.
+    /// read-only mode, and return to default only from a read-only *it* chose
+    /// itself — the user's own read-only is not retractable (the origin
+    /// condition lives in `mode_allows_in_conversation`). It can never leave
+    /// plan mode — that needs the user's approval of a plan, or the user
+    /// switching the mode themselves.
     async fn set_mode_tool(
         &self,
         conversation_id: &str,

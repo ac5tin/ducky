@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useStore } from "../../store";
 import { MODE_META, MODE_ORDER, resolveShownMode } from "../../modes";
 import type { AgentMode } from "../../types";
@@ -17,6 +17,15 @@ export function ModePicker({ dropUp = false }: { dropUp?: boolean }) {
   const mode = resolveShownMode(conversation, draftMode, config);
   const meta = MODE_META[mode];
 
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open]);
+
   const choose = (next: AgentMode) => {
     setOpen(false);
     setMode(next).catch((e) => toast("error", `${e}`));
@@ -27,6 +36,8 @@ export function ModePicker({ dropUp = false }: { dropUp?: boolean }) {
       <button
         className="flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-sm font-medium transition hover:bg-slate-100 dark:hover:bg-slate-800"
         onClick={() => setOpen(!open)}
+        aria-expanded={open}
+        aria-haspopup="true"
         title={meta.description}
       >
         <Icon name={meta.icon} className="h-3.5 w-3.5 text-slate-400" />

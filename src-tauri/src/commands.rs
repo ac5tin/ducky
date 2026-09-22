@@ -1573,6 +1573,17 @@ mod tests {
     }
 
     #[test]
+    fn default_mode_patch_deserializes() {
+        // absent keeps the current mode
+        let keep: AppSettingsPatch = serde_json::from_str("{}").unwrap();
+        assert_eq!(keep.default_mode, None);
+
+        let set: AppSettingsPatch =
+            serde_json::from_str(r#"{"default_mode": "readonly"}"#).unwrap();
+        assert_eq!(set.default_mode, Some(config::AgentMode::ReadOnly));
+    }
+
+    #[test]
     fn update_settings_patch_deserializes() {
         let keep: AppSettingsPatch = serde_json::from_str("{}").unwrap();
         assert_eq!(keep.update_mode, None);

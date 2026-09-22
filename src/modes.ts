@@ -52,7 +52,8 @@ export function resolveShownMode(
   draftMode: AgentMode | null,
   config: AppConfig | null,
 ): AgentMode {
-  if (conversation) return conversation.mode;
-  if (draftMode) return draftMode;
-  return config?.settings.default_mode ?? "default";
+  const mode = conversation?.mode ?? draftMode ?? config?.settings.default_mode;
+  // a hand-edited config can name a mode this build does not know: degrade to
+  // the default instead of dereferencing undefined MODE_META entries
+  return mode && MODE_META[mode] ? mode : "default";
 }

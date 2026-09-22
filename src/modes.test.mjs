@@ -40,3 +40,13 @@ test("resolveShownMode prefers the conversation, then the draft, then the app de
   assert.equal(resolveShownMode(undefined, null, config), "auto");
   assert.equal(resolveShownMode(undefined, null, null), "default");
 });
+
+test("resolveShownMode degrades a mode it does not know", () => {
+  // a hand-edited config can carry a value outside the four modes
+  assert.equal(resolveShownMode({ mode: "yolo" }, null, null), "default");
+  assert.equal(resolveShownMode(undefined, "yolo", null), "default");
+  assert.equal(
+    resolveShownMode(undefined, null, { settings: { default_mode: "yolo" } }),
+    "default",
+  );
+});

@@ -1033,6 +1033,8 @@ async fn effective_mode_falls_back_to_the_app_default() {
     store.config.lock().unwrap().settings.default_mode = AgentMode::Auto;
     // an unknown conversation uses the app default
     assert_eq!(agent.effective_mode("nope"), AgentMode::Auto);
+    // ...but the conversation's own mode wins over it
+    assert_eq!(agent.effective_mode("m4-conv"), AgentMode::Default);
 }
 
 // ---------------------------------------------------------------------------
@@ -1124,6 +1126,8 @@ async fn mode_text_reaches_the_model_and_default_adds_none() {
     assert!(!system.contains("# Plan mode"), "{system}");
     assert!(!system.contains("# Read-only mode"), "{system}");
     assert!(!system.contains("# Auto mode"), "{system}");
+    // no stray separator either: the block is skipped, not appended empty
+    assert!(!system.ends_with('\n'), "{system}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1330,13 +1334,11 @@ async fn auto_mode_can_switch_into_plan_mode() {
     assert!(names.contains(&"ducky__present_plan".to_string()), "{names:?}");
     assert!(!names.contains(&"ducky__fs_write".to_string()), "{names:?}");
     assert!(!names.contains(&"ducky__set_mode".to_string()), "{names:?}");
-    // the tool is not approval-gated: it is chat flow
-    assert!(!sink
-        .events
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|e| matches!(e, BackendEvent::ApprovalRequested { .. })));
+    // the tool is chat flow: no consent prompt is raised, so no pending_approval
+    // card is emitted for it before the gate would have asked
+    assert!(!tool_cards(&sink).iter().any(|(s, t, _, _)| {
+        s == "pending_approval" && t.as_deref() == Some("ducky__set_mode")
+    }));
 }
 
 #[tokio::test]
@@ -1363,6 +1365,12 @@ async fn auto_mode_can_go_read_only_and_come_back() {
     assert!(!captures_for("s2-main")[1]
         .tool_names
         .contains(&"ducky__fs_write".to_string()));
+    // round 2 still offered the way back out: the offered list must read the
+    // same permit as the gate, or the model is trapped in the read-only mode
+    // it chose itself
+    assert!(captures_for("s2-main")[1]
+        .tool_names
+        .contains(&"ducky__set_mode".to_string()));
     assert!(captures_for("s2-main")[2]
         .tool_names
         .contains(&"ducky__fs_write".to_string()));
