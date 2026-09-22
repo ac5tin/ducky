@@ -7,6 +7,7 @@ import type {
   ProviderConfig,
   SubagentConfig,
 } from "../../types";
+import { MODE_META, MODE_ORDER } from "../../modes";
 import { Button, Field, Modal, inputClass } from "../modals/Modal";
 import { Icon } from "../icons";
 import {
@@ -216,6 +217,43 @@ export function SettingsView() {
               </div>
             </div>
           )}
+        </Section>
+
+        {/* Agent mode */}
+        <Section
+          title="Agent mode"
+          description="How much freedom new chats start with. You can change it per chat from the toolbar, or with Shift+Tab in the message box."
+        >
+          <div className="space-y-2">
+            {MODE_ORDER.map((value) => (
+              <label
+                key={value}
+                className={`flex cursor-pointer items-start gap-3 rounded-xl border p-3.5 transition ${
+                  settings.default_mode === value
+                    ? "border-sky-500 bg-sky-50/60 dark:bg-sky-950/30"
+                    : "border-slate-200 dark:border-slate-700"
+                }`}
+              >
+                <input
+                  type="radio"
+                  className="mt-1"
+                  checked={settings.default_mode === value}
+                  onChange={() =>
+                    patch({ default_mode: value }).catch((e) => toast("error", `${e}`))
+                  }
+                />
+                <span>
+                  <span className="block text-sm font-medium">{MODE_META[value].label}</span>
+                  <span className="text-xs text-slate-400">{MODE_META[value].description}</span>
+                </span>
+              </label>
+            ))}
+          </div>
+          <p className="mt-3 text-xs text-slate-400">
+            Read-only and Plan allow MCP tools that the server marks read-only, and a server's
+            own mark is trusted as given — it is the server's promise, not a guarantee Ducky
+            can enforce.
+          </p>
         </Section>
 
         {/* System prompt */}
