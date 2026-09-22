@@ -89,7 +89,6 @@ fn tool_allowed(allow: &[String], server_id: &str, qualified_name: &str) -> bool
 /// `readOnlyHint` for server tools; an absent hint is not read-only. Trusting
 /// that hint here is the one sanctioned exception to the untrusted-annotation
 /// posture — see `docs/adr/0004-trust-mcp-readonly-hint-for-readonly-modes.md`.
-#[allow(dead_code)] // called by the tool-list filter and the execution gate (next changes)
 pub(crate) fn mode_allows(mode: AgentMode, qualified_name: &str, read_only: bool) -> bool {
     match qualified_name {
         // control tools are chat flow: offer them only where they mean something
@@ -107,7 +106,6 @@ pub(crate) fn mode_allows(mode: AgentMode, qualified_name: &str, read_only: bool
 
 /// The tool-result text for a call the mode gate refused. It names the active
 /// mode and the way forward, because the model sees only this text.
-#[allow(dead_code)] // called by the execution gate's denial path (next changes)
 pub(crate) fn mode_denial(mode: AgentMode, qualified_name: &str) -> String {
     match qualified_name {
         crate::builtin::SET_MODE => {
@@ -353,6 +351,18 @@ impl Agent {
         ))
     }
 
+    /// The mode in force for a conversation right now. Read fresh on every
+    /// loop iteration so a switch — by the user or by `ducky__set_mode` —
+    /// applies to the next round trip without restarting the turn.
+    pub(crate) fn effective_mode(&self, conversation_id: &str) -> AgentMode {
+        let cfg = self.store.config.lock().unwrap();
+        cfg.conversations
+            .iter()
+            .find(|c| c.id == conversation_id)
+            .map(|c| c.mode)
+            .unwrap_or(cfg.settings.default_mode)
+    }
+
     /// Resolve a qualified tool name to its server + raw tool entry. Builtins
     /// are checked first so a user server can't shadow or spoof them.
     fn resolve_tool(
@@ -522,6 +532,7 @@ impl Agent {
                     .cloned()
             };
             let tool_filter = scope.tool_allowlist();
+            let mode = self.effective_mode(conversation_id);
             let mut tools: Vec<ToolDef> = self
                 .manager
                 .aggregated_tools()
@@ -536,6 +547,9 @@ impl Agent {
                     tool_filter
                         .map(|a| tool_allowed(a, &t.server_id, &t.qualified_name))
                         .unwrap_or(true)
+                })
+                .filter(|t| {
+                    mode_allows(mode, &t.qualified_name, t.read_only_hint == Some(true))
                 })
                 .map(|t| ToolDef {
                     name: t.qualified_name.clone(),
@@ -554,6 +568,14 @@ impl Agent {
             if let Some(a) = tool_filter {
                 builtin_defs.retain(|t| tool_allowed(a, crate::builtin::SERVER_ID, &t.name));
             }
+            // the mode gate, and control tools for the main conversation only
+            builtin_defs.retain(|t| {
+                let read_only = crate::builtin::lookup(&t.name)
+                    .map(|b| b.read_only)
+                    .unwrap_or(false);
+                mode_allows(mode, &t.name, read_only)
+                    && (scope.is_main() || !crate::builtin::is_control(&t.name))
+            });
             tools.extend(builtin_defs);
 
             // Stream one assistant turn. The provider sees a snapshot of the

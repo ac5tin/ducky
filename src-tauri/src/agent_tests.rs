@@ -169,13 +169,49 @@ impl LlmProvider for MockProvider {
 // ---------------------------------------------------------------------------
 
 fn test_agent(conversation_id: &str) -> (Arc<Agent>, Arc<CollectingSink>, Arc<Store>) {
+    let (agent, sink, store, _dir) = test_agent_full(conversation_id, AgentMode::Default, false);
+    (agent, sink, store)
+}
+
+/// An agent whose conversation starts in the given mode.
+fn test_agent_in_mode(
+    conversation_id: &str,
+    mode: AgentMode,
+) -> (Arc<Agent>, Arc<CollectingSink>, Arc<Store>) {
+    let (agent, sink, store, _dir) = test_agent_full(conversation_id, mode, false);
+    (agent, sink, store)
+}
+
+/// An agent whose working directory is its own tempdir and that returns that
+/// directory, so tests can prove whether a file was actually written.
+fn test_agent_in_dir(
+    conversation_id: &str,
+    mode: AgentMode,
+) -> (Arc<Agent>, Arc<CollectingSink>, Arc<Store>, std::path::PathBuf) {
+    test_agent_full(conversation_id, mode, true)
+}
+
+fn test_agent_full(
+    conversation_id: &str,
+    mode: AgentMode,
+    own_working_dir: bool,
+) -> (
+    Arc<Agent>,
+    Arc<CollectingSink>,
+    Arc<Store>,
+    std::path::PathBuf,
+) {
     let tmp = tempfile::tempdir().unwrap();
-    let store = Arc::new(Store::new(tmp.path(), tmp.path().to_path_buf()).unwrap());
+    let dir = tmp.path().to_path_buf();
+    let store = Arc::new(Store::new(tmp.path(), dir.clone()).unwrap());
     // keep the tempdir alive by leaking in test scope
     std::mem::forget(tmp);
     {
         let mut cfg = store.config.lock().unwrap();
         cfg.settings.tool_approval = ApprovalMode::AutoApproveAll;
+        if own_working_dir {
+            cfg.settings.working_dir = Some(dir.to_string_lossy().into_owned());
+        }
         let now = chrono::Utc::now().to_rfc3339();
         cfg.conversations.push(ConversationMeta {
             id: conversation_id.to_string(),
@@ -184,7 +220,7 @@ fn test_agent(conversation_id: &str) -> (Arc<Agent>, Arc<CollectingSink>, Arc<St
             model: "mock-model".into(),
             effort: None,
             mcp_ids: None,
-            mode: crate::config::AgentMode::Default,
+            mode,
             created_at: now.clone(),
             updated_at: now,
         });
@@ -198,7 +234,7 @@ fn test_agent(conversation_id: &str) -> (Arc<Agent>, Arc<CollectingSink>, Arc<St
         bridge,
         sink: sink.clone(),
     });
-    (agent, sink, store)
+    (agent, sink, store, dir)
 }
 
 async fn run(agent: &Agent, conversation_id: &str, prompt: &str, ct: &CancellationToken) {
@@ -868,4 +904,58 @@ fn mode_denial_names_the_mode_and_the_way_out() {
     assert!(plan.contains("ducky__present_plan"), "{plan}");
     assert!(mode_denial(AgentMode::Plan, "ducky__set_mode").contains("auto mode"));
     assert!(mode_denial(AgentMode::Default, "ducky__present_plan").contains("plan mode"));
+}
+
+// ---------------------------------------------------------------------------
+// Mode filtering of the offered tool list
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn read_only_mode_hides_mutating_tools() {
+    script("m1-main", vec![MockRound::Text("done".into())]);
+    let (agent, _sink, _store, _dir) = test_agent_in_dir("m1-conv", AgentMode::ReadOnly);
+    run(&agent, "m1-conv", "m1-main", &CancellationToken::new()).await;
+
+    let names = captures_for("m1-main")[0].tool_names.clone();
+    assert!(names.contains(&"ducky__fs_read".to_string()), "{names:?}");
+    assert!(names.contains(&"ducky__fs_search".to_string()), "{names:?}");
+    // the subagent tool stays: its children inherit this mode
+    assert!(names.contains(&SUBAGENT.to_string()), "{names:?}");
+    assert!(!names.contains(&"ducky__fs_write".to_string()), "{names:?}");
+    assert!(!names.contains(&"ducky__fs_mkdir".to_string()), "{names:?}");
+    assert!(!names.contains(&"ducky__set_mode".to_string()), "{names:?}");
+    assert!(!names.contains(&"ducky__present_plan".to_string()), "{names:?}");
+}
+
+#[tokio::test]
+async fn plan_mode_offers_the_plan_tool_only() {
+    script("m2-main", vec![MockRound::Text("done".into())]);
+    let (agent, _sink, _store) = test_agent_in_mode("m2-conv", AgentMode::Plan);
+    run(&agent, "m2-conv", "m2-main", &CancellationToken::new()).await;
+
+    let names = captures_for("m2-main")[0].tool_names.clone();
+    assert!(names.contains(&"ducky__present_plan".to_string()), "{names:?}");
+    assert!(!names.contains(&"ducky__fs_write".to_string()), "{names:?}");
+    assert!(!names.contains(&"ducky__set_mode".to_string()), "{names:?}");
+}
+
+#[tokio::test]
+async fn auto_mode_offers_the_mode_tool_and_writes() {
+    script("m3b-main", vec![MockRound::Text("done".into())]);
+    let (agent, _sink, _store) = test_agent_in_mode("m3b-conv", AgentMode::Auto);
+    run(&agent, "m3b-conv", "m3b-main", &CancellationToken::new()).await;
+
+    let names = captures_for("m3b-main")[0].tool_names.clone();
+    assert!(names.contains(&"ducky__set_mode".to_string()), "{names:?}");
+    assert!(names.contains(&"ducky__fs_write".to_string()), "{names:?}");
+    assert!(!names.contains(&"ducky__present_plan".to_string()), "{names:?}");
+}
+
+#[tokio::test]
+async fn effective_mode_falls_back_to_the_app_default() {
+    let (agent, _sink, store) = test_agent("m4-conv");
+    assert_eq!(agent.effective_mode("m4-conv"), AgentMode::Default);
+    store.config.lock().unwrap().settings.default_mode = AgentMode::Auto;
+    // an unknown conversation uses the app default
+    assert_eq!(agent.effective_mode("nope"), AgentMode::Auto);
 }
