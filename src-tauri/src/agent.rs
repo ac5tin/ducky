@@ -1259,6 +1259,22 @@ impl Agent {
             }
         }
 
+        // the mode gate: a call the mode does not permit is refused here,
+        // before any consent prompt — a mode is a capability limit, not a
+        // question for the user
+        let mode = self.effective_mode(conversation_id);
+        if !mode_allows(mode, &entry.qualified_name, entry.read_only_hint == Some(true)) {
+            let msg = mode_denial(mode, &entry.qualified_name);
+            self.emit_tool_update(
+                conversation_id,
+                &call.id,
+                "error",
+                serde_json::json!({ "tool": call.name, "result_text": msg, "is_error": true }),
+                parent,
+            );
+            return format!("Error: {msg}");
+        }
+
         self.emit_tool_update(
             conversation_id,
             &call.id,

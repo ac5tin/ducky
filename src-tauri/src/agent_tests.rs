@@ -959,3 +959,63 @@ async fn effective_mode_falls_back_to_the_app_default() {
     // an unknown conversation uses the app default
     assert_eq!(agent.effective_mode("nope"), AgentMode::Auto);
 }
+
+// ---------------------------------------------------------------------------
+// Mode gate on execution
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn read_only_mode_refuses_a_forced_write() {
+    script(
+        "m5-main",
+        vec![
+            MockRound::Tools(vec![(
+                "ducky__fs_write".into(),
+                serde_json::json!({ "path": "forced.txt", "content": "nope" }),
+            )]),
+            MockRound::Text("stopped".into()),
+        ],
+    );
+    let (agent, sink, store, dir) = test_agent_in_dir("m5-conv", AgentMode::ReadOnly);
+    run(&agent, "m5-conv", "m5-main", &CancellationToken::new()).await;
+
+    // the file was never created, and the model was told why
+    assert!(!dir.join("forced.txt").exists());
+    let results = tool_results(&store, "m5-conv");
+    assert_eq!(results.len(), 1);
+    assert!(
+        results[0].contains("read-only mode is active"),
+        "{}",
+        results[0]
+    );
+    // it is an error card, and no approval was ever requested for it
+    assert!(tool_cards(&sink)
+        .iter()
+        .any(|(s, t, _, _)| s == "error" && t.as_deref() == Some("ducky__fs_write")));
+    assert!(!sink
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| matches!(e, BackendEvent::ApprovalRequested { .. })));
+}
+
+#[tokio::test]
+async fn default_mode_allows_the_same_write() {
+    // control for the test above: without the mode gate the write goes through,
+    // so the read-only test fails for the right reason
+    script(
+        "m6-main",
+        vec![
+            MockRound::Tools(vec![(
+                "ducky__fs_write".into(),
+                serde_json::json!({ "path": "allowed.txt", "content": "yes" }),
+            )]),
+            MockRound::Text("done".into()),
+        ],
+    );
+    let (agent, _sink, _store, dir) = test_agent_in_dir("m6-conv", AgentMode::Default);
+    run(&agent, "m6-conv", "m6-main", &CancellationToken::new()).await;
+
+    assert!(dir.join("allowed.txt").exists());
+}
