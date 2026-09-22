@@ -104,6 +104,24 @@ pub(crate) fn mode_allows(mode: AgentMode, qualified_name: &str, read_only: bool
     }
 }
 
+/// Whether a tool may be offered and executed, including the one narrow
+/// exemption from `mode_allows`: the agent may retract a read-only mode it
+/// switched itself into (auto mode), but never one the user chose.
+/// `mode_allows` itself is unchanged — this wrapper keeps the exemption in one
+/// auditable place while preserving "the tool list and the execution gate
+/// cannot disagree", because both call this.
+pub(crate) fn mode_allows_in_conversation(
+    mode: AgentMode,
+    qualified_name: &str,
+    read_only: bool,
+    auto_readonly: bool,
+) -> bool {
+    if auto_readonly && mode == AgentMode::ReadOnly && qualified_name == crate::builtin::SET_MODE {
+        return true;
+    }
+    mode_allows(mode, qualified_name, read_only)
+}
+
 /// The tool-result text for a call the mode gate refused. It names the active
 /// mode and the way forward, because the model sees only this text.
 pub(crate) fn mode_denial(mode: AgentMode, qualified_name: &str) -> String {
@@ -430,6 +448,17 @@ impl Agent {
             .unwrap_or(cfg.settings.default_mode)
     }
 
+    /// Whether this chat's read-only mode was the agent's own switch (Auto),
+    /// which only it may retract. Unknown conversations are not retractable.
+    fn auto_readonly(&self, conversation_id: &str) -> bool {
+        let cfg = self.store.config.lock().unwrap();
+        cfg.conversations
+            .iter()
+            .find(|c| c.id == conversation_id)
+            .map(|c| c.auto_readonly)
+            .unwrap_or(false)
+    }
+
     /// Write a conversation's mode and tell the UI. The next loop iteration
     /// reads it through `effective_mode`, so the switch applies immediately.
     fn set_conversation_mode(&self, conversation_id: &str, mode: AgentMode) {
@@ -442,7 +471,10 @@ impl Agent {
             if meta.mode == mode {
                 return;
             }
+            let from = meta.mode;
             meta.mode = mode;
+            // only the agent's own Auto -> ReadOnly switch is retractable
+            meta.auto_readonly = from == AgentMode::Auto && mode == AgentMode::ReadOnly;
         }
         let _ = self.store.save_config();
         self.sink.emit(BackendEvent::ModeChanged {
@@ -789,6 +821,7 @@ impl Agent {
             };
             let tool_filter = scope.tool_allowlist();
             let mode = self.effective_mode(conversation_id);
+            let auto_readonly = self.auto_readonly(conversation_id);
             let mut tools: Vec<ToolDef> = self
                 .manager
                 .aggregated_tools()
@@ -805,7 +838,12 @@ impl Agent {
                         .unwrap_or(true)
                 })
                 .filter(|t| {
-                    mode_allows(mode, &t.qualified_name, t.read_only_hint == Some(true))
+                    mode_allows_in_conversation(
+                        mode,
+                        &t.qualified_name,
+                        t.read_only_hint == Some(true),
+                        auto_readonly,
+                    )
                 })
                 .map(|t| ToolDef {
                     name: t.qualified_name.clone(),
@@ -829,7 +867,7 @@ impl Agent {
                 let read_only = crate::builtin::lookup(&t.name)
                     .map(|b| b.read_only)
                     .unwrap_or(false);
-                mode_allows(mode, &t.name, read_only)
+                mode_allows_in_conversation(mode, &t.name, read_only, auto_readonly)
                     && (scope.is_main() || !crate::builtin::is_control(&t.name))
             });
             tools.extend(builtin_defs);
@@ -1519,7 +1557,12 @@ impl Agent {
         // before any consent prompt — a mode is a capability limit, not a
         // question for the user
         let mode = self.effective_mode(conversation_id);
-        if !mode_allows(mode, &entry.qualified_name, entry.read_only_hint == Some(true)) {
+        if !mode_allows_in_conversation(
+            mode,
+            &entry.qualified_name,
+            entry.read_only_hint == Some(true),
+            self.auto_readonly(conversation_id),
+        ) {
             let msg = mode_denial(mode, &entry.qualified_name);
             self.emit_tool_update(
                 conversation_id,

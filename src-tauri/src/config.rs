@@ -368,6 +368,11 @@ pub struct ConversationMeta {
     /// loop iteration, so a switch applies to the next round trip.
     #[serde(default)]
     pub mode: AgentMode,
+    /// True while the agent's own switch in Auto mode is holding this chat
+    /// read-only, so it may retract it. A read-only mode the user picked keeps
+    /// this false and is never retractable by the model.
+    #[serde(default)]
+    pub auto_readonly: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -1231,6 +1236,7 @@ mod tests {
             effort: Some(EffortLevel::High),
             mcp_ids: None,
             mode: AgentMode::Default,
+            auto_readonly: false,
             created_at: "t".into(),
             updated_at: "t".into(),
         };
@@ -1276,6 +1282,7 @@ mod tests {
             effort: None,
             mcp_ids: None,
             mode: AgentMode::Default,
+            auto_readonly: false,
             created_at: "t".into(),
             updated_at: "t".into(),
         };
@@ -1304,6 +1311,7 @@ mod tests {
             effort: None,
             mcp_ids: None,
             mode: AgentMode::Default,
+            auto_readonly: false,
             created_at: "t".into(),
             updated_at: "t".into(),
         };
@@ -1331,6 +1339,7 @@ mod tests {
             effort: None,
             mcp_ids: None,
             mode: AgentMode::Default,
+            auto_readonly: false,
             created_at: "t".into(),
             updated_at: "t".into(),
         };
@@ -1366,6 +1375,7 @@ mod tests {
             effort: None,
             mcp_ids: None,
             mode: AgentMode::Default,
+            auto_readonly: false,
             created_at: "t".into(),
             updated_at: "t".into(),
         };

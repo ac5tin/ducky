@@ -221,6 +221,7 @@ fn test_agent_full(
             effort: None,
             mcp_ids: None,
             mode,
+            auto_readonly: false,
             created_at: now.clone(),
             updated_at: now,
         });
@@ -1464,4 +1465,32 @@ async fn control_tools_are_refused_inside_a_subagent() {
     assert_eq!(mode_of(&store, "s6-conv"), AgentMode::Auto);
     assert!(mode_events(&sink).is_empty());
     assert!(plan_events(&sink).is_empty());
+}
+
+#[tokio::test]
+async fn the_model_cannot_retract_a_read_only_the_user_chose() {
+    // the user put this chat in ReadOnly themselves: the agent's mode tool must
+    // neither be offered nor permitted, so a forced call is refused by the gate
+    script(
+        "s7-main",
+        vec![
+            MockRound::Tools(vec![(
+                "ducky__set_mode".into(),
+                serde_json::json!({ "mode": "default", "reason": "widening" }),
+            )]),
+            MockRound::Text("done".into()),
+        ],
+    );
+    let (agent, _sink, store) = test_agent_in_mode("s7-conv", AgentMode::ReadOnly);
+    run(&agent, "s7-conv", "s7-main", &CancellationToken::new()).await;
+
+    assert_eq!(mode_of(&store, "s7-conv"), AgentMode::ReadOnly);
+    let names = captures_for("s7-main")[0].tool_names.clone();
+    assert!(!names.contains(&"ducky__set_mode".to_string()), "{names:?}");
+    let results = tool_results(&store, "s7-conv");
+    assert!(
+        results[0].contains("only available in auto mode"),
+        "{}",
+        results[0]
+    );
 }

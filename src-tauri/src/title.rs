@@ -64,6 +64,7 @@ mod tests {
             effort: Some(EffortLevel::High),
             mcp_ids: None,
             mode: AgentMode::Default,
+            auto_readonly: false,
             created_at: "t".into(),
             updated_at: "t".into(),
         }

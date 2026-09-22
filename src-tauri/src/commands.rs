@@ -514,6 +514,7 @@ pub fn conversation_create(
         effort,
         mcp_ids: None,
         mode,
+        auto_readonly: false,
         created_at: now(),
         updated_at: now(),
     };
@@ -602,6 +603,8 @@ pub fn conversation_set_mode(
             return Err("Unknown conversation".into());
         };
         meta.mode = mode;
+        // a switch the user makes is never retractable by the model
+        meta.auto_readonly = false;
     }
     state.store.save_config().map_err(|e| e.to_string())
 }
