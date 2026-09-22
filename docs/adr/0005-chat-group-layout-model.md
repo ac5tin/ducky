@@ -33,8 +33,11 @@ order. A chat is grouped exactly when some group lists its id.
 The drag layer therefore commits one order-only payload
 (`group_apply_layout`), never a full group record. The command keeps title,
 colour and collapsed from the server record, drops unknown conversation ids and
-duplicates, and appends any group the payload omits. A malformed or stale
-payload can reorder chats but cannot erase a group's name, colour or members.
+duplicates, and appends any group the payload omits.
+A malformed or stale payload can reorder chats but cannot erase a group's
+name, colour or collapsed flag. Membership is payload-authoritative for a
+group the payload mentions — its member list becomes exactly what the payload
+lists — while a group the payload omits keeps its chats.
 
 ## Consequences
 
