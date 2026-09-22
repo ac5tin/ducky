@@ -988,16 +988,14 @@ async fn read_only_mode_refuses_a_forced_write() {
         "{}",
         results[0]
     );
-    // it is an error card, and no approval was ever requested for it
+    // it is an error card, and the refusal happened before any consent prompt:
+    // no pending_approval card was emitted for it
     assert!(tool_cards(&sink)
         .iter()
         .any(|(s, t, _, _)| s == "error" && t.as_deref() == Some("ducky__fs_write")));
-    assert!(!sink
-        .events
-        .lock()
-        .unwrap()
+    assert!(!tool_cards(&sink)
         .iter()
-        .any(|e| matches!(e, BackendEvent::ApprovalRequested { .. })));
+        .any(|(s, t, _, _)| s == "pending_approval" && t.as_deref() == Some("ducky__fs_write")));
 }
 
 #[tokio::test]
