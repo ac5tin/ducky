@@ -533,6 +533,92 @@ impl Agent {
         }
     }
 
+    /// `ducky__set_mode`: the auto-mode tool. The model may enter plan or
+    /// read-only mode, and return to default from read-only. It can never
+    /// leave plan mode — that needs the user's approval of a plan, or the
+    /// user switching the mode themselves.
+    async fn set_mode_tool(
+        &self,
+        conversation_id: &str,
+        call: &ToolCall,
+        parent: Option<&str>,
+    ) -> String {
+        let requested = call
+            .arguments
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let reason = call
+            .arguments
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let mode = match requested.as_str() {
+            "readonly" => AgentMode::ReadOnly,
+            "plan" => AgentMode::Plan,
+            "default" => AgentMode::Default,
+            other => {
+                let msg = format!("unknown mode {other:?}; use readonly, plan or default");
+                self.emit_tool_update(
+                    conversation_id,
+                    &call.id,
+                    "error",
+                    serde_json::json!({
+                        "tool": call.name,
+                        "result_text": msg,
+                        "is_error": true,
+                    }),
+                    parent,
+                );
+                return format!("Error: {msg}");
+            }
+        };
+
+        if self.effective_mode(conversation_id) == AgentMode::Plan && mode == AgentMode::Default {
+            let msg = "plan mode ends when the user approves a plan — call \
+                       ducky__present_plan instead of leaving plan mode yourself"
+                .to_string();
+            self.emit_tool_update(
+                conversation_id,
+                &call.id,
+                "error",
+                serde_json::json!({ "tool": call.name, "result_text": msg, "is_error": true }),
+                parent,
+            );
+            return format!("Error: {msg}");
+        }
+
+        self.set_conversation_mode(conversation_id, mode);
+        let effect = match mode {
+            AgentMode::ReadOnly => {
+                "Only read-only tools are available now. Investigate and report."
+            }
+            AgentMode::Plan => {
+                "Only read-only tools are available now, plus ducky__present_plan. \
+                 Research, then present a plan for approval."
+            }
+            AgentMode::Default | AgentMode::Auto => "All tools are available again.",
+        };
+        let note = if reason.is_empty() {
+            String::new()
+        } else {
+            format!(" Reason: {reason}")
+        };
+        let text = format!("Mode is now {requested}. {effect}{note}");
+        self.emit_tool_update(
+            conversation_id,
+            &call.id,
+            "done",
+            serde_json::json!({ "tool": call.name, "result_text": text }),
+            parent,
+        );
+        text
+    }
+
     /// Resolve a qualified tool name to its server + raw tool entry. Builtins
     /// are checked first so a user server can't shadow or spoof them.
     fn resolve_tool(
@@ -1460,9 +1546,15 @@ impl Agent {
                 );
                 return format!("Error: {msg}");
             }
-            return self
-                .present_plan_tool(conversation_id, call, parent, ct)
-                .await;
+            return match call.name.as_str() {
+                crate::builtin::PRESENT_PLAN => {
+                    self.present_plan_tool(conversation_id, call, parent, ct).await
+                }
+                crate::builtin::SET_MODE => {
+                    self.set_mode_tool(conversation_id, call, parent).await
+                }
+                _ => "Error: unknown control tool".to_string(),
+            };
         }
 
         self.emit_tool_update(

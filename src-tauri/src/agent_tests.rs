@@ -1302,3 +1302,166 @@ async fn cancelling_a_turn_settles_a_pending_plan() {
     let results = tool_results(&store, "p7-conv");
     assert!(results[0].contains("cancelled the plan review"), "{}", results[0]);
 }
+
+// ---------------------------------------------------------------------------
+// Auto mode: the model chooses the mode
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn auto_mode_can_switch_into_plan_mode() {
+    script(
+        "s1-main",
+        vec![
+            MockRound::Tools(vec![(
+                "ducky__set_mode".into(),
+                serde_json::json!({ "mode": "plan", "reason": "needs a design" }),
+            )]),
+            MockRound::Text("researching".into()),
+        ],
+    );
+    let (agent, sink, store) = test_agent_in_mode("s1-conv", AgentMode::Auto);
+    run(&agent, "s1-conv", "s1-main", &CancellationToken::new()).await;
+
+    assert_eq!(mode_of(&store, "s1-conv"), AgentMode::Plan);
+    assert_eq!(mode_events(&sink), vec![AgentMode::Plan]);
+    // the very next round is read-only and offers the plan tool
+    let names = captures_for("s1-main")[1].tool_names.clone();
+    assert!(names.contains(&"ducky__present_plan".to_string()), "{names:?}");
+    assert!(!names.contains(&"ducky__fs_write".to_string()), "{names:?}");
+    assert!(!names.contains(&"ducky__set_mode".to_string()), "{names:?}");
+    // the tool is not approval-gated: it is chat flow
+    assert!(!sink
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| matches!(e, BackendEvent::ApprovalRequested { .. })));
+}
+
+#[tokio::test]
+async fn auto_mode_can_go_read_only_and_come_back() {
+    script(
+        "s2-main",
+        vec![
+            MockRound::Tools(vec![(
+                "ducky__set_mode".into(),
+                serde_json::json!({ "mode": "readonly", "reason": "just looking" }),
+            )]),
+            MockRound::Tools(vec![(
+                "ducky__set_mode".into(),
+                serde_json::json!({ "mode": "default", "reason": "done looking" }),
+            )]),
+            MockRound::Text("done".into()),
+        ],
+    );
+    let (agent, _sink, store) = test_agent_in_mode("s2-conv", AgentMode::Auto);
+    run(&agent, "s2-conv", "s2-main", &CancellationToken::new()).await;
+
+    assert_eq!(mode_of(&store, "s2-conv"), AgentMode::Default);
+    // round 2 was read-only, round 3 has the write tools back
+    assert!(!captures_for("s2-main")[1]
+        .tool_names
+        .contains(&"ducky__fs_write".to_string()));
+    assert!(captures_for("s2-main")[2]
+        .tool_names
+        .contains(&"ducky__fs_write".to_string()));
+}
+
+#[tokio::test]
+async fn the_model_cannot_leave_plan_mode_by_itself() {
+    script(
+        "s3-main",
+        vec![
+            MockRound::Tools(vec![(
+                "ducky__set_mode".into(),
+                serde_json::json!({ "mode": "default", "reason": "skipping review" }),
+            )]),
+            MockRound::Text("done".into()),
+        ],
+    );
+    let (agent, sink, store) = test_agent_in_mode("s3-conv", AgentMode::Plan);
+    // in plan mode the tool is not offered at all, so the call is refused
+    run(&agent, "s3-conv", "s3-main", &CancellationToken::new()).await;
+
+    assert_eq!(mode_of(&store, "s3-conv"), AgentMode::Plan);
+    assert!(mode_events(&sink).is_empty());
+    let results = tool_results(&store, "s3-conv");
+    assert!(results[0].contains("only available in auto mode"), "{}", results[0]);
+}
+
+#[tokio::test]
+async fn an_unknown_mode_is_refused() {
+    script(
+        "s4-main",
+        vec![
+            MockRound::Tools(vec![(
+                "ducky__set_mode".into(),
+                serde_json::json!({ "mode": "yolo", "reason": "typo" }),
+            )]),
+            MockRound::Text("done".into()),
+        ],
+    );
+    let (agent, _sink, store) = test_agent_in_mode("s4-conv", AgentMode::Auto);
+    run(&agent, "s4-conv", "s4-main", &CancellationToken::new()).await;
+
+    assert_eq!(mode_of(&store, "s4-conv"), AgentMode::Auto);
+    let results = tool_results(&store, "s4-conv");
+    assert!(results[0].contains("unknown mode"), "{}", results[0]);
+}
+
+#[tokio::test]
+async fn auto_mode_thrashing_ends_at_the_iteration_cap() {
+    // the model asks to switch mode every round; the turn must end at the
+    // existing iteration cap instead of hanging
+    let rounds: Vec<MockRound> = (0..40)
+        .map(|_| {
+            MockRound::Tools(vec![(
+                "ducky__set_mode".into(),
+                serde_json::json!({ "mode": "plan", "reason": "thrash" }),
+            )])
+        })
+        .collect();
+    script("s5-main", rounds);
+    let (agent, _sink, store) = test_agent_in_mode("s5-conv", AgentMode::Auto);
+    run(&agent, "s5-conv", "s5-main", &CancellationToken::new()).await;
+
+    assert_eq!(mode_of(&store, "s5-conv"), AgentMode::Plan);
+    let results = tool_results(&store, "s5-conv");
+    assert!(
+        (20..=25).contains(&results.len()),
+        "capped by max_tool_iterations, got {}",
+        results.len()
+    );
+    assert!(results[1].contains("only available in auto mode"), "{}", results[1]);
+}
+
+#[tokio::test]
+async fn control_tools_are_refused_inside_a_subagent() {
+    script(
+        "s6-main",
+        vec![
+            MockRound::Tools(vec![(SUBAGENT.into(), serde_json::json!({ "task": "s6-sub" }))]),
+            MockRound::Text("done".into()),
+        ],
+    );
+    script(
+        "s6-sub",
+        vec![
+            MockRound::Tools(vec![(
+                "ducky__set_mode".into(),
+                serde_json::json!({ "mode": "plan", "reason": "child tries" }),
+            )]),
+            MockRound::Text("child done".into()),
+        ],
+    );
+    let (agent, sink, store) = test_agent_in_mode("s6-conv", AgentMode::Auto);
+    run(&agent, "s6-conv", "s6-main", &CancellationToken::new()).await;
+
+    // the child's own tool list already excludes the control tool
+    let child = captures_for("s6-sub");
+    assert!(!child[0].tool_names.contains(&"ducky__set_mode".to_string()));
+    // and the conversation's mode is untouched
+    assert_eq!(mode_of(&store, "s6-conv"), AgentMode::Auto);
+    assert!(mode_events(&sink).is_empty());
+    assert!(plan_events(&sink).is_empty());
+}
