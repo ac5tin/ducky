@@ -1,3 +1,5 @@
+import { useDraggable, useDroppable } from "@dnd-kit/core";
+import { chatDragId, chatZone } from "../../groups";
 import { useStore } from "../../store";
 import type { ConversationMeta } from "../../types";
 import { Icon } from "../icons";
@@ -15,9 +17,25 @@ export function ChatRow({ chat }: { chat: ConversationMeta }) {
     renameConversation(chat.id, title).catch((e) => console.error(e));
   });
 
+  const drag = useDraggable({
+    id: chatDragId(chat.id),
+    data: { kind: "chat" },
+    disabled: rename.editing, // selecting text in the input must not drag
+  });
+  const drop = useDroppable({ id: chatZone(chat.id), data: { kind: "chat" } });
+  const setRefs = (node: HTMLElement | null) => {
+    drag.setNodeRef(node);
+    drop.setNodeRef(node);
+  };
+
   return (
     <div
+      ref={setRefs}
+      {...drag.attributes}
+      {...drag.listeners}
       className={`group flex items-center gap-1 rounded-lg px-2 py-1.5 text-sm transition ${
+        drag.isDragging ? "opacity-40" : ""
+      } ${
         chat.id === activeId
           ? "bg-sky-100 text-sky-900 dark:bg-sky-900/40 dark:text-sky-100"
           : "hover:bg-slate-200/60 dark:hover:bg-slate-800"

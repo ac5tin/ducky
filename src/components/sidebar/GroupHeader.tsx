@@ -1,5 +1,12 @@
+import { useDraggable, useDroppable } from "@dnd-kit/core";
 import { useEffect, useState } from "react";
-import { groupBodyId, normalizeGroupColor } from "../../groups";
+import {
+  groupBodyId,
+  groupDragId,
+  groupHeaderZone,
+  groupOverZone,
+  normalizeGroupColor,
+} from "../../groups";
 import { useStore } from "../../store";
 import type { ChatGroup } from "../../types";
 import { Icon } from "../icons";
@@ -27,6 +34,23 @@ export function GroupHeader({
     renameGroup(group.id, title).catch((e) => console.error(e));
   });
 
+  const drag = useDraggable({
+    id: groupDragId(group.id),
+    data: { kind: "group" },
+    disabled: rename.editing, // the name input needs normal text selection
+  });
+  // Three droppables share the header node. The collision detection in
+  // Sidebar keeps only one of them per drag kind, which is what disambiguates
+  // them: a chat drag can only see `group-header`, a group drag only
+  // `group-over`.
+  const groupOver = useDroppable({ id: groupOverZone(group.id), data: { kind: "group-over" } });
+  const header = useDroppable({ id: groupHeaderZone(group.id), data: { kind: "group-header" } });
+  const setRefs = (node: HTMLElement | null) => {
+    drag.setNodeRef(node);
+    groupOver.setNodeRef(node);
+    header.setNodeRef(node);
+  };
+
   // Freshly created groups are named in place. The flag is one-shot: the parent
   // clears it as soon as it has been consumed.
   useEffect(() => {
@@ -39,7 +63,14 @@ export function GroupHeader({
     "shrink-0 rounded p-1 text-slate-400 transition hover:bg-slate-200 hover:text-slate-700 dark:hover:bg-slate-700 dark:hover:text-slate-200";
 
   return (
-    <div className="group flex items-center gap-1 rounded-lg px-2 py-1.5 text-sm text-slate-500 transition hover:bg-slate-200/60 dark:text-slate-300 dark:hover:bg-slate-800">
+    <div
+      ref={setRefs}
+      {...drag.attributes}
+      {...drag.listeners}
+      className={`group flex items-center gap-1 rounded-lg px-2 py-1.5 text-sm text-slate-500 transition dark:text-slate-300 ${
+        drag.isDragging ? "opacity-40" : "hover:bg-slate-200/60 dark:hover:bg-slate-800"
+      }`}
+    >
       <div className="relative shrink-0">
         <button
           className="flex h-4 w-4 items-center justify-center rounded"
