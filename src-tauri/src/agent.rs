@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::config::Store;
+use crate::config::{AgentMode, Store};
 use crate::events::{BackendEvent, EventSink};
 use crate::mcp::bridge::{ApprovalDecision, SamplingBackend};
 use crate::mcp::manager::{content_to_text, McpManager};
@@ -79,6 +79,58 @@ fn tool_allowed(allow: &[String], server_id: &str, qualified_name: &str) -> bool
             || entry == server_id
             || entry.strip_suffix("/*").is_some_and(|p| p == server_id)
     })
+}
+
+/// Whether a tool may be offered to the model — and may run — in this mode.
+/// The same predicate filters the tool list and gates execution, so a forced
+/// call can never do what the list would not offer.
+///
+/// `read_only` is `BuiltinTool::read_only` for builtins and the MCP server's
+/// `readOnlyHint` for server tools; an absent hint is not read-only. Trusting
+/// that hint here is the one sanctioned exception to the untrusted-annotation
+/// posture — see `docs/adr/0004-trust-mcp-readonly-hint-for-readonly-modes.md`.
+#[allow(dead_code)] // called by the tool-list filter and the execution gate (next changes)
+pub(crate) fn mode_allows(mode: AgentMode, qualified_name: &str, read_only: bool) -> bool {
+    match qualified_name {
+        // control tools are chat flow: offer them only where they mean something
+        crate::builtin::SET_MODE => mode == AgentMode::Auto,
+        crate::builtin::PRESENT_PLAN => mode == AgentMode::Plan,
+        // the subagent tool is a dispatcher; the child reads this same
+        // conversation mode and is therefore read-only too
+        crate::builtin::SUBAGENT => true,
+        _ => match mode {
+            AgentMode::Default | AgentMode::Auto => true,
+            AgentMode::ReadOnly | AgentMode::Plan => read_only,
+        },
+    }
+}
+
+/// The tool-result text for a call the mode gate refused. It names the active
+/// mode and the way forward, because the model sees only this text.
+#[allow(dead_code)] // called by the execution gate's denial path (next changes)
+pub(crate) fn mode_denial(mode: AgentMode, qualified_name: &str) -> String {
+    match qualified_name {
+        crate::builtin::SET_MODE => {
+            "ducky__set_mode is only available in auto mode.".to_string()
+        }
+        crate::builtin::PRESENT_PLAN => {
+            "ducky__present_plan is only available in plan mode.".to_string()
+        }
+        _ => match mode {
+            AgentMode::ReadOnly => format!(
+                "{qualified_name} is blocked: read-only mode is active. Use read-only tools \
+                 only. If the task needs a change, say what you would change instead of \
+                 doing it."
+            ),
+            AgentMode::Plan => format!(
+                "{qualified_name} is blocked: plan mode is active. Research read-only, then \
+                 call ducky__present_plan when the plan is ready."
+            ),
+            AgentMode::Default | AgentMode::Auto => {
+                format!("{qualified_name} is not available in this mode.")
+            }
+        },
+    }
 }
 
 /// Resolve a subagent's (provider, model): the definition's overrides when

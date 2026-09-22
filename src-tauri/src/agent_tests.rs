@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::Agent;
 use crate::config::{
-    ApprovalMode, ConversationMeta, EffortLevel, ProviderConfig, Store, SubagentConfig,
+    AgentMode, ApprovalMode, ConversationMeta, EffortLevel, ProviderConfig, Store, SubagentConfig,
 };
 use crate::events::{BackendEvent, CollectingSink};
 use crate::mcp::bridge::InteractiveBridge;
@@ -819,4 +819,53 @@ async fn main_system_prompt_applies_to_main_run_only() {
     assert_eq!(sub.len(), 1);
     assert!(sub[0].system.contains("Working directory"));
     assert!(!sub[0].system.contains("Always answer in haiku."));
+}
+
+// ---------------------------------------------------------------------------
+// Mode predicate
+// ---------------------------------------------------------------------------
+
+#[test]
+fn mode_allows_matrix() {
+    use crate::agent::mode_allows;
+
+    // Default and Auto keep every tool available
+    for name in ["ducky__fs_write", "ducky__fs_read", "srv__search"] {
+        assert!(mode_allows(AgentMode::Default, name, false), "{name} in Default");
+        assert!(mode_allows(AgentMode::Auto, name, false), "{name} in Auto");
+    }
+
+    // ReadOnly and Plan keep read-only tools and drop the rest
+    for mode in [AgentMode::ReadOnly, AgentMode::Plan] {
+        assert!(mode_allows(mode, "ducky__fs_read", true), "read in {mode:?}");
+        assert!(mode_allows(mode, "srv__search", true), "mcp read in {mode:?}");
+        assert!(!mode_allows(mode, "ducky__fs_write", false), "write in {mode:?}");
+        // an absent readOnlyHint is not read-only (MCP spec default)
+        assert!(!mode_allows(mode, "srv__write", false), "unannotated mcp in {mode:?}");
+    }
+
+    // the subagent tool stays available: its children read this same mode
+    for mode in [AgentMode::Default, AgentMode::ReadOnly, AgentMode::Plan, AgentMode::Auto] {
+        assert!(mode_allows(mode, "ducky__subagent", false), "subagent in {mode:?}");
+    }
+
+    // control tools only where they mean something
+    assert!(mode_allows(AgentMode::Auto, "ducky__set_mode", true));
+    assert!(!mode_allows(AgentMode::Default, "ducky__set_mode", true));
+    assert!(!mode_allows(AgentMode::Plan, "ducky__set_mode", true));
+    assert!(!mode_allows(AgentMode::ReadOnly, "ducky__set_mode", true));
+    assert!(mode_allows(AgentMode::Plan, "ducky__present_plan", true));
+    assert!(!mode_allows(AgentMode::Default, "ducky__present_plan", true));
+    assert!(!mode_allows(AgentMode::Auto, "ducky__present_plan", true));
+}
+
+#[test]
+fn mode_denial_names_the_mode_and_the_way_out() {
+    use crate::agent::mode_denial;
+    let read_only = mode_denial(AgentMode::ReadOnly, "ducky__fs_write");
+    assert!(read_only.contains("read-only mode is active"), "{read_only}");
+    let plan = mode_denial(AgentMode::Plan, "ducky__fs_write");
+    assert!(plan.contains("ducky__present_plan"), "{plan}");
+    assert!(mode_denial(AgentMode::Plan, "ducky__set_mode").contains("auto mode"));
+    assert!(mode_denial(AgentMode::Default, "ducky__present_plan").contains("plan mode"));
 }

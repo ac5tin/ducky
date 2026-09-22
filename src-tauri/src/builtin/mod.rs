@@ -22,6 +22,13 @@ pub const SERVER_TITLE: &str = "Ducky";
 /// chat engine, not just a cwd.
 pub const SUBAGENT: &str = "ducky__subagent";
 
+/// Present a plan for approval. Offered only in plan mode, and executed by the
+/// agent loop like `ducky__subagent` — it needs the bridge, not a cwd.
+pub const PRESENT_PLAN: &str = "ducky__present_plan";
+
+/// Let the model switch the conversation's mode. Offered only in auto mode.
+pub const SET_MODE: &str = "ducky__set_mode";
+
 /// The definition an omitted `agent` argument resolves to (when it exists in
 /// the user's config; otherwise the spawn stays base-generic).
 pub const DEFAULT_SUBAGENT_NAME: &str = "General-Purpose";
