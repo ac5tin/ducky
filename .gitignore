@@ -19,3 +19,6 @@ flatpak-repo/
 
 # superpowers design specs (kept local, not committed)
 docs/superpowers/
+
+# git worktrees (isolated feature workspaces)
+.worktrees/
