@@ -126,9 +126,7 @@ pub(crate) fn mode_allows_in_conversation(
 /// mode and the way forward, because the model sees only this text.
 pub(crate) fn mode_denial(mode: AgentMode, qualified_name: &str) -> String {
     match qualified_name {
-        crate::builtin::SET_MODE => {
-            "ducky__set_mode is only available in auto mode.".to_string()
-        }
+        crate::builtin::SET_MODE => "ducky__set_mode is only available in auto mode.".to_string(),
         crate::builtin::PRESENT_PLAN => {
             "ducky__present_plan is only available in plan mode.".to_string()
         }
@@ -464,7 +462,10 @@ impl Agent {
     fn set_conversation_mode(&self, conversation_id: &str, mode: AgentMode) {
         {
             let mut cfg = self.store.config.lock().unwrap();
-            let Some(meta) = cfg.conversations.iter_mut().find(|c| c.id == conversation_id)
+            let Some(meta) = cfg
+                .conversations
+                .iter_mut()
+                .find(|c| c.id == conversation_id)
             else {
                 return;
             };
@@ -1072,7 +1073,10 @@ impl Agent {
                     )
                 } else if call.name == crate::builtin::SUBAGENT {
                     // past the concurrency cap: gate, spawn, wait inline
-                    match self.prepare_subagent(conversation_id, &call, scope, ct).await {
+                    match self
+                        .prepare_subagent(conversation_id, &call, scope, ct)
+                        .await
+                    {
                         Ok((task, spec)) => {
                             let handle = self.spawn_subagent_task(
                                 conversation_id,
@@ -1151,9 +1155,11 @@ impl Agent {
                     serde_json::json!({ "result_text": "The user denied this tool call." }),
                     parent,
                 );
-                Err("The user denied permission for this tool call. Do not retry it; \
+                Err(
+                    "The user denied permission for this tool call. Do not retry it; \
                         continue without it or ask the user what to do instead."
-                    .to_string())
+                        .to_string(),
+                )
             }
             ApprovalDecision::AllowOnce => Ok(()),
         }
@@ -1240,7 +1246,8 @@ impl Agent {
         // unless the subagent tool itself is allowlisted
         if let Some(allow) = scope.tool_allowlist() {
             if !tool_allowed(allow, &entry.server_id, &entry.qualified_name) {
-                let msg = "this subagent type does not have access to the subagent tool".to_string();
+                let msg =
+                    "this subagent type does not have access to the subagent tool".to_string();
                 self.emit_tool_update(
                     conversation_id,
                     &call.id,
@@ -1331,14 +1338,11 @@ impl Agent {
     ) -> crate::events::SubagentMeta {
         let (conversation_effort, provider_id, model) = {
             let cfg = self.store.config.lock().unwrap();
-            let (conv_provider, conv_model, conv_effort) = match cfg
-                .conversations
-                .iter()
-                .find(|c| c.id == conversation_id)
-            {
-                Some(m) => (m.provider_id.clone(), m.model.clone(), m.effort),
-                None => (String::new(), String::new(), None),
-            };
+            let (conv_provider, conv_model, conv_effort) =
+                match cfg.conversations.iter().find(|c| c.id == conversation_id) {
+                    Some(m) => (m.provider_id.clone(), m.model.clone(), m.effort),
+                    None => (String::new(), String::new(), None),
+                };
             let (provider_id, model) = resolve_spec_model(&cfg, spec, conv_provider, conv_model);
             (conv_effort, provider_id, model)
         };
@@ -1472,7 +1476,15 @@ impl Agent {
             ts: Some(chrono::Utc::now().to_rfc3339()),
         }];
         let outcome = self
-            .agent_loop(conversation_id, &provider_id, &model, &mut history, max_iterations, &child, &scope)
+            .agent_loop(
+                conversation_id,
+                &provider_id,
+                &model,
+                &mut history,
+                max_iterations,
+                &child,
+                &scope,
+            )
             .await;
         match outcome {
             Ok(Some(text)) if !text.trim().is_empty() => {
@@ -1486,8 +1498,7 @@ impl Agent {
                 text
             }
             Ok(_) => {
-                let text =
-                    "(The subagent finished without producing a final answer.)".to_string();
+                let text = "(The subagent finished without producing a final answer.)".to_string();
                 self.emit_tool_update(
                     conversation_id,
                     tool_call_id,
@@ -1542,8 +1553,10 @@ impl Agent {
         // allowlisted tools, even if the model tries something else
         if let Some(allow) = scope.tool_allowlist() {
             if !tool_allowed(allow, &entry.server_id, &entry.qualified_name) {
-                let msg =
-                    format!("{} is not in this subagent's tool allowlist", entry.qualified_name);
+                let msg = format!(
+                    "{} is not in this subagent's tool allowlist",
+                    entry.qualified_name
+                );
                 self.emit_tool_update(
                     conversation_id,
                     &call.id,
@@ -1593,11 +1606,10 @@ impl Agent {
             }
             return match call.name.as_str() {
                 crate::builtin::PRESENT_PLAN => {
-                    self.present_plan_tool(conversation_id, call, parent, ct).await
+                    self.present_plan_tool(conversation_id, call, parent, ct)
+                        .await
                 }
-                crate::builtin::SET_MODE => {
-                    self.set_mode_tool(conversation_id, call, parent).await
-                }
+                crate::builtin::SET_MODE => self.set_mode_tool(conversation_id, call, parent).await,
                 _ => "Error: unknown control tool".to_string(),
             };
         }
@@ -1632,7 +1644,13 @@ impl Agent {
             return denial;
         }
 
-        self.emit_tool_update(conversation_id, &call.id, "running", serde_json::json!({}), parent);
+        self.emit_tool_update(
+            conversation_id,
+            &call.id,
+            "running",
+            serde_json::json!({}),
+            parent,
+        );
 
         // Builtins run in-process — no server to connect. Result text goes
         // straight to the model and the tool card.
