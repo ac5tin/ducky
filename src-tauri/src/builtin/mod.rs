@@ -52,6 +52,13 @@ pub fn lookup(name: &str) -> Option<&'static BuiltinTool> {
     REGISTRY.iter().find(|t| t.name == name)
 }
 
+/// The control tools: chat flow rather than tool calls. They are main-scope
+/// only and bypass the approval gate, so the engine intercepts them before
+/// `execute`.
+pub fn is_control(name: &str) -> bool {
+    name == PRESENT_PLAN || name == SET_MODE
+}
+
 pub fn tool_defs() -> Vec<ToolDef> {
     REGISTRY
         .iter()
@@ -117,6 +124,9 @@ pub async fn execute(name: &str, args: &Value, cwd: &Path) -> Result<String, Str
         fs::execute(name, args, cwd).await
     } else if name.starts_with("ducky__web_") {
         web::execute(name, args).await
+    } else if is_control(name) {
+        // reached only if the engine's control branch is ever bypassed
+        Err(format!("{name} is handled by the chat engine"))
     } else {
         Err(format!("Unknown builtin tool: {name}"))
     }
@@ -262,6 +272,56 @@ static REGISTRY: LazyLock<Vec<BuiltinTool>> = LazyLock::new(|| {
             read_only: false,
         },
         BuiltinTool {
+            name: PRESENT_PLAN,
+            description: "Present your finished implementation plan to the user for \
+                      approval. Use this in plan mode when the plan is ready: the user \
+                      reads it and either approves it or asks for changes. Approval ends \
+                      plan mode and you continue in default mode with this plan still in \
+                      context, so start implementing it then. Never ask for approval in \
+                      plain text — this tool is the request. If the user asks for changes, \
+                      revise the plan and call this tool again.",
+            schema: obj(
+                &["plan"],
+                serde_json::json!({
+                    "plan": {
+                        "type": "string",
+                        "description": "The complete implementation plan in markdown: what \
+                                        changes, in which files, in what order, and how to \
+                                        verify it. Include the reasoning the user needs to \
+                                        judge it."
+                    }
+                }),
+            ),
+            read_only: true,
+        },
+        BuiltinTool {
+            name: SET_MODE,
+            description: "Switch how much this conversation lets you change. Auto mode \
+                      only. Use `plan` before starting a task with design decisions, \
+                      several files to touch, or unclear requirements: you then work \
+                      read-only, research, and present a plan for approval. Use \
+                      `readonly` when you will only investigate and report. Use `default` \
+                      for unrestricted work — that is refused while a plan is waiting for \
+                      approval, because plan mode only ends when the user approves a plan \
+                      or switches the mode themselves.",
+            schema: obj(
+                &["mode", "reason"],
+                serde_json::json!({
+                    "mode": {
+                        "type": "string",
+                        "enum": ["readonly", "plan", "default"],
+                        "description": "The mode to switch to."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "One short line for the user explaining why this mode \
+                                        fits the task."
+                    }
+                }),
+            ),
+            read_only: true,
+        },
+        BuiltinTool {
             name: web::SEARCH,
             description: "Search the web (DuckDuckGo) and return the top results with \
                       titles, URLs and snippets. Use this to find pages before \
@@ -316,6 +376,29 @@ mod tests {
     }
 
     #[test]
+    fn control_tools_are_registered_and_identified() {
+        assert!(is_control(PRESENT_PLAN));
+        assert!(is_control(SET_MODE));
+        assert!(!is_control(SUBAGENT));
+        assert!(!is_control("ducky__fs_write"));
+
+        let plan = lookup(PRESENT_PLAN).expect("plan tool is registered");
+        assert!(plan.read_only, "control tools must survive read-only modes");
+        assert_eq!(plan.schema["required"], serde_json::json!(["plan"]));
+
+        let set = lookup(SET_MODE).expect("mode tool is registered");
+        assert!(set.read_only);
+        assert_eq!(set.schema["required"], serde_json::json!(["mode", "reason"]));
+        assert_eq!(
+            set.schema["properties"]["mode"]["enum"],
+            serde_json::json!(["readonly", "plan", "default"])
+        );
+
+        // control tools are executed by the engine, never by builtin::execute
+        assert!(is_builtin(PRESENT_PLAN) && is_builtin(SET_MODE));
+    }
+
+    #[test]
     fn lookup_and_dispatch_guard() {
         assert!(is_builtin("ducky__fs_read"));
         assert!(!is_builtin("filesystem__read_file"));
@@ -329,5 +412,11 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("Unknown builtin"));
+
+        // control tools are engine-handled, never dispatched here
+        let err = execute(PRESENT_PLAN, &serde_json::json!({}), Path::new("/tmp"))
+            .await
+            .unwrap_err();
+        assert!(err.contains("handled by the chat engine"));
     }
 }
