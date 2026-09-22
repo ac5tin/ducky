@@ -575,6 +575,7 @@ pub struct UndoRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatGroup {
     pub id: String,
+    #[serde(default)]
     pub title: String,
     #[serde(default)]
     pub collapsed: bool,
@@ -1855,6 +1856,10 @@ mod tests {
         assert!(normalize_group_color("#12345").is_err());
         assert!(normalize_group_color("#gggggg").is_err());
         assert!(normalize_group_color("").is_err());
+        assert_eq!(
+            GROUP_COLORS,
+            ["#64748b", "#ef4444", "#f59e0b", "#22c55e", "#0ea5e9"]
+        );
     }
 
     #[test]
@@ -1875,6 +1880,14 @@ mod tests {
         assert_eq!(group.color, "#64748b");
         assert!(!group.collapsed);
         assert!(group.conversation_ids.is_empty());
+
+        // A group missing `title` must not fail the whole parse: a failed parse
+        // replaces the entire config with defaults (see `Store::new`), which
+        // would drop every provider and server on the next save.
+        let cfg: AppConfig = serde_json::from_str(r#"{"version":1,"groups":[{"id":"g1"}]}"#)
+            .expect("a group without a title must not fail the parse");
+        assert_eq!(cfg.groups.len(), 1);
+        assert_eq!(cfg.groups[0].title, "");
     }
 
     #[test]
@@ -1981,6 +1994,11 @@ mod tests {
         store.delete_conversation("c1").unwrap();
 
         let cfg = store.config.lock().unwrap();
+        assert_eq!(cfg.groups[0].conversation_ids, ["c2"]);
+        drop(cfg);
+
+        let reopened = Store::new(tmp.path(), tmp.path().to_path_buf()).unwrap();
+        let cfg = reopened.config.lock().unwrap();
         assert_eq!(cfg.groups[0].conversation_ids, ["c2"]);
     }
 }
