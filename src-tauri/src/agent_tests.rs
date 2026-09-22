@@ -1494,3 +1494,68 @@ async fn the_model_cannot_retract_a_read_only_the_user_chose() {
         results[0]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Subagent mode inheritance
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn read_only_mode_makes_subagents_read_only_too() {
+    script(
+        "i1-main",
+        vec![
+            MockRound::Tools(vec![(SUBAGENT.into(), serde_json::json!({ "task": "i1-sub" }))]),
+            MockRound::Text("all done".into()),
+        ],
+    );
+    script(
+        "i1-sub",
+        vec![
+            MockRound::Tools(vec![(
+                "ducky__fs_write".into(),
+                serde_json::json!({ "path": "sub-forced.txt", "content": "nope" }),
+            )]),
+            MockRound::Text("blocked".into()),
+        ],
+    );
+    let (agent, sink, _store, dir) = test_agent_in_dir("i1-conv", AgentMode::ReadOnly);
+    run(&agent, "i1-conv", "i1-main", &CancellationToken::new()).await;
+
+    // the child never sees a write tool, even though it tries to use one
+    let child = captures_for("i1-sub");
+    assert_eq!(child.len(), 2, "the write attempt came back as a result");
+    assert!(!child[0].tool_names.contains(&"ducky__fs_write".to_string()));
+    assert!(!child[0].tool_names.contains(&"ducky__set_mode".to_string()));
+    assert!(!child[0].tool_names.contains(&"ducky__present_plan".to_string()));
+    // the write never happened, and the child was told why
+    assert!(!dir.join("sub-forced.txt").exists());
+    assert!(
+        tool_cards(&sink).iter().any(|(status, _, text, is_sub)| {
+            status == "error"
+                && *is_sub
+                && text
+                    .as_deref()
+                    .is_some_and(|t| t.contains("read-only mode is active"))
+        }),
+        "a subagent card carries the denial"
+    );
+}
+
+#[tokio::test]
+async fn a_plan_mode_parent_also_gives_a_read_only_child() {
+    script(
+        "i2-main",
+        vec![
+            MockRound::Tools(vec![(SUBAGENT.into(), serde_json::json!({ "task": "i2-sub" }))]),
+            MockRound::Text("all done".into()),
+        ],
+    );
+    script("i2-sub", vec![MockRound::Text("sub answer".into())]);
+    let (agent, _sink, _store) = test_agent_in_mode("i2-conv", AgentMode::Plan);
+    run(&agent, "i2-conv", "i2-main", &CancellationToken::new()).await;
+
+    let child = captures_for("i2-sub");
+    assert!(!child[0].tool_names.contains(&"ducky__fs_write".to_string()));
+    assert!(!child[0].tool_names.contains(&"ducky__present_plan".to_string()));
+    assert!(child[0].system.contains("plan mode"), "{}", child[0].system);
+}
