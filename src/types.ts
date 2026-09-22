@@ -12,6 +12,8 @@ export type ApprovalMode =
         | "always_ask"
         | "auto_approve_read_only"
         | "auto_approve_all";
+/** How much the agent may change in a chat. */
+export type AgentMode = "default" | "readonly" | "plan" | "auto";
 export type SamplingMode = "ask" | "auto_approve" | "deny";
 export type ToolRule = "allow" | "deny";
 export type ToolDetailsMode = "auto" | "collapsed" | "expanded";
@@ -85,6 +87,8 @@ export interface AppSettings {
         default_model: string | null;
         /** Reasoning effort new chats start with; null = model default. */
         default_effort: EffortLevel | null;
+        /** Mode new chats start in. */
+        default_mode: AgentMode;
         /** Provider used to generate chat titles; null = the chat's provider. */
         title_provider_id: string | null;
         /** Model used to generate chat titles; only with title_provider_id. */
@@ -105,6 +109,7 @@ export interface ConversationMeta {
         provider_id: string;
         model: string;
         effort: EffortLevel | null;
+        mode: AgentMode;
         mcp_ids?: string[] | null;
         created_at: string;
         updated_at: string;
@@ -301,6 +306,13 @@ export type ContentBlockValue =
           }
         | { type: string; [k: string]: any };
 
+/** A plan presented for review in plan mode. */
+export interface PlanRequest {
+        request_id: string;
+        conversation_id: string | null;
+        plan: string;
+}
+
 export type BackendEvent =
         | { type: "chat_delta"; conversation_id: string; text: string }
         | { type: "reasoning_delta"; conversation_id: string; text: string }
@@ -358,6 +370,13 @@ export type BackendEvent =
                   messages: any[];
                   max_tokens?: number;
           }
+        | {
+                  type: "plan_presented";
+                  request_id: string;
+                  conversation_id: string | null;
+                  plan: string;
+          }
+        | { type: "mode_changed"; conversation_id: string; mode: AgentMode }
         | {
                   type: "server_status";
                   server_id: string;

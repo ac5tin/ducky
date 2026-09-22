@@ -2,6 +2,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  AgentMode,
   AppConfig,
   BackendEvent,
   ConnectorSuggestion,
@@ -93,6 +94,7 @@ export const settingsSet = (settings: {
   default_model?: string;
   /** null clears the default effort; undefined leaves it unchanged. */
   default_effort?: EffortLevel | null;
+  default_mode?: AgentMode;
   title_provider_id?: string;
   title_model?: string;
   /** null clears title effort; undefined leaves it unchanged. */
@@ -149,6 +151,9 @@ export const conversationSetModel = (
 
 export const conversationSetEffort = (id: string, effort: EffortLevel | null) =>
   invoke<void>("conversation_set_effort", { id, effort });
+
+export const conversationSetMode = (id: string, mode: AgentMode) =>
+  invoke<void>("conversation_set_mode", { id, mode });
 
 export const conversationSetMcpIds = (id: string, mcpIds: string[] | null) =>
   invoke<void>("conversation_set_mcp_ids", { id, mcpIds });
@@ -226,6 +231,19 @@ export const approvalRespond = (
 ) =>
   invoke<boolean>("approval_respond", {
     response: { request_id: requestId, decision },
+  });
+
+export const planRespond = (
+  requestId: string,
+  decision: "approve" | "revise",
+  feedback?: string,
+) =>
+  invoke<boolean>("plan_respond", {
+    response: {
+      request_id: requestId,
+      decision,
+      feedback: feedback || null,
+    },
   });
 
 export const elicitationRespond = (
