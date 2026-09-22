@@ -9,3 +9,4 @@ Files use the format `NNNN-kebab-case-title.md`. Review the relevant ADR before 
 - [0002: Slash commands (`/compact`, `/undo`, `/init`)](0002-slash-commands-undo-compact.md)
 - [0003: Prepend the login shell's PATH to stdio MCP server spawns](0003-stdio-server-spawn-path.md)
 - [0004: Trust the MCP `readOnlyHint` annotation inside read-only agent modes](0004-trust-mcp-readonly-hint-for-readonly-modes.md)
+- [0005: Group membership and order live inside the group record](0005-chat-group-layout-model.md)

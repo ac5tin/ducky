@@ -22,7 +22,7 @@ Rust 1.85+ required (`rust-version` in Cargo.toml). Linux builds need `webkit2gt
 
 ## Layout
 
-- `src/` — React + TS (strict, `noUnusedLocals`/`noUnusedParameters`), Tailwind v4 (CSS-first, no config file), zustand (`store.ts`), no router; components under `chat/`, `connectors/`, `modals/`, `settings/`. No import aliases — use relative paths.
+- `src/` — React + TS (strict, `noUnusedLocals`/`noUnusedParameters`), Tailwind v4 (CSS-first, no config file), zustand (`store.ts`), no router; components under `chat/`, `connectors/`, `modals/`, `settings/`, `sidebar/`. No import aliases — use relative paths.
 - `src-tauri/src/commands.rs` — the ~40-command Tauri command surface; frontend calls backend only through these.
 - `src-tauri/src/events.rs` — `BackendEvent` stream to the webview on `backend://event`.
 - `src-tauri/src/agent.rs` — chat loop: stream → tool calls → approvals → tool results; also subagents (`ducky__subagent` tool: parallel/nested runs via `RunScope`, depth-capped; spawns take an optional `agent` type resolving to a user-editable `SubagentConfig` in Settings — persona, optional model/effort overrides, enforced tool allowlists; defaults General-Purpose + Explore are seeded into config once — see `docs/superpowers/specs/2026-09-20-subagents-design.md` and `2026-09-21-subagent-definitions-design.md`).
