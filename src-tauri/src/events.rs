@@ -3,6 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::AgentMode;
+
 /// Identity/config of a `ducky__subagent` run, shown on its tool card.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubagentMeta {
@@ -83,6 +85,19 @@ pub enum BackendEvent {
         tool: String,
         args: serde_json::Value,
         read_only_hint: Option<bool>,
+    },
+    /// A plan was presented for approval (plan mode). The user's answer comes
+    /// back through `plan_respond`.
+    PlanPresented {
+        request_id: String,
+        conversation_id: Option<String>,
+        plan: String,
+    },
+    /// The conversation's agent mode changed: a user switch, an auto-mode
+    /// switch, or an approved plan.
+    ModeChanged {
+        conversation_id: String,
+        mode: AgentMode,
     },
     /// Server needs input from the user (MCP elicitation, form or URL mode).
     ElicitationRequested {

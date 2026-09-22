@@ -29,6 +29,15 @@ pub enum ApprovalDecision {
     Deny,
 }
 
+/// The user's answer to a presented plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanDecision {
+    /// Plan mode ends; the agent continues in default mode.
+    Approve,
+    /// Plan mode stays active, and the text is what the user wants changed.
+    Revise(String),
+}
+
 /// Provider + model to use when fulfilling a sampling request.
 #[derive(Clone)]
 pub struct SamplingBackend {
@@ -50,6 +59,7 @@ pub struct InteractiveBridge {
     approvals: Pending<ApprovalDecision>,
     elicitations: Pending<ElicitResult>,
     sampling_slots: Pending<bool>,
+    plans: Pending<PlanDecision>,
 }
 
 /// Keeps the conversation context attributed while an agent run (main turn
@@ -88,6 +98,7 @@ impl InteractiveBridge {
             approvals: Arc::new(Mutex::new(HashMap::new())),
             elicitations: Arc::new(Mutex::new(HashMap::new())),
             sampling_slots: Arc::new(Mutex::new(HashMap::new())),
+            plans: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -142,6 +153,14 @@ impl InteractiveBridge {
         for (_, tx) in s.drain() {
             let _ = tx.send(false);
         }
+        drop(s);
+        // a cancelled turn must never leave the model waiting on a plan
+        let mut plans = self.plans.lock().unwrap();
+        for (_, tx) in plans.drain() {
+            let _ = tx.send(PlanDecision::Revise(
+                "the user cancelled the plan review".into(),
+            ));
+        }
     }
 
     // -- approvals ---------------------------------------------------------
@@ -195,6 +214,39 @@ impl InteractiveBridge {
     /// Called from a Tauri command when the user answers an approval dialog.
     pub fn resolve_approval(&self, request_id: &str, decision: ApprovalDecision) -> bool {
         if let Some(tx) = self.approvals.lock().unwrap().remove(request_id) {
+            let _ = tx.send(decision);
+            true
+        } else {
+            false
+        }
+    }
+
+    // -- plan approval (plan mode) -----------------------------------------
+
+    /// Ask the user to review a plan. Always resolves: a cancelled turn or a
+    /// dropped request becomes a `Revise`.
+    pub async fn request_plan_approval(
+        &self,
+        conversation_id: Option<String>,
+        plan: String,
+    ) -> PlanDecision {
+        let request_id = crate::config::Store::new_id();
+        let (tx, rx) = oneshot::channel();
+        self.plans.lock().unwrap().insert(request_id.clone(), tx);
+        self.sink.emit(BackendEvent::PlanPresented {
+            request_id: request_id.clone(),
+            conversation_id,
+            plan,
+        });
+        match rx.await {
+            Ok(decision) => decision,
+            Err(_) => PlanDecision::Revise("the user cancelled the plan review".into()),
+        }
+    }
+
+    /// Called from a Tauri command when the user answers the plan dialog.
+    pub fn resolve_plan(&self, request_id: &str, decision: PlanDecision) -> bool {
+        if let Some(tx) = self.plans.lock().unwrap().remove(request_id) {
             let _ = tx.send(decision);
             true
         } else {

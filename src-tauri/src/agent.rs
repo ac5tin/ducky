@@ -430,6 +430,109 @@ impl Agent {
             .unwrap_or(cfg.settings.default_mode)
     }
 
+    /// Write a conversation's mode and tell the UI. The next loop iteration
+    /// reads it through `effective_mode`, so the switch applies immediately.
+    fn set_conversation_mode(&self, conversation_id: &str, mode: AgentMode) {
+        {
+            let mut cfg = self.store.config.lock().unwrap();
+            let Some(meta) = cfg.conversations.iter_mut().find(|c| c.id == conversation_id)
+            else {
+                return;
+            };
+            if meta.mode == mode {
+                return;
+            }
+            meta.mode = mode;
+        }
+        let _ = self.store.save_config();
+        self.sink.emit(BackendEvent::ModeChanged {
+            conversation_id: conversation_id.to_string(),
+            mode,
+        });
+    }
+
+    /// `ducky__present_plan`: show the plan, then act on the user's answer.
+    /// Approval ends plan mode; a revision keeps it and hands the user's
+    /// requested changes back to the model.
+    async fn present_plan_tool(
+        &self,
+        conversation_id: &str,
+        call: &ToolCall,
+        parent: Option<&str>,
+        ct: &CancellationToken,
+    ) -> String {
+        let plan = call
+            .arguments
+            .get("plan")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if plan.is_empty() {
+            let msg = "ducky__present_plan needs a non-empty `plan` argument".to_string();
+            self.emit_tool_update(
+                conversation_id,
+                &call.id,
+                "error",
+                serde_json::json!({ "tool": call.name, "result_text": msg, "is_error": true }),
+                parent,
+            );
+            return format!("Error: {msg}");
+        }
+
+        self.emit_tool_update(
+            conversation_id,
+            &call.id,
+            "pending_approval",
+            serde_json::json!({ "tool": call.name, "args": call.arguments }),
+            parent,
+        );
+        let decision = tokio::select! {
+            _ = ct.cancelled() => crate::mcp::bridge::PlanDecision::Revise(
+                "the user cancelled the plan review".into(),
+            ),
+            d = self.bridge.request_plan_approval(
+                Some(conversation_id.to_string()),
+                plan,
+            ) => d,
+        };
+        match decision {
+            crate::mcp::bridge::PlanDecision::Approve => {
+                self.set_conversation_mode(conversation_id, AgentMode::Default);
+                self.emit_tool_update(
+                    conversation_id,
+                    &call.id,
+                    "done",
+                    serde_json::json!({
+                        "tool": call.name,
+                        "result_text": "The user approved the plan.",
+                    }),
+                    parent,
+                );
+                "The user approved this plan. Plan mode is off — you are in default mode \
+                 now. Start implementing the approved plan; tell the user if you deviate."
+                    .to_string()
+            }
+            crate::mcp::bridge::PlanDecision::Revise(feedback) => {
+                self.emit_tool_update(
+                    conversation_id,
+                    &call.id,
+                    "denied",
+                    serde_json::json!({
+                        "tool": call.name,
+                        "result_text": feedback,
+                        "is_error": true,
+                    }),
+                    parent,
+                );
+                format!(
+                    "The user did not approve the plan yet: {feedback}\n\
+                     Revise the plan and call ducky__present_plan again."
+                )
+            }
+        }
+    }
+
     /// Resolve a qualified tool name to its server + raw tool entry. Builtins
     /// are checked first so a user server can't shadow or spoof them.
     fn resolve_tool(
@@ -1340,6 +1443,26 @@ impl Agent {
                 parent,
             );
             return format!("Error: {msg}");
+        }
+
+        // control tools are chat flow, not tool calls: no approval prompt, no
+        // server, and main-scope only so a subagent can never flip the
+        // conversation's mode or open the plan review
+        if crate::builtin::is_control(&call.name) {
+            if !scope.is_main() {
+                let msg = "control tools are not available inside a subagent".to_string();
+                self.emit_tool_update(
+                    conversation_id,
+                    &call.id,
+                    "error",
+                    serde_json::json!({ "tool": call.name, "result_text": msg, "is_error": true }),
+                    parent,
+                );
+                return format!("Error: {msg}");
+            }
+            return self
+                .present_plan_tool(conversation_id, call, parent, ct)
+                .await;
         }
 
         self.emit_tool_update(

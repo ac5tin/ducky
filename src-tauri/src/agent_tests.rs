@@ -324,6 +324,80 @@ fn tool_cards(sink: &CollectingSink) -> Vec<(String, Option<String>, Option<Stri
         .collect()
 }
 
+/// Wait for a `PlanPresented` event and return its request id.
+async fn wait_for_plan(sink: &CollectingSink) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(id) = sink.events.lock().unwrap().iter().find_map(|e| match e {
+            BackendEvent::PlanPresented { request_id, .. } => Some(request_id.clone()),
+            _ => None,
+        }) {
+            return id;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no PlanPresented event within 5s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+fn plan_events(sink: &CollectingSink) -> Vec<String> {
+    sink.events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            BackendEvent::PlanPresented { plan, .. } => Some(plan.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn mode_events(sink: &CollectingSink) -> Vec<AgentMode> {
+    sink.events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            BackendEvent::ModeChanged { mode, .. } => Some(*mode),
+            _ => None,
+        })
+        .collect()
+}
+
+fn mode_of(store: &Store, conversation_id: &str) -> AgentMode {
+    store
+        .config
+        .lock()
+        .unwrap()
+        .conversations
+        .iter()
+        .find(|c| c.id == conversation_id)
+        .expect("conversation exists")
+        .mode
+}
+
+/// Run a turn while answering the plan it presents. The turn blocks inside
+/// `present_plan`, so it must run as a task.
+async fn run_answering_plan(
+    agent: &Arc<Agent>,
+    sink: &CollectingSink,
+    conversation_id: &str,
+    prompt: &str,
+    decision: crate::mcp::bridge::PlanDecision,
+) {
+    let handle = {
+        let agent = agent.clone();
+        let id = conversation_id.to_string();
+        let prompt = prompt.to_string();
+        tokio::spawn(async move { run(&agent, &id, &prompt, &CancellationToken::new()).await })
+    };
+    let request_id = wait_for_plan(sink).await;
+    assert!(agent.bridge.resolve_plan(&request_id, decision));
+    handle.await.unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1049,4 +1123,182 @@ async fn mode_text_reaches_the_model_and_default_adds_none() {
     assert!(!system.contains("# Plan mode"), "{system}");
     assert!(!system.contains("# Read-only mode"), "{system}");
     assert!(!system.contains("# Auto mode"), "{system}");
+}
+
+// ---------------------------------------------------------------------------
+// Plan approval
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn approving_a_plan_leaves_plan_mode_and_reoffers_writes() {
+    script(
+        "p1-main",
+        vec![
+            MockRound::Tools(vec![(
+                "ducky__present_plan".into(),
+                serde_json::json!({ "plan": "# Plan\n\n1. Do the thing." }),
+            )]),
+            MockRound::Text("implementing".into()),
+        ],
+    );
+    let (agent, sink, store) = test_agent_in_mode("p1-conv", AgentMode::Plan);
+    run_answering_plan(
+        &agent,
+        &sink,
+        "p1-conv",
+        "p1-main",
+        crate::mcp::bridge::PlanDecision::Approve,
+    )
+    .await;
+
+    // the plan reached the UI, unchanged
+    assert_eq!(plan_events(&sink), vec!["# Plan\n\n1. Do the thing.".to_string()]);
+    // approval flipped the mode, told the UI, and told the model to build
+    assert_eq!(mode_of(&store, "p1-conv"), AgentMode::Default);
+    assert_eq!(mode_events(&sink), vec![AgentMode::Default]);
+    let results = tool_results(&store, "p1-conv");
+    assert!(results[0].contains("The user approved this plan"), "{}", results[0]);
+    // and the next round offers the write tools again
+    let names = captures_for("p1-main")[1].tool_names.clone();
+    assert!(names.contains(&"ducky__fs_write".to_string()), "{names:?}");
+}
+
+#[tokio::test]
+async fn revising_a_plan_keeps_plan_mode_and_returns_the_feedback() {
+    script(
+        "p2-main",
+        vec![
+            MockRound::Tools(vec![(
+                "ducky__present_plan".into(),
+                serde_json::json!({ "plan": "first draft" }),
+            )]),
+            MockRound::Text("revising".into()),
+        ],
+    );
+    let (agent, sink, store) = test_agent_in_mode("p2-conv", AgentMode::Plan);
+    run_answering_plan(
+        &agent,
+        &sink,
+        "p2-conv",
+        "p2-main",
+        crate::mcp::bridge::PlanDecision::Revise("shorter please".into()),
+    )
+    .await;
+
+    assert_eq!(mode_of(&store, "p2-conv"), AgentMode::Plan);
+    assert!(mode_events(&sink).is_empty(), "no mode change on a revision");
+    let results = tool_results(&store, "p2-conv");
+    assert!(results[0].contains("shorter please"), "{}", results[0]);
+    // still read-only on the next round
+    let names = captures_for("p2-main")[1].tool_names.clone();
+    assert!(!names.contains(&"ducky__fs_write".to_string()), "{names:?}");
+}
+
+#[tokio::test]
+async fn a_second_plan_in_the_same_message_is_refused() {
+    script(
+        "p3-main",
+        vec![
+            MockRound::Tools(vec![
+                ("ducky__present_plan".into(), serde_json::json!({ "plan": "one" })),
+                ("ducky__present_plan".into(), serde_json::json!({ "plan": "two" })),
+            ]),
+            MockRound::Text("done".into()),
+        ],
+    );
+    let (agent, sink, store) = test_agent_in_mode("p3-conv", AgentMode::Plan);
+    run_answering_plan(
+        &agent,
+        &sink,
+        "p3-conv",
+        "p3-main",
+        crate::mcp::bridge::PlanDecision::Approve,
+    )
+    .await;
+
+    // only one plan was ever presented, and the second call was refused
+    assert_eq!(plan_events(&sink), vec!["one".to_string()]);
+    let results = tool_results(&store, "p3-conv");
+    assert_eq!(results.len(), 2);
+    assert!(results[1].contains("only available in plan mode"), "{}", results[1]);
+}
+
+#[tokio::test]
+async fn an_empty_plan_is_refused_without_asking_the_user() {
+    script(
+        "p4-main",
+        vec![
+            MockRound::Tools(vec![(
+                "ducky__present_plan".into(),
+                serde_json::json!({ "plan": "   " }),
+            )]),
+            MockRound::Text("done".into()),
+        ],
+    );
+    let (agent, sink, store) = test_agent_in_mode("p4-conv", AgentMode::Plan);
+    run(&agent, "p4-conv", "p4-main", &CancellationToken::new()).await;
+
+    assert!(plan_events(&sink).is_empty(), "no plan event for an empty plan");
+    let results = tool_results(&store, "p4-conv");
+    assert!(results[0].contains("non-empty"), "{}", results[0]);
+    assert_eq!(mode_of(&store, "p4-conv"), AgentMode::Plan);
+}
+
+#[tokio::test]
+async fn a_large_plan_survives_the_tool_argument() {
+    let big = "x".repeat(20_000);
+    script(
+        "p5-main",
+        vec![
+            MockRound::Tools(vec![(
+                "ducky__present_plan".into(),
+                serde_json::json!({ "plan": big }),
+            )]),
+            MockRound::Text("done".into()),
+        ],
+    );
+    let (agent, sink, _store) = test_agent_in_mode("p5-conv", AgentMode::Plan);
+    run_answering_plan(
+        &agent,
+        &sink,
+        "p5-conv",
+        "p5-main",
+        crate::mcp::bridge::PlanDecision::Approve,
+    )
+    .await;
+
+    assert_eq!(plan_events(&sink)[0].len(), 20_000);
+}
+
+#[tokio::test]
+async fn a_stale_plan_answer_changes_nothing() {
+    let (agent, _sink, _store) = test_agent("p6-conv");
+    assert!(!agent
+        .bridge
+        .resolve_plan("no-such-request", crate::mcp::bridge::PlanDecision::Approve));
+}
+
+#[tokio::test]
+async fn cancelling_a_turn_settles_a_pending_plan() {
+    script(
+        "p7-main",
+        vec![MockRound::Tools(vec![(
+            "ducky__present_plan".into(),
+            serde_json::json!({ "plan": "pending" }),
+        )])],
+    );
+    let (agent, sink, store) = test_agent_in_mode("p7-conv", AgentMode::Plan);
+    let handle = {
+        let agent = agent.clone();
+        tokio::spawn(async move {
+            run(&agent, "p7-conv", "p7-main", &CancellationToken::new()).await
+        })
+    };
+    let _ = wait_for_plan(&sink).await;
+    agent.bridge.cancel_for_conversation("p7-conv");
+    handle.await.unwrap();
+
+    assert_eq!(mode_of(&store, "p7-conv"), AgentMode::Plan);
+    let results = tool_results(&store, "p7-conv");
+    assert!(results[0].contains("cancelled the plan review"), "{}", results[0]);
 }

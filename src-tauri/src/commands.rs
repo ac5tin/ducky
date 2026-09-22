@@ -12,7 +12,7 @@ use crate::config::{
     self, AppConfig, ConversationMeta, McpServerConfig, ProviderConfig, Store, SubagentConfig,
     Theme, ToolRule, UndoRecord,
 };
-use crate::mcp::bridge::ApprovalDecision;
+use crate::mcp::bridge::{ApprovalDecision, PlanDecision};
 use crate::providers::Msg;
 use crate::state::AppState;
 
@@ -591,6 +591,22 @@ pub fn conversation_set_effort(
 }
 
 #[tauri::command]
+pub fn conversation_set_mode(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    mode: config::AgentMode,
+) -> Result<(), String> {
+    {
+        let mut c = state.store.config.lock().unwrap();
+        let Some(meta) = c.conversations.iter_mut().find(|c| c.id == id) else {
+            return Err("Unknown conversation".into());
+        };
+        meta.mode = mode;
+    }
+    state.store.save_config().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn conversation_set_mcp_ids(
     state: State<'_, Arc<AppState>>,
     id: String,
@@ -1082,6 +1098,28 @@ pub fn approval_respond(state: State<'_, Arc<AppState>>, response: ApprovalRespo
     state
         .bridge
         .resolve_approval(&response.request_id, decision)
+}
+
+#[derive(Deserialize)]
+pub struct PlanResponse {
+    pub request_id: String,
+    pub decision: String, // "approve" | "revise"
+    pub feedback: Option<String>,
+}
+
+/// Answer the plan review dialog. Returns false when the request is gone
+/// (cancelled turn, or the app restarted while a plan was pending).
+#[tauri::command]
+pub fn plan_respond(state: State<'_, Arc<AppState>>, response: PlanResponse) -> bool {
+    let decision = match response.decision.as_str() {
+        "approve" => PlanDecision::Approve,
+        "revise" => PlanDecision::Revise(match response.feedback {
+            Some(text) if !text.trim().is_empty() => text,
+            _ => "the user asked for changes without saying what".to_string(),
+        }),
+        _ => return false,
+    };
+    state.bridge.resolve_plan(&response.request_id, decision)
 }
 
 #[derive(Deserialize)]
