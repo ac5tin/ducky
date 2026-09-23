@@ -11,6 +11,15 @@ export type MessageActionItem = {
   streaming?: boolean;
 };
 
+export function latestUserMessageIndex(
+  raw: readonly { kind: string }[],
+): number | undefined {
+  for (let i = raw.length - 1; i >= 0; i--) {
+    if (raw[i]?.kind === "user") return i;
+  }
+  return undefined;
+}
+
 export function messageActionKinds(
   item: MessageActionItem,
 ): MessageActionKind[] {

@@ -3,6 +3,7 @@ import { create } from "zustand";
 import { check as updaterCheck, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import * as api from "./api";
+import { latestUserMessageIndex } from "./chatMessageActions";
 import { resolveDraftModel } from "./chatDraft";
 import { toLayout } from "./groups";
 import { expandInitPrompt, parseSlashCommand } from "./slashCommands";
@@ -796,13 +797,9 @@ export const useStore = create<StoreState>((set, get) => ({
     try {
       let boundary = messageIndex;
       if (boundary === undefined) {
+        // Only persisted turns use this fallback while their completion reloads.
         const [, raw] = await api.conversationGet(id);
-        for (let i = raw.length - 1; i >= 0; i--) {
-          if (raw[i]?.kind === "user") {
-            boundary = i;
-            break;
-          }
-        }
+        boundary = latestUserMessageIndex(raw);
       }
       if (boundary === undefined) return false;
       await api.conversationTruncate(id, boundary);
@@ -1216,6 +1213,7 @@ async function dispatchSend(
       };
     });
     // the turn never started, so no message_done will arrive to drain the rest
+    if (active) await get().reloadItems(convId);
     drainQueue(convId, set, get);
     return false;
   }
