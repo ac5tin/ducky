@@ -186,11 +186,16 @@ function dropChat(
     }
     case "group-header": {
       const group = groups.find((g) => g.id === target.groupId);
-      // Moving up over a header, or any move over a collapsed group, ungroups.
-      if (!group || group.collapsed || direction === "before") {
-        return moveConversation(groups, conversationId, null, null);
-      }
-      return moveConversation(groups, conversationId, group.id, 0);
+      if (!group) return moveConversation(groups, conversationId, null, null);
+      // A collapsed group has no visible rows to aim between, so its header
+      // means "into this group", whichever way the pointer is moving. This is
+      // what the highlight promises, and the group is opened on drop.
+      if (group.collapsed) return moveConversation(groups, conversationId, group.id, 0);
+      // Expanded: moving down means the top of the group; moving up means the
+      // top level, which is the ungroup gesture that needs no footer strip.
+      return direction === "before"
+        ? moveConversation(groups, conversationId, null, null)
+        : moveConversation(groups, conversationId, group.id, 0);
     }
     case "group-footer":
       // Moving up over the footer means the end of the group; down means out.

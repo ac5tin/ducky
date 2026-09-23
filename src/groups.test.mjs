@@ -166,7 +166,7 @@ test("a chat dropped on an expanded group header goes inside, or out", () => {
   assert.deepEqual(shape(up), ["g1:[a,b]", "g2:[]"]);
 });
 
-test("a chat dropped on a collapsed group header never goes inside", () => {
+test("a chat dropped on a collapsed group header goes inside that group", () => {
   const origin = [group("g1", ["a"], { collapsed: true }), group("g2", ["c"])];
   const built = view(origin, [chat("a"), chat("c")]);
   const next = computeDropLayout(
@@ -175,7 +175,7 @@ test("a chat dropped on a collapsed group header never goes inside", () => {
     { kind: "group-header", groupId: "g1" },
     "after",
   );
-  assert.deepEqual(shape(next), ["g1:[a]", "g2:[]"]);
+  assert.deepEqual(shape(next), ["g1:[c,a]", "g2:[]"]);
 });
 
 test("a chat dropped on a group footer goes to the end, or out", () => {

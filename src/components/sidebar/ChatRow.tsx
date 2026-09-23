@@ -42,7 +42,7 @@ export function ChatRow({ chat }: { chat: ConversationMeta }) {
       {...drag.listeners}
       className={`group flex items-center gap-1 rounded-lg px-2 py-1.5 text-sm transition ${
         drag.isDragging ? "opacity-40" : ""
-      } ${
+      } ${drop.isOver ? "ring-2 ring-sky-400" : ""} ${
         chat.id === activeId
           ? "bg-sky-100 text-sky-900 dark:bg-sky-900/40 dark:text-sky-100"
           : "hover:bg-slate-200/60 dark:hover:bg-slate-800"

@@ -74,6 +74,8 @@ export function GroupHeader({
       {...drag.attributes}
       {...drag.listeners}
       className={`group flex items-center gap-1 rounded-lg px-2 py-1.5 text-sm text-slate-500 transition dark:text-slate-300 ${
+        header.isOver || groupOver.isOver ? "ring-2 ring-sky-400" : ""
+      } ${
         drag.isDragging ? "opacity-40" : "hover:bg-slate-200/60 dark:hover:bg-slate-800"
       }`}
     >

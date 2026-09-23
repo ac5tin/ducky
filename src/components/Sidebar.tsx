@@ -11,7 +11,6 @@ import type {
   CollisionDetection,
   DragEndEvent,
   DragMoveEvent,
-  DragOverEvent,
   DragStartEvent,
 } from "@dnd-kit/core";
 import { useCallback, useMemo, useRef, useState } from "react";
@@ -37,7 +36,13 @@ import { GroupHeader } from "./sidebar/GroupHeader";
  *  the group, moving down to leave it. */
 function GroupFooterStrip({ group }: { group: ChatGroup }) {
   const footer = useDroppable({ id: groupFooterZone(group.id), data: { kind: "group-footer" } });
-  return <div ref={footer.setNodeRef} className="h-2.5" />;
+  return (
+    <div ref={footer.setNodeRef} className="h-2.5">
+      <div
+        className={`h-0.5 rounded-full transition ${footer.isOver ? "bg-sky-400" : "bg-transparent"}`}
+      />
+    </div>
+  );
 }
 
 /** Shown by an empty group. Dropping here fills the group; clicking starts a
@@ -48,7 +53,11 @@ function GroupEmptyZone({ group }: { group: ChatGroup }) {
   return (
     <button
       ref={empty.setNodeRef}
-      className="w-full rounded-lg border border-dashed border-slate-300 px-2 py-1.5 text-xs text-slate-400 transition hover:border-sky-400 hover:text-sky-600 dark:border-slate-700"
+      className={`w-full rounded-lg border border-dashed px-2 py-1.5 text-xs transition ${
+        empty.isOver
+          ? "border-sky-400 text-sky-600"
+          : "border-slate-300 text-slate-400 hover:border-sky-400 hover:text-sky-600 dark:border-slate-700"
+      }`}
       onClick={() => newConversationInGroup(group.id).catch((e) => console.error(e))}
     >
       New chat, or drag here.
@@ -82,34 +91,20 @@ export function Sidebar() {
   };
 
   const applyGroupLayout = useStore((s) => s.applyGroupLayout);
+  const setGroupCollapsed = useStore((s) => s.setGroupCollapsed);
 
-  // While a drag is running the sidebar renders `preview` instead of the
-  // stored layout, so rows re-order live under the pointer.
-  const [preview, setPreview] = useState<ChatGroup[] | null>(null);
   const [activeDrag, setActiveDrag] = useState<DragRef | null>(null);
   const dragRef = useRef<DragRef | null>(null);
-  const originRef = useRef<ChatGroup[] | null>(null);
   const directionRef = useRef<DragDirection>("after");
-  /** The droppable the pointer was over last, so a direction flip can be
-   *  re-evaluated without a fresh `onDragOver`. */
-  const overIdRef = useRef<string | null>(null);
-  /** Signature of the layout the preview is currently showing. */
-  const previewSignatureRef = useRef<string | null>(null);
 
-  const renderGroups = useMemo(
-    () => preview ?? sidebarView.groups.map((node) => node.group),
-    [preview, sidebarView],
-  );
-  const renderView = useMemo(
-    () => buildSidebarView(conversations, renderGroups),
-    [conversations, renderGroups],
-  );
   const activeChat =
     activeDrag?.kind === "chat"
       ? conversations.find((c) => c.id === activeDrag.id) ?? null
       : null;
   const activeGroupNode =
-    activeDrag?.kind === "group" ? renderView.groups.find((n) => n.group.id === activeDrag.id) : undefined;
+    activeDrag?.kind === "group"
+      ? sidebarView.groups.find((n) => n.group.id === activeDrag.id)
+      : undefined;
 
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
 
@@ -126,83 +121,58 @@ export function Sidebar() {
     return closestCenter({ ...args, droppableContainers: containers });
   }, []);
 
-  /** The layout this drop would produce, computed from the layout the drag
-   *  started with, so a direction flip re-evaluates instead of stacking. */
-  const layoutFor = (drag: DragRef, overId: string | null): ChatGroup[] => {
-    const origin = originRef.current;
-    if (!origin || !overId) return origin ?? renderGroups;
-    const target = parseZone(overId);
-    if (!target) return origin;
-    return computeDropLayout(buildSidebarView(conversations, origin), drag, target, directionRef.current);
-  };
-
-  /** The live preview is only worth a re-render when the layout changes. An
-   *  unconditional setState here re-renders the list on every drag-over, and
-   *  because the rows themselves are droppables, each render re-measures and
-   *  re-runs the collision test — which is what turned a re-order into an
-   *  endless update loop. */
-  const showPreview = (next: ChatGroup[]) => {
-    const signature = layoutSignature(next);
-    if (signature === previewSignatureRef.current) return;
-    previewSignatureRef.current = signature;
-    setPreview(next);
+  /** The layout this drop would produce, computed once at drop time from the
+   *  layout on screen.
+   *
+   *  The list is deliberately NOT re-ordered while the drag runs. Moving rows
+   *  mid-drag moves the drop zones under a stationary pointer, so the collision
+   *  test flips between two zones and the preview flips with it, mounting and
+   *  unmounting rows forever — React aborts that loop by unmounting the app.
+   *  A highlight on the target zone (see `isOver` in the rows and headers) is
+   *  the drag feedback instead. */
+  const layoutFor = (drag: DragRef, overId: string | null): ChatGroup[] | null => {
+    const target = overId ? parseZone(overId) : null;
+    if (!target) return null;
+    return computeDropLayout(sidebarView, drag, target, directionRef.current);
   };
 
   const onDragStart = (event: DragStartEvent) => {
     const drag = parseDragId(String(event.active.id));
     if (!drag) return;
-    const origin = sidebarView.groups.map((node) => node.group);
     directionRef.current = "after";
-    originRef.current = origin;
-    overIdRef.current = null;
-    previewSignatureRef.current = layoutSignature(origin);
     dragRef.current = drag;
     setActiveDrag(drag);
-    setPreview(origin);
   };
 
-  // onDragOver only fires when the target changes, so a direction flip over the
-  // same header or footer is invisible to it. Watch the direction here and
-  // re-run the preview against the target we last saw.
   const onDragMove = (event: DragMoveEvent) => {
-    const next = event.delta.y < 0 ? "before" : "after";
-    if (next === directionRef.current) return;
-    directionRef.current = next;
-    const drag = dragRef.current;
-    if (drag && overIdRef.current) showPreview(layoutFor(drag, overIdRef.current));
-  };
-
-  const onDragOver = (event: DragOverEvent) => {
-    const drag = dragRef.current;
-    if (!drag) return;
-    const overId = event.over ? String(event.over.id) : null;
-    overIdRef.current = overId;
-    showPreview(layoutFor(drag, overId));
+    directionRef.current = event.delta.y < 0 ? "before" : "after";
   };
 
   const onDragEnd = (event: DragEndEvent) => {
     const drag = dragRef.current;
-    const origin = originRef.current;
-    const next = drag ? layoutFor(drag, event.over ? String(event.over.id) : null) : null;
+    const overId = event.over ? String(event.over.id) : null;
+    const target = overId ? parseZone(overId) : null;
+    const next = drag ? layoutFor(drag, overId) : null;
     dragRef.current = null;
-    originRef.current = null;
-    overIdRef.current = null;
-    previewSignatureRef.current = null;
     setActiveDrag(null);
-    setPreview(null);
-    if (!drag || !origin || !next) return;
+    if (!drag || !next) return;
     // A drop that changed nothing must not write to the config.
-    if (layoutSignature(next) === layoutSignature(origin)) return;
+    const before = sidebarView.groups.map((node) => node.group);
+    if (layoutSignature(next) === layoutSignature(before)) return;
     applyGroupLayout(next).catch((e) => console.error(e));
+    // A collapsed group shows no rows, so a chat dropped into it would look
+    // like nothing happened. Open the group it landed in.
+    if (
+      target?.kind === "group-header" &&
+      sidebarView.groups.find((node) => node.group.id === target.groupId)?.group.collapsed
+    ) {
+      setGroupCollapsed(target.groupId, false).catch((e) => console.error(e));
+    }
   };
 
   const onDragCancel = () => {
     dragRef.current = null;
-    originRef.current = null;
-    overIdRef.current = null;
-    previewSignatureRef.current = null;
     setActiveDrag(null);
-    setPreview(null);
   };
 
   const sectionButton =
@@ -236,7 +206,6 @@ export function Sidebar() {
         autoScroll={{ threshold: { x: 0.1, y: 0.1 } }}
         onDragStart={onDragStart}
         onDragMove={onDragMove}
-        onDragOver={onDragOver}
         onDragEnd={onDragEnd}
         onDragCancel={onDragCancel}
       >
@@ -282,7 +251,7 @@ export function Sidebar() {
           </p>
         )}
 
-        {renderView.groups.map(({ group, chats }) => (
+        {sidebarView.groups.map(({ group, chats }) => (
           <div key={group.id}>
             <GroupHeader
               group={group}
@@ -301,7 +270,7 @@ export function Sidebar() {
           </div>
         ))}
 
-        {renderView.ungrouped.map((chat) => (
+        {sidebarView.ungrouped.map((chat) => (
           <ChatRow key={chat.id} chat={chat} />
         ))}
       </div>
