@@ -67,6 +67,13 @@ export function GroupHeader({
 
   const iconButton =
     "shrink-0 rounded p-1 text-slate-400 transition hover:bg-slate-200 hover:text-slate-700 dark:hover:bg-slate-700 dark:hover:text-slate-200";
+  // The row's controls keep their space when the pointer is away, so nothing
+  // moves under the cursor. `hidden` made them appear to the right of the
+  // chevron and push it left, which parked "ungroup and delete" on the pixel
+  // the chevron had just left. `invisible` reserves the space, and
+  // `group-focus-within` keeps the buttons reachable by keyboard, because a
+  // `display: none` control is not in the tab order at all.
+  const revealOnHover = "invisible group-hover:visible group-focus-within:visible";
 
   return (
     <div
@@ -79,6 +86,17 @@ export function GroupHeader({
         drag.isDragging ? "opacity-40" : "hover:bg-slate-200/60 dark:hover:bg-slate-800"
       }`}
     >
+      <button
+        className={iconButton}
+        aria-expanded={!group.collapsed}
+        aria-controls={groupBodyId(group.id)}
+        aria-label={group.collapsed ? "Expand group" : "Collapse group"}
+        title={group.collapsed ? "Expand group" : "Collapse group"}
+        onClick={() => setGroupCollapsed(group.id, !group.collapsed).catch((e) => console.error(e))}
+      >
+        <Icon name="chevron" className={`h-3.5 w-3.5 transition ${group.collapsed ? "-rotate-90" : ""}`} />
+      </button>
+
       <div className="relative shrink-0">
         <button
           className="flex h-4 w-4 items-center justify-center rounded"
@@ -112,18 +130,7 @@ export function GroupHeader({
       <span className="shrink-0 text-[11px] text-slate-400">{count}</span>
 
       <button
-        className={iconButton}
-        aria-expanded={!group.collapsed}
-        aria-controls={groupBodyId(group.id)}
-        aria-label={group.collapsed ? "Expand group" : "Collapse group"}
-        title={group.collapsed ? "Expand group" : "Collapse group"}
-        onClick={() => setGroupCollapsed(group.id, !group.collapsed).catch((e) => console.error(e))}
-      >
-        <Icon name="chevron" className={`h-3.5 w-3.5 transition ${group.collapsed ? "-rotate-90" : ""}`} />
-      </button>
-
-      <button
-        className={`hidden group-hover:block ${iconButton}`}
+        className={`${revealOnHover} ${iconButton}`}
         aria-label="New chat in group"
         title="New chat in group"
         onClick={() => newConversationInGroup(group.id).catch((e) => console.error(e))}
@@ -132,7 +139,7 @@ export function GroupHeader({
       </button>
 
       <button
-        className={`hidden group-hover:block ${iconButton}`}
+        className={`${revealOnHover} ${iconButton}`}
         aria-label="Rename group"
         title="Rename group"
         onClick={rename.start}
@@ -141,7 +148,7 @@ export function GroupHeader({
       </button>
 
       <button
-        className={`hidden text-slate-400 group-hover:block hover:bg-rose-100 hover:text-rose-600 dark:hover:bg-rose-950 ${iconButton}`}
+        className={`${revealOnHover} text-slate-400 hover:bg-rose-100 hover:text-rose-600 dark:hover:bg-rose-950 ${iconButton}`}
         aria-label="Ungroup and delete"
         title="Ungroup and delete"
         onClick={() => deleteGroup(group.id).catch((e) => console.error(e))}
