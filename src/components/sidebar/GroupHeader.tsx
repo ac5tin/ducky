@@ -10,6 +10,7 @@ import {
 import { useStore } from "../../store";
 import type { ChatGroup } from "../../types";
 import { Icon } from "../icons";
+import { Button, Modal } from "../modals/Modal";
 import { GroupColorPicker } from "./GroupColorPicker";
 import { useInlineRename } from "./useInlineRename";
 
@@ -30,6 +31,7 @@ export function GroupHeader({
   const setGroupCollapsed = useStore((s) => s.setGroupCollapsed);
   const newConversationInGroup = useStore((s) => s.newConversationInGroup);
   const [colorOpen, setColorOpen] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const rename = useInlineRename(group.title, (title) => {
     renameGroup(group.id, title).catch((e) => console.error(e));
   });
@@ -80,6 +82,7 @@ export function GroupHeader({
   const revealOnHover = "invisible group-hover:visible group-has-[:focus-visible]:visible";
 
   return (
+    <>
     <div
       ref={setRefs}
       {...drag.attributes}
@@ -155,10 +158,40 @@ export function GroupHeader({
         className={`${revealOnHover} text-slate-400 hover:bg-rose-100 hover:text-rose-600 dark:hover:bg-rose-950 ${iconButton}`}
         aria-label="Ungroup and delete"
         title="Ungroup and delete"
-        onClick={() => deleteGroup(group.id).catch((e) => console.error(e))}
+        onClick={() => setConfirmDelete(true)}
       >
         <Icon name="trash" className="h-3.5 w-3.5" />
       </button>
     </div>
+
+      {/* A sibling of the header, not a child: the header carries the drag
+          listeners, so a pointer-down inside the dialog would start a group
+          drag. */}
+      <Modal
+        open={confirmDelete}
+        onClose={() => setConfirmDelete(false)}
+        title="Delete this group?"
+        subtitle={`${group.title || "New group"} · ${count} ${count === 1 ? "chat" : "chats"}`}
+      >
+        <p className="text-sm leading-relaxed text-slate-600 dark:text-slate-300">
+          The chats are not deleted. They leave the group and stay in your chat list as
+          ungrouped chats.
+        </p>
+        <div className="mt-5 flex justify-end gap-2">
+          <Button variant="secondary" onClick={() => setConfirmDelete(false)}>
+            Cancel
+          </Button>
+          <Button
+            variant="danger"
+            onClick={() => {
+              setConfirmDelete(false);
+              deleteGroup(group.id).catch((e) => console.error(e));
+            }}
+          >
+            Ungroup and delete
+          </Button>
+        </div>
+      </Modal>
+    </>
   );
 }
