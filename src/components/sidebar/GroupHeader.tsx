@@ -70,10 +70,14 @@ export function GroupHeader({
   // The row's controls keep their space when the pointer is away, so nothing
   // moves under the cursor. `hidden` made them appear to the right of the
   // chevron and push it left, which parked "ungroup and delete" on the pixel
-  // the chevron had just left. `invisible` reserves the space, and
-  // `group-focus-within` keeps the buttons reachable by keyboard, because a
-  // `display: none` control is not in the tab order at all.
-  const revealOnHover = "invisible group-hover:visible group-focus-within:visible";
+  // the chevron had just left. `invisible` reserves the space.
+  //
+  // `:focus-visible`, not `:focus-within`: a clicked button keeps focus after
+  // the pointer leaves, so focus-within left the controls on screen until the
+  // next click elsewhere. Only keyboard focus counts here, which is also what
+  // puts the buttons in the tab order (`display: none` removes a control from
+  // it).
+  const revealOnHover = "invisible group-hover:visible group-has-[:focus-visible]:visible";
 
   return (
     <div
