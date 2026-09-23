@@ -76,6 +76,9 @@ export function Sidebar() {
   const [renameAfterCreate, setRenameAfterCreate] = useState<string | null>(null);
 
   const groups = useMemo(() => config?.groups ?? [], [config]);
+  // One collapse/expand-all button instead of two: with any group open the
+  // useful action is "collapse", and with every group shut it is "expand".
+  const anyExpanded = groups.some((g) => !g.collapsed);
   const conversations = useMemo(() => config?.conversations ?? [], [config]);
   const sidebarView = useMemo(
     () => buildSidebarView(conversations, groups),
@@ -225,21 +228,12 @@ export function Sidebar() {
             </button>
             <button
               className={sectionButton}
-              aria-label="Collapse all groups"
-              title="Collapse all"
+              aria-label={anyExpanded ? "Collapse all groups" : "Expand all groups"}
+              title={anyExpanded ? "Collapse all" : "Expand all"}
               disabled={groups.length === 0}
-              onClick={() => setAllGroupsCollapsed(true).catch((e) => console.error(e))}
+              onClick={() => setAllGroupsCollapsed(anyExpanded).catch((e) => console.error(e))}
             >
-              <Icon name="chevron" className="h-3.5 w-3.5 -rotate-90" />
-            </button>
-            <button
-              className={sectionButton}
-              aria-label="Expand all groups"
-              title="Expand all"
-              disabled={groups.length === 0}
-              onClick={() => setAllGroupsCollapsed(false).catch((e) => console.error(e))}
-            >
-              <Icon name="chevron" className="h-3.5 w-3.5" />
+              <Icon name="chevron" className={`h-3.5 w-3.5 ${anyExpanded ? "-rotate-90" : ""}`} />
             </button>
           </div>
         </div>
