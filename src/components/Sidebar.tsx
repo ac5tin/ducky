@@ -123,9 +123,12 @@ export function Sidebar() {
 
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
 
-  /** The group this drop would put the dragged chat inside, or null when it
-   *  would leave the chat out of every group. Every highlight is gated on it, so
-   *  a ring can never promise a move the drop will not make. */
+  /** The group this drop would move the dragged chat into, or null when it would
+   *  leave the chat out of every group or change nothing. The group header, the
+   *  footer strip and the empty zone are gated on it, so a ring can never promise
+   *  a move the drop will not make. A chat row rings on dnd-kit's own `isOver`
+   *  instead: dropping on a row really does act on that row, except when the drop
+   *  is a no-op. */
   const ringGroupId = useMemo(() => {
     if (!activeDrag || !overId) return null;
     const target = parseZone(overId);

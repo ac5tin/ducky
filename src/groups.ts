@@ -245,12 +245,12 @@ export function computeDropLayout(
     : dropGroup(groups, active.id, target, direction);
 }
 
-/** The group a drop would put the dragged chat INSIDE, or `null` when the drop
- *  leaves the chat out of every group (or changes nothing).
+/** The group this drop would move the dragged chat into, or `null` when the drop
+ *  changes nothing at all or leaves the chat out of every group.
  *
- *  The drag highlight is gated on this, and it runs the same rules as the drop
- *  itself, so a ring can never promise a move the drop will not make: over an
- *  expanded group's header, moving up means "leave the group", and the footer
+ *  The group highlights are gated on this, and it runs the same rules as the
+ *  drop itself, so a ring can never promise a move the drop will not make: over
+ *  an expanded group's header, moving up means "leave the group", and the footer
  *  strip means "end of the group" only while the pointer moves up. A group drag
  *  lands in no group. */
 export function dropLandsInGroup(
@@ -261,6 +261,9 @@ export function dropLandsInGroup(
 ): string | null {
   if (active.kind !== "chat") return null;
   const next = computeDropLayout(view, active, target, direction);
+  // A drop that changes nothing is not a promise: dropping a chat back where it
+  // already is must not light a ring for a move the drop discards.
+  if (layoutSignature(next) === layoutSignature(view.groups.map((node) => node.group))) return null;
   return next.find((g) => g.conversation_ids.includes(active.id))?.id ?? null;
 }
 

@@ -218,6 +218,10 @@ test("the drop highlight only lights a group the chat would land in", () => {
   // A chat of another group is a target that really does join that group.
   assert.equal(landsIn({ kind: "chat", conversationId: "c" }, "after"), "g2");
 
+  // A drop that changes nothing is not a promise: `a` is already at the top of
+  // the group its own header is being dragged onto.
+  assert.equal(landsIn({ kind: "group-header", groupId: "g1" }, "after", "a"), null);
+
   // A group drag lands in no group at all.
   assert.equal(
     dropLandsInGroup(built, { kind: "group", id: "g2" }, { kind: "group-over", groupId: "g1" }, "after"),
