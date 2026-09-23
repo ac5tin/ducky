@@ -845,8 +845,7 @@ pub async fn chat_send(
             let cfg = state.store.config.lock().unwrap();
             cfg.settings.effective_working_dir(&state.store.home_dir)
         };
-        match tokio::task::spawn_blocking(move || crate::snapshot::capture(&snap_root, &wd)).await
-        {
+        match tokio::task::spawn_blocking(move || crate::snapshot::capture(&snap_root, &wd)).await {
             Ok(Ok((tree, root))) => {
                 records.push(UndoRecord {
                     user_index,
@@ -870,8 +869,7 @@ pub async fn chat_send(
                     .find(|c| c.id == conversation_id)
                     .cloned()
                     .ok_or("Unknown conversation")?;
-                let payload: Vec<serde_json::Value> =
-                    history.iter().map(|m| m.as_json()).collect();
+                let payload: Vec<serde_json::Value> = history.iter().map(|m| m.as_json()).collect();
                 if let Err(e) = state.store.save_conversation(&meta, &payload, &records) {
                     tracing::warn!("failed to persist /undo snapshot record: {e}");
                 }
@@ -951,8 +949,45 @@ pub async fn conversation_compact(
         Ok(result) => result,
         Err(e) => Err(format!("Compaction failed unexpectedly: {e}")),
     };
-    app_state.compacting.lock().unwrap().remove(&conversation_id);
+    app_state
+        .compacting
+        .lock()
+        .unwrap()
+        .remove(&conversation_id);
     result
+}
+
+#[derive(Debug)]
+struct TranscriptTruncation {
+    undone_text: String,
+    kept_messages: Vec<serde_json::Value>,
+    kept_records: Vec<UndoRecord>,
+    truncated: usize,
+}
+
+fn truncate_transcript(
+    messages: &[serde_json::Value],
+    records: &[UndoRecord],
+    boundary: usize,
+) -> Result<TranscriptTruncation, String> {
+    let Some(message) = messages.get(boundary) else {
+        return Err("Message not found".into());
+    };
+    let undone_text = match Msg::from_json(message) {
+        Some(Msg::User { text, .. }) if !text.starts_with(crate::compact::COMPACT_MARKER) => text,
+        _ => return Err("Only a user message can be edited".into()),
+    };
+
+    Ok(TranscriptTruncation {
+        undone_text,
+        kept_messages: messages[..boundary].to_vec(),
+        kept_records: records
+            .iter()
+            .filter(|record| record.user_index < boundary)
+            .cloned()
+            .collect(),
+        truncated: messages.len() - boundary,
+    })
 }
 
 #[derive(Serialize)]
@@ -967,6 +1002,85 @@ pub struct UndoOutcome {
     pub file_warning: Option<String>,
 }
 
+fn ensure_conversation_idle(
+    state: &AppState,
+    conversation_id: &str,
+    action: &str,
+) -> Result<(), String> {
+    let compacting = state.compacting.lock().unwrap();
+    if compacting.contains(conversation_id) {
+        return Err("This conversation is being compacted.".into());
+    }
+    let runtimes = state.runtimes.lock().unwrap();
+    if runtimes.contains_key(conversation_id) {
+        return Err(format!(
+            "Wait for the current response to finish before {action}."
+        ));
+    }
+    Ok(())
+}
+
+async fn truncate_conversation(
+    app_state: Arc<AppState>,
+    conversation_id: String,
+    boundary: usize,
+) -> Result<UndoOutcome, String> {
+    let (meta, messages, records) = {
+        let Some((meta, messages)) = app_state.store.load_conversation(&conversation_id) else {
+            return Err("Unknown conversation".into());
+        };
+        (
+            meta,
+            messages,
+            app_state.store.load_undo_records(&conversation_id),
+        )
+    };
+    let truncation = truncate_transcript(&messages, &records, boundary)?;
+
+    let record = records
+        .iter()
+        .rev()
+        .find(|r| r.user_index == boundary)
+        .cloned();
+    let (reverted_files, file_warning) = match record {
+        Some(rec) => {
+            let snap_root = app_state.store.snapshots_dir.clone();
+            let wd = std::path::PathBuf::from(&rec.wd);
+            let tree = rec.tree.clone();
+            match tokio::task::spawn_blocking(move || {
+                crate::snapshot::restore(&snap_root, &wd, &tree)
+            })
+            .await
+            {
+                Ok(Ok(files)) => (files, None),
+                Ok(Err(e)) => (Vec::new(), Some(format!("Files were not reverted: {e}"))),
+                Err(e) => (Vec::new(), Some(format!("Files were not reverted: {e}"))),
+            }
+        }
+        None => (
+            Vec::new(),
+            Some(
+                "No file snapshot for this turn — files were left unchanged \
+                 (snapshots need the working directory to be a git repository)."
+                    .into(),
+            ),
+        ),
+    };
+
+    let mut meta = meta;
+    meta.updated_at = now();
+    app_state
+        .store
+        .save_conversation(&meta, &truncation.kept_messages, &truncation.kept_records)
+        .map_err(|e| e.to_string())?;
+    Ok(UndoOutcome {
+        undone_text: truncation.undone_text,
+        reverted_files,
+        truncated: truncation.truncated,
+        file_warning,
+    })
+}
+
 /// `/undo`: drop the last user turn from the transcript and, when a snapshot
 /// exists, restore the project files to their pre-turn state.
 #[tauri::command]
@@ -974,23 +1088,13 @@ pub async fn conversation_undo(
     state: State<'_, Arc<AppState>>,
     conversation_id: String,
 ) -> Result<UndoOutcome, String> {
-    {
-        let compacting = state.compacting.lock().unwrap();
-        if compacting.contains(&conversation_id) {
-            return Err("This conversation is being compacted.".into());
-        }
-        let runtimes = state.runtimes.lock().unwrap();
-        if runtimes.contains_key(&conversation_id) {
-            return Err("Wait for the current response to finish before undoing.".into());
-        }
-    }
+    ensure_conversation_idle(&state, &conversation_id, "undoing")?;
     let app_state = state.inner().clone();
-    let (meta, messages, records) = {
-        let Some((meta, messages)) = app_state.store.load_conversation(&conversation_id) else {
-            return Err("Unknown conversation".into());
-        };
-        (meta, messages, app_state.store.load_undo_records(&conversation_id))
-    };
+    let messages = app_state
+        .store
+        .load_conversation(&conversation_id)
+        .map(|(_, messages)| messages)
+        .ok_or("Unknown conversation")?;
 
     // boundary = the last real user message (compaction summaries are
     // carriers, not turns); everything from it onward is removed
@@ -1008,59 +1112,20 @@ pub async fn conversation_undo(
         })
         .map(|(i, _)| i)
         .ok_or("Nothing to undo")?;
-    let undone_text = match Msg::from_json(&messages[boundary]) {
-        Some(Msg::User { text, .. }) => text,
-        _ => return Err("Nothing to undo".into()),
-    };
 
-    let record = records.iter().rev().find(|r| r.user_index == boundary).cloned();
-    let (reverted_files, file_warning) = match record {
-        Some(rec) => {
-            let snap_root = app_state.store.snapshots_dir.clone();
-            let wd = std::path::PathBuf::from(&rec.wd);
-            let tree = rec.tree.clone();
-            match tokio::task::spawn_blocking(move || {
-                crate::snapshot::restore(&snap_root, &wd, &tree)
-            })
-            .await
-            {
-                Ok(Ok(files)) => (files, None),
-                Ok(Err(e)) => (
-                    Vec::new(),
-                    Some(format!("Files were not reverted: {e}")),
-                ),
-                Err(e) => (
-                    Vec::new(),
-                    Some(format!("Files were not reverted: {e}")),
-                ),
-            }
-        }
-        None => (
-            Vec::new(),
-            Some(
-                "No file snapshot for this turn — files were left unchanged \
-                 (snapshots need the working directory to be a git repository)."
-                    .into(),
-            ),
-        ),
-    };
+    truncate_conversation(app_state, conversation_id, boundary).await
+}
 
-    let truncated = messages.len() - boundary;
-    let kept: Vec<serde_json::Value> = messages[..boundary].to_vec();
-    let kept_records: Vec<UndoRecord> =
-        records.into_iter().filter(|r| r.user_index < boundary).collect();
-    let mut meta = meta;
-    meta.updated_at = now();
-    app_state
-        .store
-        .save_conversation(&meta, &kept, &kept_records)
-        .map_err(|e| e.to_string())?;
-    Ok(UndoOutcome {
-        undone_text,
-        reverted_files,
-        truncated,
-        file_warning,
-    })
+/// Remove the selected user turn and every message after it, restore its
+/// pre-turn workspace snapshot, and leave the caller ready to send a revision.
+#[tauri::command]
+pub async fn conversation_truncate(
+    state: State<'_, Arc<AppState>>,
+    conversation_id: String,
+    message_index: usize,
+) -> Result<UndoOutcome, String> {
+    ensure_conversation_idle(&state, &conversation_id, "editing it")?;
+    truncate_conversation(state.inner().clone(), conversation_id, message_index).await
 }
 
 #[tauri::command]
@@ -1696,5 +1761,55 @@ mod tests {
                 .unwrap();
         assert_eq!(set.update_mode, Some(config::UpdateMode::Auto));
         assert_eq!(set.update_check_interval_hours, Some(24));
+    }
+
+    #[test]
+    fn truncation_uses_the_selected_user_boundary_and_discards_later_records() {
+        let messages = vec![
+            Msg::User {
+                text: "first".into(),
+                ts: None,
+            }
+            .as_json(),
+            Msg::Assistant {
+                text: "first reply".into(),
+                tool_calls: Vec::new(),
+                ts: None,
+            }
+            .as_json(),
+            Msg::User {
+                text: "second".into(),
+                ts: None,
+            }
+            .as_json(),
+            Msg::Assistant {
+                text: "second reply".into(),
+                tool_calls: Vec::new(),
+                ts: None,
+            }
+            .as_json(),
+        ];
+        let first = UndoRecord {
+            user_index: 0,
+            tree: "tree-1".into(),
+            wd: "/project".into(),
+        };
+        let second = UndoRecord {
+            user_index: 2,
+            tree: "tree-2".into(),
+            wd: "/project".into(),
+        };
+        let later = UndoRecord {
+            user_index: 9,
+            tree: "tree-9".into(),
+            wd: "/project".into(),
+        };
+
+        let result = truncate_transcript(&messages, &[first.clone(), second, later], 2).unwrap();
+
+        assert_eq!(result.undone_text, "second");
+        assert_eq!(result.truncated, 2);
+        assert_eq!(result.kept_messages, messages[..2]);
+        assert_eq!(result.kept_records, vec![first]);
     }
 }

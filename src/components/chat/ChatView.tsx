@@ -1,4 +1,11 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useStore } from "../../store";
 import {
   COMPACT_SUMMARY_MARKER,
@@ -7,6 +14,10 @@ import {
   type SlashCommand,
 } from "../../slashCommands";
 import { nextMode, resolveShownMode } from "../../modes";
+import {
+  messageActionKinds,
+  type MessageActionKind,
+} from "../../chatMessageActions";
 import { Icon } from "../icons";
 import { Markdown } from "../Markdown";
 import { ToolCallCard } from "./ToolCallCard";
@@ -26,6 +37,7 @@ export function ChatView() {
     s.activeConversationId ? s.messageQueues[s.activeConversationId] : undefined,
   );
   const removeQueued = useStore((s) => s.removeQueued);
+  const editMessage = useStore((s) => s.editMessage);
   const streaming = useStore(
     (s) =>
       !!s.activeConversationId &&
@@ -43,6 +55,11 @@ export function ChatView() {
       !!s.activeConversationId && s.terminalOpenIds.has(s.activeConversationId),
   );
   const terminalHeight = useStore((s) => s.terminalHeight);
+  const handleEditMessage = useCallback(
+    (messageIndex: number | undefined, text: string) =>
+      editMessage(messageIndex, text),
+    [editMessage],
+  );
   const scrollRef = useRef<HTMLDivElement>(null);
   // null until this instance has rendered a conversation once — a remount
   // (view switches unmount ChatView) must still jump to the latest message
@@ -177,7 +194,12 @@ export function ChatView() {
       >
         <div className="mx-auto flex max-w-3xl flex-col gap-4 px-5 py-6">
           {items.map((item) => (
-            <MessageItem key={item.id} item={item} />
+            <MessageItem
+              key={item.id}
+              item={item}
+              onEdit={handleEditMessage}
+              editDisabled={streaming || !!queued?.length}
+            />
           ))}
           {queued?.map((m) => (
             <QueuedBubble
@@ -219,8 +241,12 @@ export function ChatView() {
 // message must not re-render (and re-parse its markdown) on each token.
 const MessageItem = memo(function MessageItem({
   item,
+  onEdit,
+  editDisabled,
 }: {
   item: import("../../store").ChatItem;
+  onEdit: (messageIndex: number | undefined, text: string) => Promise<boolean>;
+  editDisabled: boolean;
 }) {
   if (item.kind === "user") {
     if (item.text.startsWith(COMPACT_SUMMARY_MARKER)) {
@@ -235,14 +261,11 @@ const MessageItem = memo(function MessageItem({
       return <RanInitCard text={item.text} />;
     }
     return (
-      <div className="flex justify-end">
-        <div className="max-w-[85%]">
-          <div className="whitespace-pre-wrap rounded-2xl rounded-br-md bg-sky-600 px-4 py-2.5 text-sm leading-relaxed text-white shadow-sm">
-            {item.text}
-          </div>
-          <MessageTime ts={item.ts} align="right" />
-        </div>
-      </div>
+      <UserMessageBubble
+        item={item}
+        onEdit={onEdit}
+        editDisabled={editDisabled}
+      />
     );
   }
   if (item.kind === "tool") {
@@ -250,7 +273,7 @@ const MessageItem = memo(function MessageItem({
   }
   return (
     <div className="flex justify-start">
-      <div className="max-w-[92%]">
+      <div className="group max-w-[92%]">
         {item.reasoning && (
           <details className="mb-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-500 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-400">
             <summary className="cursor-pointer select-none font-medium">
@@ -278,11 +301,194 @@ const MessageItem = memo(function MessageItem({
             </div>
           )}
         </div>
+        <MessageActions
+          text={item.text}
+          kinds={messageActionKinds(item)}
+          align="left"
+        />
         <MessageTime ts={item.ts} align="left" />
       </div>
     </div>
   );
 });
+
+function UserMessageBubble({
+  item,
+  onEdit,
+  editDisabled,
+}: {
+  item: import("../../store").UserItem;
+  onEdit: (messageIndex: number | undefined, text: string) => Promise<boolean>;
+  editDisabled: boolean;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [text, setText] = useState(item.text);
+  const [submitting, setSubmitting] = useState(false);
+  const ref = useRef<HTMLTextAreaElement>(null);
+  const canEdit = !editDisabled;
+
+  const startEditing = () => {
+    if (!canEdit) return;
+    setText(item.text);
+    setEditing(true);
+    requestAnimationFrame(() => {
+      ref.current?.focus();
+      ref.current?.setSelectionRange(0, ref.current.value.length);
+    });
+  };
+
+  const cancelEditing = () => {
+    if (submitting) return;
+    setEditing(false);
+    setText(item.text);
+  };
+
+  const rerun = async () => {
+    const next = text.trim();
+    if (!canEdit || !next || submitting) return;
+    setSubmitting(true);
+    try {
+      const ok = await onEdit(item.messageIndex, next);
+      if (ok) setEditing(false);
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="flex justify-end">
+      <div className="group max-w-[85%]">
+        {editing ? (
+          <div className="rounded-2xl rounded-br-md bg-sky-600 p-2 text-sm text-white shadow-sm">
+            <textarea
+              ref={ref}
+              value={text}
+              rows={3}
+              aria-label="Edit message"
+              className="max-h-48 min-h-20 w-full resize-y rounded-xl border border-sky-300 bg-white px-3 py-2 text-slate-900 outline-none focus:border-sky-200 focus:ring-2 focus:ring-sky-200/60 dark:border-sky-700 dark:bg-slate-950 dark:text-slate-100 dark:focus:border-sky-400"
+              onChange={(e) => setText(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  cancelEditing();
+                }
+                if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+                  e.preventDefault();
+                  void rerun();
+                }
+              }}
+            />
+            <div className="mt-2 flex items-end justify-between gap-3">
+              <span className="text-[11px] leading-snug text-sky-100">
+                Re-running removes this message and later turns, and restores their file changes.
+              </span>
+              <div className="flex shrink-0 gap-1.5">
+                <button
+                  type="button"
+                  className="rounded-lg px-2.5 py-1.5 text-xs font-medium text-sky-100 transition hover:bg-sky-500 disabled:opacity-50"
+                  disabled={submitting}
+                  onClick={cancelEditing}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  className="flex items-center gap-1.5 rounded-lg bg-white px-2.5 py-1.5 text-xs font-semibold text-sky-700 transition hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-50"
+                  disabled={submitting || editDisabled || !text.trim()}
+                  onClick={() => void rerun()}
+                >
+                  {submitting && <Icon name="spinner" className="h-3 w-3 animate-spin" />}
+                  Edit & re-run
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="whitespace-pre-wrap rounded-2xl rounded-br-md bg-sky-600 px-4 py-2.5 text-sm leading-relaxed text-white shadow-sm">
+            {item.text}
+          </div>
+        )}
+        {!editing && (
+          <MessageActions
+            text={item.text}
+            kinds={messageActionKinds(item)}
+            align="right"
+            onEdit={startEditing}
+            editDisabled={!canEdit}
+          />
+        )}
+        <MessageTime ts={item.ts} align="right" />
+      </div>
+    </div>
+  );
+}
+
+function MessageActions({
+  text,
+  kinds,
+  align,
+  onEdit,
+  editDisabled = false,
+}: {
+  text: string;
+  kinds: MessageActionKind[];
+  align: "left" | "right";
+  onEdit?: () => void;
+  editDisabled?: boolean;
+}) {
+  const [copied, setCopied] = useState(false);
+  if (kinds.length === 0) return null;
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  return (
+    <div
+      className={`mt-1 flex min-h-6 items-center gap-1 opacity-0 transition-opacity group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100 pointer-events-none ${
+        align === "right" ? "justify-end" : "justify-start"
+      }`}
+    >
+      {kinds.includes("copy") && (
+        <button
+          type="button"
+          className="rounded-md p-1 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600 dark:hover:bg-slate-800 dark:hover:text-slate-300"
+          aria-label={copied ? "Copied" : "Copy message"}
+          title={copied ? "Copied" : "Copy message"}
+          onClick={(e) => {
+            e.stopPropagation();
+            void copy();
+          }}
+        >
+          <Icon name={copied ? "check" : "copy"} className="h-3.5 w-3.5" />
+        </button>
+      )}
+      {kinds.includes("edit") && onEdit && (
+        <button
+          type="button"
+          className="rounded-md p-1 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600 disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-slate-800 dark:hover:text-slate-300"
+          aria-label="Edit message"
+          title={editDisabled ? "Wait for the response to finish" : "Edit message"}
+          disabled={editDisabled}
+          onClick={(e) => {
+            e.stopPropagation();
+            onEdit();
+          }}
+        >
+          <Icon name="pencil" className="h-3.5 w-3.5" />
+        </button>
+      )}
+    </div>
+  );
+}
 
 function MessageTime({ ts, align }: { ts?: string; align: "left" | "right" }) {
   if (!ts) return null;

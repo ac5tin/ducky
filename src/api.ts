@@ -224,6 +224,16 @@ export interface UndoOutcome {
 export const conversationUndo = (conversationId: string) =>
   invoke<UndoOutcome>("conversation_undo", { conversationId });
 
+/** Remove a selected raw user-message index and later messages, then restore its files. */
+export const conversationTruncate = (
+  conversationId: string,
+  messageIndex: number,
+) =>
+  invoke<UndoOutcome>("conversation_truncate", {
+    conversationId,
+    messageIndex,
+  });
+
 // ---------------------------------------------------------------------------
 // Per-conversation terminal
 // ---------------------------------------------------------------------------

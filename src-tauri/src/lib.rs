@@ -99,6 +99,7 @@ pub fn run() {
             commands::chat_cancel,
             commands::conversation_compact,
             commands::conversation_undo,
+            commands::conversation_truncate,
             commands::group_create,
             commands::group_rename,
             commands::group_set_collapsed,

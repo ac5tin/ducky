@@ -36,6 +36,8 @@ export interface UserItem {
   kind: "user";
   id: string;
   text: string;
+  /** Index in the raw backend transcript, not the display item list. */
+  messageIndex?: number;
   ts?: string;
 }
 
@@ -228,7 +230,9 @@ interface StoreState {
   setMode: (mode: AgentMode) => Promise<void>;
   setActiveMcpIds: (mcpIds: string[] | null) => Promise<void>;
 
-  send: (text: string) => Promise<void>;
+  send: (text: string) => Promise<boolean>;
+  /** Remove a selected prompt and re-run the edited text. */
+  editMessage: (messageIndex: number | undefined, text: string) => Promise<boolean>;
   stop: () => void;
   removeQueued: (id: string) => void;
   /** `/compact`: summarise the conversation's history. */
@@ -266,12 +270,13 @@ function rawToItems(
   toolStates: Map<string, ToolCallState>,
 ): ChatItem[] {
   const items: ChatItem[] = [];
-  for (const msg of raw) {
+  for (const [messageIndex, msg] of raw.entries()) {
     if (msg.kind === "user") {
       items.push({
         kind: "user",
         id: `u-${items.length}`,
         text: msg.text,
+        messageIndex,
         ts: msg.ts ?? undefined,
       });
     } else if (msg.kind === "assistant") {
@@ -671,49 +676,48 @@ export const useStore = create<StoreState>((set, get) => ({
     await get().refreshConfig();
   },
 
-  async send(text) {
+  async send(text): Promise<boolean> {
     // slash commands never reach the model as chat text — and unlike real
     // messages they are never queued behind a running turn
     const command = parseSlashCommand(text);
     if (command) {
       if (command.unknown) {
         get().toast("error", `Unknown command: /${command.name}`);
-        return;
+        return false;
       }
       switch (command.name) {
         case "init": {
           const workingDir = get().config?.settings.working_dir?.trim() || "~";
-          await get().send(expandInitPrompt(workingDir, command.args));
-          return;
+          return get().send(expandInitPrompt(workingDir, command.args));
         }
         case "compact": {
           const id = get().activeConversationId;
           if (!id) {
             get().toast("error", "Open a conversation first — /compact needs a chat.");
-            return;
+            return false;
           }
           if (get().busyConversationIds.has(id)) {
             get().toast("error", "Wait for the response to finish before compacting.");
-            return;
+            return false;
           }
           await get().compactConversation(id, command.args || undefined);
-          return;
+          return true;
         }
         case "undo": {
           const id = get().activeConversationId;
           if (!id) {
             get().toast("info", "Nothing to undo yet.");
-            return;
+            return false;
           }
           if (get().busyConversationIds.has(id)) {
             get().toast("error", "Wait for the response to finish before undoing.");
-            return;
+            return false;
           }
           await get().undoConversation(id);
-          return;
+          return true;
         }
       }
-      return;
+      return false;
     }
     let id = get().activeConversationId;
     if (id && get().busyConversationIds.has(id)) {
@@ -732,12 +736,12 @@ export const useStore = create<StoreState>((set, get) => ({
           ],
         },
       }));
-      return;
+      return true;
     }
     if (!id) {
       // lazy chat creation: the record is made only when the first message is
       // sent from the draft page
-      if (creatingDraft) return;
+      if (creatingDraft) return false;
       creatingDraft = true;
       try {
         const { config } = get();
@@ -749,7 +753,7 @@ export const useStore = create<StoreState>((set, get) => ({
             "error",
             "Add an AI provider first (Settings → Providers).",
           );
-          return;
+          return false;
         }
         const model = resolveDraftModel(get().draftModel, config, provider);
         const meta = await api.conversationCreate(provider.id, model, get().draftGroupId);
@@ -768,7 +772,7 @@ export const useStore = create<StoreState>((set, get) => ({
         id = meta.id;
       } catch (e) {
         get().toast("error", `Could not start a new chat: ${e}`);
-        return;
+        return false;
       } finally {
         creatingDraft = false;
       }
@@ -778,7 +782,43 @@ export const useStore = create<StoreState>((set, get) => ({
       // first message from the draft page: the new chat becomes the active one
       set({ activeConversationId: convId });
     }
-    await dispatchSend(convId, text, set, get);
+    return dispatchSend(convId, text, set, get);
+  },
+
+  async editMessage(messageIndex, text) {
+    const id = get().activeConversationId;
+    const next = text.trim();
+    if (!id || !next) return false;
+    if (get().busyConversationIds.has(id)) {
+      get().toast("error", "Wait for the response to finish before editing it.");
+      return false;
+    }
+    try {
+      let boundary = messageIndex;
+      if (boundary === undefined) {
+        const [, raw] = await api.conversationGet(id);
+        for (let i = raw.length - 1; i >= 0; i--) {
+          if (raw[i]?.kind === "user") {
+            boundary = i;
+            break;
+          }
+        }
+      }
+      if (boundary === undefined) return false;
+      await api.conversationTruncate(id, boundary);
+      await get().reloadItems(id);
+      const sent = await get().send(next);
+      if (!sent) {
+        await get().reloadItems(id);
+        set((s) => ({
+          restoredDrafts: { ...s.restoredDrafts, [id]: next },
+        }));
+      }
+      return true;
+    } catch (e) {
+      get().toast("error", `${e}`);
+      return false;
+    }
   },
 
   stop() {
@@ -1132,7 +1172,7 @@ async function dispatchSend(
   text: string,
   set: SetFn,
   get: GetFn,
-) {
+): Promise<boolean> {
   const active = convId === get().activeConversationId;
   if (active) {
     const untitled =
@@ -1161,6 +1201,7 @@ async function dispatchSend(
   }
   try {
     await api.chatSend(convId, text);
+    return true;
   } catch (e) {
     get().toast("error", `${e}`);
     set((s) => {
@@ -1176,6 +1217,7 @@ async function dispatchSend(
     });
     // the turn never started, so no message_done will arrive to drain the rest
     drainQueue(convId, set, get);
+    return false;
   }
 }
 
@@ -1241,6 +1283,10 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
         get()
           .refreshConfig()
           .catch(() => {});
+        void get().reloadItems(event.conversation_id).then(() => {
+          drainQueue(event.conversation_id, set, get);
+        });
+        break;
       }
       drainQueue(event.conversation_id, set, get);
       break;
@@ -1542,6 +1588,8 @@ function stripEvent(
     const value = event[key];
     if (value !== null && value !== undefined) state[key] = value;
   }
+  // SAFETY: required tool_call_id/status fields are set above; optional event
+  // fields are copied only when present, matching ToolCallState's patch shape.
   return state as unknown as ToolCallState;
 }
 
