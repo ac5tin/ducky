@@ -1,4 +1,5 @@
 import { useDraggable, useDroppable } from "@dnd-kit/core";
+import { useCallback } from "react";
 import { chatDragId, chatZone } from "../../groups";
 import { useStore } from "../../store";
 import type { ConversationMeta } from "../../types";
@@ -23,10 +24,16 @@ export function ChatRow({ chat }: { chat: ConversationMeta }) {
     disabled: rename.editing, // selecting text in the input must not drag
   });
   const drop = useDroppable({ id: chatZone(chat.id), data: { kind: "chat" } });
-  const setRefs = (node: HTMLElement | null) => {
-    drag.setNodeRef(node);
-    drop.setNodeRef(node);
-  };
+  // Stable identity: React calls a changed ref callback with `null` and then
+  // with the node again, so an inline arrow detaches and re-attaches the
+  // droppable on every render, and dnd-kit re-measures on every attach.
+  const setRefs = useCallback(
+    (node: HTMLElement | null) => {
+      drag.setNodeRef(node);
+      drop.setNodeRef(node);
+    },
+    [drag.setNodeRef, drop.setNodeRef],
+  );
 
   return (
     <div

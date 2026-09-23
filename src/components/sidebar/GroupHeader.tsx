@@ -1,5 +1,5 @@
 import { useDraggable, useDroppable } from "@dnd-kit/core";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   groupBodyId,
   groupDragId,
@@ -45,11 +45,17 @@ export function GroupHeader({
   // `group-over`.
   const groupOver = useDroppable({ id: groupOverZone(group.id), data: { kind: "group-over" } });
   const header = useDroppable({ id: groupHeaderZone(group.id), data: { kind: "group-header" } });
-  const setRefs = (node: HTMLElement | null) => {
-    drag.setNodeRef(node);
-    groupOver.setNodeRef(node);
-    header.setNodeRef(node);
-  };
+  // Stable identity: React calls a changed ref callback with `null` and then
+  // with the node again, so an inline arrow detaches and re-attaches all three
+  // droppables on every render, and dnd-kit re-measures on every attach.
+  const setRefs = useCallback(
+    (node: HTMLElement | null) => {
+      drag.setNodeRef(node);
+      groupOver.setNodeRef(node);
+      header.setNodeRef(node);
+    },
+    [drag.setNodeRef, groupOver.setNodeRef, header.setNodeRef],
+  );
 
   // Freshly created groups are named in place. The flag is one-shot: the parent
   // clears it as soon as it has been consumed.

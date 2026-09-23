@@ -1,7 +1,6 @@
 import {
   DndContext,
   DragOverlay,
-  MeasuringStrategy,
   PointerSensor,
   closestCenter,
   useDroppable,
@@ -15,7 +14,7 @@ import type {
   DragOverEvent,
   DragStartEvent,
 } from "@dnd-kit/core";
-import { useMemo, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import {
   buildSidebarView,
   computeDropLayout,
@@ -94,6 +93,8 @@ export function Sidebar() {
   /** The droppable the pointer was over last, so a direction flip can be
    *  re-evaluated without a fresh `onDragOver`. */
   const overIdRef = useRef<string | null>(null);
+  /** Signature of the layout the preview is currently showing. */
+  const previewSignatureRef = useRef<string | null>(null);
 
   const renderGroups = useMemo(
     () => preview ?? sidebarView.groups.map((node) => node.group),
@@ -112,9 +113,9 @@ export function Sidebar() {
 
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
 
-  // One custom filter, used by both drag kinds. It also disambiguates the three
-  // droppables that share a group header node.
-  const collisionDetection: CollisionDetection = (args) => {
+  // Stable identity matters here: a new function every render makes dnd-kit
+  // recompute collisions on each render, which feeds the update loop below.
+  const collisionDetection: CollisionDetection = useCallback((args) => {
     const kind = dragRef.current?.kind;
     const containers = args.droppableContainers.filter((container) => {
       const id = String(container.id);
@@ -123,7 +124,7 @@ export function Sidebar() {
       return kind === "group" ? isGroupOver || isChat : !isGroupOver;
     });
     return closestCenter({ ...args, droppableContainers: containers });
-  };
+  }, []);
 
   /** The layout this drop would produce, computed from the layout the drag
    *  started with, so a direction flip re-evaluates instead of stacking. */
@@ -135,6 +136,18 @@ export function Sidebar() {
     return computeDropLayout(buildSidebarView(conversations, origin), drag, target, directionRef.current);
   };
 
+  /** The live preview is only worth a re-render when the layout changes. An
+   *  unconditional setState here re-renders the list on every drag-over, and
+   *  because the rows themselves are droppables, each render re-measures and
+   *  re-runs the collision test — which is what turned a re-order into an
+   *  endless update loop. */
+  const showPreview = (next: ChatGroup[]) => {
+    const signature = layoutSignature(next);
+    if (signature === previewSignatureRef.current) return;
+    previewSignatureRef.current = signature;
+    setPreview(next);
+  };
+
   const onDragStart = (event: DragStartEvent) => {
     const drag = parseDragId(String(event.active.id));
     if (!drag) return;
@@ -142,6 +155,7 @@ export function Sidebar() {
     directionRef.current = "after";
     originRef.current = origin;
     overIdRef.current = null;
+    previewSignatureRef.current = layoutSignature(origin);
     dragRef.current = drag;
     setActiveDrag(drag);
     setPreview(origin);
@@ -155,7 +169,7 @@ export function Sidebar() {
     if (next === directionRef.current) return;
     directionRef.current = next;
     const drag = dragRef.current;
-    if (drag && overIdRef.current) setPreview(layoutFor(drag, overIdRef.current));
+    if (drag && overIdRef.current) showPreview(layoutFor(drag, overIdRef.current));
   };
 
   const onDragOver = (event: DragOverEvent) => {
@@ -163,7 +177,7 @@ export function Sidebar() {
     if (!drag) return;
     const overId = event.over ? String(event.over.id) : null;
     overIdRef.current = overId;
-    setPreview(layoutFor(drag, overId));
+    showPreview(layoutFor(drag, overId));
   };
 
   const onDragEnd = (event: DragEndEvent) => {
@@ -173,6 +187,7 @@ export function Sidebar() {
     dragRef.current = null;
     originRef.current = null;
     overIdRef.current = null;
+    previewSignatureRef.current = null;
     setActiveDrag(null);
     setPreview(null);
     if (!drag || !origin || !next) return;
@@ -185,6 +200,7 @@ export function Sidebar() {
     dragRef.current = null;
     originRef.current = null;
     overIdRef.current = null;
+    previewSignatureRef.current = null;
     setActiveDrag(null);
     setPreview(null);
   };
@@ -218,8 +234,6 @@ export function Sidebar() {
         sensors={sensors}
         collisionDetection={collisionDetection}
         autoScroll={{ threshold: { x: 0.1, y: 0.1 } }}
-        // Rows move under the pointer while dragging, so cached rects go stale.
-        measuring={{ droppable: { strategy: MeasuringStrategy.Always } }}
         onDragStart={onDragStart}
         onDragMove={onDragMove}
         onDragOver={onDragOver}
