@@ -17,11 +17,17 @@ import { useInlineRename } from "./useInlineRename";
 export function GroupHeader({
   group,
   count,
+  dropInside,
   startRenaming,
   onStartRenamingDone,
 }: {
   group: ChatGroup;
   count: number;
+  /** True when the drop over this header would put the dragged chat inside this
+   *  group. The ring is gated on it, so the highlight never promises a move the
+   *  drop will not make: over an expanded header, dragging up means "leave the
+   *  group". */
+  dropInside: boolean;
   /** True for a group that was just created, so it opens in rename mode. */
   startRenaming: boolean;
   onStartRenamingDone: () => void;
@@ -88,7 +94,7 @@ export function GroupHeader({
       {...drag.attributes}
       {...drag.listeners}
       className={`group flex items-center gap-1 rounded-lg px-2 py-1.5 text-sm text-slate-500 transition dark:text-slate-300 ${
-        header.isOver || groupOver.isOver ? "ring-2 ring-sky-400" : ""
+        groupOver.isOver || (header.isOver && dropInside) ? "ring-2 ring-sky-400" : ""
       } ${
         drag.isDragging ? "opacity-40" : "hover:bg-slate-200/60 dark:hover:bg-slate-800"
       }`}
@@ -178,7 +184,7 @@ export function GroupHeader({
           ungrouped chats.
         </p>
         <div className="mt-5 flex justify-end gap-2">
-          <Button variant="secondary" onClick={() => setConfirmDelete(false)}>
+          <Button variant="secondary" autoFocus onClick={() => setConfirmDelete(false)}>
             Cancel
           </Button>
           <Button

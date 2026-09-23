@@ -61,6 +61,7 @@ export function Button({
   variant = "primary",
   className = "",
   disabled,
+  autoFocus,
   type = "button",
   title,
 }: {
@@ -69,6 +70,7 @@ export function Button({
   variant?: "primary" | "secondary" | "danger" | "ghost" | "success";
   className?: string;
   disabled?: boolean;
+  autoFocus?: boolean;
   type?: "button" | "submit";
   title?: string;
 }) {
@@ -83,7 +85,14 @@ export function Button({
     ghost: "text-slate-500 hover:bg-slate-100 hover:text-slate-700 dark:hover:bg-slate-800 dark:hover:text-slate-200",
   }[variant];
   return (
-    <button type={type} className={`${base} ${styles} ${className}`} onClick={onClick} disabled={disabled} title={title}>
+    <button
+      type={type}
+      className={`${base} ${styles} ${className}`}
+      onClick={onClick}
+      disabled={disabled}
+      autoFocus={autoFocus}
+      title={title}
+    >
       {children}
     </button>
   );

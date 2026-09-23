@@ -11,12 +11,15 @@ import type {
   CollisionDetection,
   DragEndEvent,
   DragMoveEvent,
+  DragOverEvent,
   DragStartEvent,
 } from "@dnd-kit/core";
 import { useCallback, useMemo, useRef, useState } from "react";
 import {
   buildSidebarView,
+  chatZone,
   computeDropLayout,
+  dropLandsInGroup,
   groupBodyId,
   groupEmptyZone,
   groupFooterZone,
@@ -34,12 +37,14 @@ import { GroupHeader } from "./sidebar/GroupHeader";
 
 /** The thin strip after a group's last row: drop here moving up to append to
  *  the group, moving down to leave it. */
-function GroupFooterStrip({ group }: { group: ChatGroup }) {
+function GroupFooterStrip({ group, dropInside }: { group: ChatGroup; dropInside: boolean }) {
   const footer = useDroppable({ id: groupFooterZone(group.id), data: { kind: "group-footer" } });
   return (
     <div ref={footer.setNodeRef} className="h-2.5">
       <div
-        className={`h-0.5 rounded-full transition ${footer.isOver ? "bg-sky-400" : "bg-transparent"}`}
+        className={`h-0.5 rounded-full transition ${
+          footer.isOver && dropInside ? "bg-sky-400" : "bg-transparent"
+        }`}
       />
     </div>
   );
@@ -97,8 +102,15 @@ export function Sidebar() {
   const setGroupCollapsed = useStore((s) => s.setGroupCollapsed);
 
   const [activeDrag, setActiveDrag] = useState<DragRef | null>(null);
-  const dragRef = useRef<DragRef | null>(null);
+  const [overId, setOverId] = useState<string | null>(null);
+  // The direction is held twice on purpose. The ref is what the drop maths
+  // reads, so a late event sees the current value and never a stale render's;
+  // the state is what the highlight renders from. It is written only when the
+  // sign flips, so a drag costs a couple of renders — a per-move write is what
+  // used to put the app in a render loop.
   const directionRef = useRef<DragDirection>("after");
+  const [direction, setDirection] = useState<DragDirection>("after");
+  const dragRef = useRef<DragRef | null>(null);
 
   const activeChat =
     activeDrag?.kind === "chat"
@@ -111,15 +123,26 @@ export function Sidebar() {
 
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
 
+  /** The group this drop would put the dragged chat inside, or null when it
+   *  would leave the chat out of every group. Every highlight is gated on it, so
+   *  a ring can never promise a move the drop will not make. */
+  const ringGroupId = useMemo(() => {
+    if (!activeDrag || !overId) return null;
+    const target = parseZone(overId);
+    return target ? dropLandsInGroup(sidebarView, activeDrag, target, direction) : null;
+  }, [activeDrag, overId, sidebarView, direction]);
+
   // Stable identity matters here: a new function every render makes dnd-kit
   // recompute collisions on each render, which feeds the update loop below.
   const collisionDetection: CollisionDetection = useCallback((args) => {
-    const kind = dragRef.current?.kind;
+    const drag = dragRef.current;
     const containers = args.droppableContainers.filter((container) => {
       const id = String(container.id);
-      const isGroupOver = id.startsWith("group-over:");
-      const isChat = id.startsWith("chat:");
-      return kind === "group" ? isGroupOver || isChat : !isGroupOver;
+      // The dragged row is not a target: dropping a chat on itself does
+      // nothing, so it must not light up as one.
+      if (drag?.kind === "chat" && id === chatZone(drag.id)) return false;
+      const kind = parseZone(id)?.kind;
+      return drag?.kind === "group" ? kind === "group-over" || kind === "chat" : kind !== "group-over";
     });
     return closestCenter({ ...args, droppableContainers: containers });
   }, []);
@@ -143,39 +166,55 @@ export function Sidebar() {
     const drag = parseDragId(String(event.active.id));
     if (!drag) return;
     directionRef.current = "after";
+    setDirection("after");
+    setOverId(null);
     dragRef.current = drag;
     setActiveDrag(drag);
   };
 
+  // dnd-kit fires this only when the target changes, so it is a cheap write.
+  const onDragOver = (event: DragOverEvent) => {
+    setOverId(event.over ? String(event.over.id) : null);
+  };
+
   const onDragMove = (event: DragMoveEvent) => {
-    directionRef.current = event.delta.y < 0 ? "before" : "after";
+    const next: DragDirection = event.delta.y < 0 ? "before" : "after";
+    if (next === directionRef.current) return;
+    directionRef.current = next;
+    setDirection(next);
   };
 
   const onDragEnd = (event: DragEndEvent) => {
     const drag = dragRef.current;
-    const overId = event.over ? String(event.over.id) : null;
-    const target = overId ? parseZone(overId) : null;
-    const next = drag ? layoutFor(drag, overId) : null;
+    const droppedOn = event.over ? String(event.over.id) : null;
+    const target = droppedOn ? parseZone(droppedOn) : null;
+    const next = drag ? layoutFor(drag, droppedOn) : null;
     dragRef.current = null;
     setActiveDrag(null);
+    setOverId(null);
     if (!drag || !next) return;
     // A drop that changed nothing must not write to the config.
     const before = sidebarView.groups.map((node) => node.group);
     if (layoutSignature(next) === layoutSignature(before)) return;
-    applyGroupLayout(next).catch((e) => console.error(e));
     // A collapsed group shows no rows, so a chat dropped into it would look
-    // like nothing happened. Open the group it landed in.
-    if (
+    // like nothing happened: open the group it landed in. That write is
+    // sequenced after the layout write, because each of these commands rewrites
+    // the whole config file — fired together they can land out of order (the
+    // view then disagrees with the file) or interleave inside the file.
+    const openGroupId =
       target?.kind === "group-header" &&
       sidebarView.groups.find((node) => node.group.id === target.groupId)?.group.collapsed
-    ) {
-      setGroupCollapsed(target.groupId, false).catch((e) => console.error(e));
-    }
+        ? target.groupId
+        : null;
+    applyGroupLayout(next)
+      .then(() => (openGroupId ? setGroupCollapsed(openGroupId, false) : undefined))
+      .catch((e) => console.error(e));
   };
 
   const onDragCancel = () => {
     dragRef.current = null;
     setActiveDrag(null);
+    setOverId(null);
   };
 
   const sectionButton =
@@ -208,6 +247,7 @@ export function Sidebar() {
         collisionDetection={collisionDetection}
         autoScroll={{ threshold: { x: 0.1, y: 0.1 } }}
         onDragStart={onDragStart}
+        onDragOver={onDragOver}
         onDragMove={onDragMove}
         onDragEnd={onDragEnd}
         onDragCancel={onDragCancel}
@@ -250,6 +290,7 @@ export function Sidebar() {
             <GroupHeader
               group={group}
               count={chats.length}
+              dropInside={ringGroupId === group.id}
               startRenaming={renameAfterCreate === group.id}
               onStartRenamingDone={() => setRenameAfterCreate(null)}
             />
@@ -258,7 +299,11 @@ export function Sidebar() {
                 {chats.map((chat) => (
                   <ChatRow key={chat.id} chat={chat} />
                 ))}
-                {chats.length === 0 ? <GroupEmptyZone group={group} /> : <GroupFooterStrip group={group} />}
+                {chats.length === 0 ? (
+                  <GroupEmptyZone group={group} />
+                ) : (
+                  <GroupFooterStrip group={group} dropInside={ringGroupId === group.id} />
+                )}
               </div>
             )}
           </div>

@@ -35,6 +35,13 @@ export function ChatRow({ chat }: { chat: ConversationMeta }) {
     [drag.setNodeRef, drop.setNodeRef],
   );
 
+  // The same reserve-the-space rule as the group header: `hidden` takes these
+  // buttons out of the layout, so they would appear over the end of the title,
+  // and a click aimed at the title's last few pixels would delete the chat.
+  // `:focus-visible`, not `:focus-within`: a clicked button keeps focus after
+  // the pointer leaves.
+  const revealOnHover = "invisible group-hover:visible group-has-[:focus-visible]:visible";
+
   return (
     <div
       ref={setRefs}
@@ -89,7 +96,7 @@ export function ChatRow({ chat }: { chat: ConversationMeta }) {
         </button>
       )}
       <button
-        className="hidden shrink-0 rounded p-1 text-slate-400 hover:bg-slate-200 hover:text-slate-700 group-hover:block dark:hover:bg-slate-700 dark:hover:text-slate-200"
+        className={`${revealOnHover} shrink-0 rounded p-1 text-slate-400 hover:bg-slate-200 hover:text-slate-700 dark:hover:bg-slate-700 dark:hover:text-slate-200`}
         aria-label="Rename chat"
         onClick={() => {
           if (titleGenerating) cancelTitle(chat.id).catch((e) => console.error(e));
@@ -99,7 +106,7 @@ export function ChatRow({ chat }: { chat: ConversationMeta }) {
         <Icon name="pencil" className="h-3.5 w-3.5" />
       </button>
       <button
-        className="hidden shrink-0 rounded p-1 text-slate-400 hover:bg-rose-100 hover:text-rose-600 group-hover:block dark:hover:bg-rose-950"
+        className={`${revealOnHover} shrink-0 rounded p-1 text-slate-400 hover:bg-rose-100 hover:text-rose-600 dark:hover:bg-rose-950`}
         aria-label="Delete chat"
         onClick={() => deleteConversation(chat.id).catch((e) => console.error(e))}
       >

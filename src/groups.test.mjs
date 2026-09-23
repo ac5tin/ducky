@@ -7,6 +7,7 @@ import {
   chatDragId,
   chatZone,
   computeDropLayout,
+  dropLandsInGroup,
   groupDragId,
   groupEmptyZone,
   groupFooterZone,
@@ -169,13 +170,59 @@ test("a chat dropped on an expanded group header goes inside, or out", () => {
 test("a chat dropped on a collapsed group header goes inside that group", () => {
   const origin = [group("g1", ["a"], { collapsed: true }), group("g2", ["c"])];
   const built = view(origin, [chat("a"), chat("c")]);
-  const next = computeDropLayout(
-    built,
-    { kind: "chat", id: "c" },
-    { kind: "group-header", groupId: "g1" },
-    "after",
+  // A collapsed group has no rows to aim between, so the direction cannot
+  // matter: either way the header means "into this group".
+  for (const direction of ["before", "after"]) {
+    const next = computeDropLayout(
+      built,
+      { kind: "chat", id: "c" },
+      { kind: "group-header", groupId: "g1" },
+      direction,
+    );
+    assert.deepEqual(shape(next), ["g1:[c,a]", "g2:[]"], `direction ${direction}`);
+  }
+});
+
+test("the drop highlight only lights a group the chat would land in", () => {
+  const origin = [group("g1", ["a"]), group("g2", ["c"])];
+  const built = view(origin, [chat("a"), chat("c"), chat("d")]);
+  const landsIn = (target, direction, chatId = "d") =>
+    dropLandsInGroup(built, { kind: "chat", id: chatId }, target, direction);
+
+  // An expanded header moving down means "top of this group"...
+  assert.equal(landsIn({ kind: "group-header", groupId: "g1" }, "after"), "g1");
+  // ...but moving up means "leave the group", so the ring must stay off rather
+  // than promise a move the drop will not make.
+  assert.equal(landsIn({ kind: "group-header", groupId: "g1" }, "before"), null);
+
+  // A collapsed header means "inside" whichever way the pointer moves.
+  const shut = view([group("g1", ["a"], { collapsed: true })], [chat("a"), chat("d")]);
+  for (const direction of ["before", "after"]) {
+    assert.equal(
+      dropLandsInGroup(
+        shut,
+        { kind: "chat", id: "d" },
+        { kind: "group-header", groupId: "g1" },
+        direction,
+      ),
+      "g1",
+      `direction ${direction}`,
+    );
+  }
+
+  // The footer strip appends to the group while the pointer moves up, and means
+  // "leave the group" when it moves down.
+  assert.equal(landsIn({ kind: "group-footer", groupId: "g1" }, "before"), "g1");
+  assert.equal(landsIn({ kind: "group-footer", groupId: "g1" }, "after"), null);
+
+  // A chat of another group is a target that really does join that group.
+  assert.equal(landsIn({ kind: "chat", conversationId: "c" }, "after"), "g2");
+
+  // A group drag lands in no group at all.
+  assert.equal(
+    dropLandsInGroup(built, { kind: "group", id: "g2" }, { kind: "group-over", groupId: "g1" }, "after"),
+    null,
   );
-  assert.deepEqual(shape(next), ["g1:[c,a]", "g2:[]"]);
 });
 
 test("a chat dropped on a group footer goes to the end, or out", () => {

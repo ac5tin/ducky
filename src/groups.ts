@@ -245,6 +245,25 @@ export function computeDropLayout(
     : dropGroup(groups, active.id, target, direction);
 }
 
+/** The group a drop would put the dragged chat INSIDE, or `null` when the drop
+ *  leaves the chat out of every group (or changes nothing).
+ *
+ *  The drag highlight is gated on this, and it runs the same rules as the drop
+ *  itself, so a ring can never promise a move the drop will not make: over an
+ *  expanded group's header, moving up means "leave the group", and the footer
+ *  strip means "end of the group" only while the pointer moves up. A group drag
+ *  lands in no group. */
+export function dropLandsInGroup(
+  view: SidebarView,
+  active: DragRef,
+  target: DropTarget,
+  direction: DragDirection,
+): string | null {
+  if (active.kind !== "chat") return null;
+  const next = computeDropLayout(view, active, target, direction);
+  return next.find((g) => g.conversation_ids.includes(active.id))?.id ?? null;
+}
+
 /** Order and membership only — the payload `group_apply_layout` takes. */
 export function toLayout(groups: ChatGroup[]): GroupLayout[] {
   return groups.map((g) => ({ id: g.id, conversation_ids: [...g.conversation_ids] }));
