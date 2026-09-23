@@ -1,9 +1,10 @@
 import { useDraggable, useDroppable } from "@dnd-kit/core";
-import { useCallback } from "react";
+import { useCallback, useState } from "react";
 import { chatDragId, chatZone } from "../../groups";
 import { useStore } from "../../store";
 import type { ConversationMeta } from "../../types";
 import { Icon } from "../icons";
+import { Button, Modal } from "../modals/Modal";
 import { useInlineRename } from "./useInlineRename";
 
 export function ChatRow({ chat }: { chat: ConversationMeta }) {
@@ -14,6 +15,7 @@ export function ChatRow({ chat }: { chat: ConversationMeta }) {
   const generateTitle = useStore((s) => s.generateTitle);
   const cancelTitle = useStore((s) => s.cancelTitle);
   const titleGenerating = useStore((s) => s.titleGeneratingIds.has(chat.id));
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const rename = useInlineRename(chat.title, (title) => {
     renameConversation(chat.id, title).catch((e) => console.error(e));
   });
@@ -43,6 +45,7 @@ export function ChatRow({ chat }: { chat: ConversationMeta }) {
   const revealOnHover = "invisible group-hover:visible group-has-[:focus-visible]:visible";
 
   return (
+    <>
     <div
       ref={setRefs}
       {...drag.attributes}
@@ -108,10 +111,38 @@ export function ChatRow({ chat }: { chat: ConversationMeta }) {
       <button
         className={`${revealOnHover} shrink-0 rounded p-1 text-slate-400 hover:bg-rose-100 hover:text-rose-600 dark:hover:bg-rose-950`}
         aria-label="Delete chat"
-        onClick={() => deleteConversation(chat.id).catch((e) => console.error(e))}
+        onClick={() => setConfirmDelete(true)}
       >
         <Icon name="trash" className="h-3.5 w-3.5" />
       </button>
     </div>
+
+      {/* A sibling of the row, not a child: the row carries the drag listeners,
+          so a pointer-down inside the dialog would start a chat drag. */}
+      <Modal
+        open={confirmDelete}
+        onClose={() => setConfirmDelete(false)}
+        title="Delete this chat?"
+        subtitle={chat.title || "Untitled chat"}
+      >
+        <p className="text-sm leading-relaxed text-slate-600 dark:text-slate-300">
+          The conversation and its messages are deleted from disk. This cannot be undone.
+        </p>
+        <div className="mt-5 flex justify-end gap-2">
+          <Button variant="secondary" autoFocus onClick={() => setConfirmDelete(false)}>
+            Cancel
+          </Button>
+          <Button
+            variant="danger"
+            onClick={() => {
+              setConfirmDelete(false);
+              deleteConversation(chat.id).catch((e) => console.error(e));
+            }}
+          >
+            Delete chat
+          </Button>
+        </div>
+      </Modal>
+    </>
   );
 }
