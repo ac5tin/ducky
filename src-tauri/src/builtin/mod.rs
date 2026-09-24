@@ -5,6 +5,7 @@
 
 pub mod fs;
 pub mod html;
+pub mod session_context;
 pub mod web;
 
 use std::path::Path;
