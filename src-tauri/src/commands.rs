@@ -957,6 +957,31 @@ pub async fn chat_steer(
     )
 }
 
+/// Withdraw a queued steer. `Ok` when the id is no longer queued — it was
+/// already delivered, or the turn ended; there is nothing left to retract.
+pub(crate) fn unqueue_steer(
+    runtimes: &Mutex<HashMap<String, Arc<ConversationRuntime>>>,
+    conversation_id: &str,
+    id: &str,
+) -> Result<(), String> {
+    let runtimes = runtimes.lock().unwrap();
+    let Some(runtime) = runtimes.get(conversation_id) else {
+        return Ok(());
+    };
+    runtime.steering.lock().unwrap().retain(|s| s.id != id);
+    Ok(())
+}
+
+/// Withdraw a steering message that has not been delivered yet.
+#[tauri::command]
+pub async fn chat_unsteer(
+    state: State<'_, Arc<AppState>>,
+    conversation_id: String,
+    id: String,
+) -> Result<(), String> {
+    unqueue_steer(&state.runtimes, &conversation_id, &id)
+}
+
 #[tauri::command]
 pub fn chat_cancel(state: State<'_, Arc<AppState>>, conversation_id: String) {
     if let Some(rt) = state.runtimes.lock().unwrap().get(&conversation_id) {
@@ -1898,5 +1923,33 @@ mod tests {
         let runtimes: Mutex<HashMap<String, Arc<ConversationRuntime>>> = Mutex::new(HashMap::new());
         let err = queue_steer(&runtimes, "c1", steer("s1", "too late")).unwrap_err();
         assert_eq!(err, "No running turn for this conversation");
+    }
+
+    #[test]
+    fn unqueue_steer_removes_only_that_id() {
+        let steering: Arc<crate::agent::SteeringQueue> = Arc::new(Mutex::new(VecDeque::new()));
+        steering.lock().unwrap().push_back(steer("s1", "one"));
+        steering.lock().unwrap().push_back(steer("s2", "two"));
+        let mut runtimes = HashMap::new();
+        runtimes.insert(
+            "c1".to_string(),
+            Arc::new(ConversationRuntime {
+                ct: CancellationToken::new(),
+                steering: steering.clone(),
+            }),
+        );
+        let runtimes = Mutex::new(runtimes);
+
+        unqueue_steer(&runtimes, "c1", "s1").unwrap();
+
+        let queued = steering.lock().unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].id, "s2");
+    }
+
+    #[test]
+    fn unqueue_steer_is_ok_without_a_running_turn() {
+        let runtimes: Mutex<HashMap<String, Arc<ConversationRuntime>>> = Mutex::new(HashMap::new());
+        unqueue_steer(&runtimes, "c1", "s1").unwrap();
     }
 }

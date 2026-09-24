@@ -15,6 +15,16 @@ export function withSteeringAdded(
   };
 }
 
+/** The first pending steer whose `chat_steer` invoke has settled. A steer
+ *  still in flight must not be sent as a normal turn: the backend may accept
+ *  it and inject the same text twice. */
+export function nextFlushableSteer(
+  queue: SteeringMessage[],
+  inFlight: ReadonlySet<string>,
+): SteeringMessage | undefined {
+  return queue.find((m) => !inFlight.has(m.id));
+}
+
 /** A copy of `queues` with the message whose `id` matches removed for
  *  `conversationId`. Other conversations and other messages are untouched;
  *  removing an id that is not queued changes nothing. */

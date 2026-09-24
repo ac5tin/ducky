@@ -97,6 +97,7 @@ pub fn run() {
             commands::context_limit,
             commands::chat_send,
             commands::chat_steer,
+            commands::chat_unsteer,
             commands::chat_cancel,
             commands::conversation_compact,
             commands::conversation_undo,

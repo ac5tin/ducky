@@ -3,7 +3,11 @@ import { create } from "zustand";
 import { check as updaterCheck, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import * as api from "./api";
-import { withSteeringAdded, withSteeringRemoved } from "./chatSteering";
+import {
+  nextFlushableSteer,
+  withSteeringAdded,
+  withSteeringRemoved,
+} from "./chatSteering";
 import { resolveDraftModel } from "./chatDraft";
 import { toLayout } from "./groups";
 import { expandInitPrompt, parseSlashCommand } from "./slashCommands";
@@ -727,21 +731,25 @@ export const useStore = create<StoreState>((set, get) => ({
       set((s) => ({
         steeringQueues: withSteeringAdded(s.steeringQueues, convId, pending),
       }));
+      steeringInFlight.add(pending.id);
       try {
         await api.chatSteer(convId, pending.id, text);
       } catch {
-        // The run ended before the steer landed: send it as a normal turn —
-        // but only if the run-end flush has not already sent it (the dead
-        // runtime lingers briefly, so this Err can arrive after flushSteering
-        // drained the bubble).
-        const stillPending = (get().steeringQueues[convId] ?? []).some(
-          (m) => m.id === pending.id,
-        );
-        if (!stillPending) return true;
-        set((s) => ({
-          steeringQueues: withSteeringRemoved(s.steeringQueues, convId, pending.id),
-        }));
-        await dispatchSend(convId, text, set, get);
+        // no running turn — the settle check below sends it as a normal turn
+      }
+      steeringInFlight.delete(pending.id);
+      if (steeringWithdrawn.delete(pending.id)) {
+        // withdrawn while this invoke was in flight: the backend may only now
+        // hold it, so retract it a second time
+        void api.chatUnsteer(convId, pending.id).catch(() => {});
+      } else if (
+        steeringStillPending(convId, pending.id, get) &&
+        !get().busyConversationIds.has(convId)
+      ) {
+        // The backend refused it, or accepted it onto a run that has since
+        // ended: nothing will deliver it, so send it as a normal turn. When a
+        // run IS active it either delivers the steer or the next flush does.
+        sendSteerAsTurn(convId, pending.id, text, set, get);
       }
       return true;
     }
@@ -843,6 +851,11 @@ export const useStore = create<StoreState>((set, get) => ({
     set((s) => ({
       steeringQueues: withSteeringRemoved(s.steeringQueues, convId, id),
     }));
+    // Withdraw it from the backend too, or the agent still receives it. While
+    // the steer's own invoke is in flight the backend may not hold it yet, so
+    // remember the id and let the settle path retract it again.
+    if (steeringInFlight.has(id)) steeringWithdrawn.add(id);
+    void api.chatUnsteer(convId, id).catch(() => {});
   },
 
   async compactConversation(id, instructions) {
@@ -1163,6 +1176,16 @@ function flushPending(set: SetFn, get: GetFn) {
 
 let queueSeq = 0;
 
+/** Steer ids whose `chatSteer` invoke has not settled yet. `flushSteering`
+ *  must not send one as a normal turn: the backend may still accept it, and
+ *  the same text would then enter the model twice. */
+const steeringInFlight = new Set<string>();
+
+/** Steer ids the user withdrew while their invoke was in flight. The backend
+ *  may only accept them after that retraction, so the settle path retracts
+ *  them once more. */
+const steeringWithdrawn = new Set<string>();
+
 /** Starts a turn for `convId`. Transcript updates, the `streaming` mirror and
  * the title flag apply only to the active conversation — a background flush
  * (a pending steer firing in a chat the user switched away from) must not
@@ -1222,6 +1245,25 @@ async function dispatchSend(
   }
 }
 
+/** Is `id` still a pending steer for `convId`? */
+function steeringStillPending(convId: string, id: string, get: GetFn): boolean {
+  return (get().steeringQueues[convId] ?? []).some((m) => m.id === id);
+}
+
+/** Drop a pending steer and send its text as a normal turn. */
+function sendSteerAsTurn(
+  convId: string,
+  id: string,
+  text: string,
+  set: SetFn,
+  get: GetFn,
+) {
+  set((s) => ({
+    steeringQueues: withSteeringRemoved(s.steeringQueues, convId, id),
+  }));
+  void dispatchSend(convId, text, set, get);
+}
+
 /** Sends the next pending steer for `convId` as a normal turn, if any. One per
  * call — the sent message re-marks the conversation busy, so the next one waits
  * for that turn's message_done. This is the lossless fallback for a cancelled
@@ -1229,8 +1271,14 @@ async function dispatchSend(
 function flushSteering(convId: string, set: SetFn, get: GetFn) {
   const queue = get().steeringQueues[convId];
   if (!queue?.length) return;
-  const [next, ...rest] = queue;
-  set({ steeringQueues: { ...get().steeringQueues, [convId]: rest } });
+  const next = nextFlushableSteer(queue, steeringInFlight);
+  if (!next) return; // every pending steer still has an invoke in flight
+  set({
+    steeringQueues: {
+      ...get().steeringQueues,
+      [convId]: queue.filter((m) => m.id !== next.id),
+    },
+  });
   void dispatchSend(convId, next.text, set, get);
 }
 
