@@ -196,6 +196,9 @@ export const conversationGet = (
 export const chatSend = (conversationId: string, text: string) =>
   invoke<void>("chat_send", { conversationId, text });
 
+export const chatSteer = (conversationId: string, id: string, text: string) =>
+  invoke<void>("chat_steer", { conversationId, id, text });
+
 export const chatCancel = (conversationId: string) =>
   invoke<void>("chat_cancel", { conversationId });
 

@@ -253,6 +253,14 @@ export type RawMessage =
                   is_error: boolean;
           };
 
+/** A message submitted while its conversation was mid-turn; the backend
+ * delivers it into the running turn at the next assistant-turn boundary. */
+export interface SteeringMessage {
+        id: string;
+        text: string;
+        ts: string;
+}
+
 // ---------------------------------------------------------------------------
 // Backend events
 // ---------------------------------------------------------------------------
@@ -339,6 +347,13 @@ export type BackendEvent =
                   conversation_id: string;
                   tool_call_id: string;
                   text: string;
+          }
+        | {
+                  type: "steering_delivered";
+                  conversation_id: string;
+                  id: string;
+                  text: string;
+                  ts: string;
           }
         | { type: "message_done"; conversation_id: string; message_id: string }
         | { type: "chat_error"; conversation_id: string; error: string }
