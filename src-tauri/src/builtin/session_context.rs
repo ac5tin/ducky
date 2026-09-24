@@ -154,10 +154,14 @@ fn build_context(title: &str, id: &str, raw: &[Value], query: &str) -> String {
         out.push_str(&block);
     }
     if out.len() > MAX_OUTPUT_CHARS {
-        out = clip(&out, MAX_OUTPUT_CHARS.saturating_sub(TRUNCATION_NOTICE.len())).to_string();
         truncated = true;
     }
     if truncated {
+        out = clip(
+            &out,
+            MAX_OUTPUT_CHARS.saturating_sub(TRUNCATION_NOTICE.len()),
+        )
+        .to_string();
         out.push_str(TRUNCATION_NOTICE);
     }
     out
@@ -317,14 +321,30 @@ mod tests {
     }
 
     #[test]
-    fn build_context_stays_within_the_character_cap() {
-        let raw = vec![
-            serde_json::json!({ "kind": "user", "text": "x".repeat(60_000) }),
-            serde_json::json!({ "kind": "assistant", "text": "y".repeat(60_000) }),
-        ];
-        let out = build_context("T", OTHER, &raw, "");
-        assert!(out.len() <= 24_000, "len={}", out.len());
-        assert!(out.contains("[truncated]"), "{out}");
+    fn build_context_stays_within_the_character_cap_when_truncated() {
+        for header_len in 1..=12 {
+            for message_len in 5_950..=5_965 {
+                let title = "T".repeat(header_len);
+                let raw: Vec<Value> = (0..5)
+                    .map(|_| {
+                        serde_json::json!({
+                            "kind": "user",
+                            "text": "x".repeat(message_len),
+                        })
+                    })
+                    .collect();
+                let out = build_context(&title, OTHER, &raw, "");
+                assert!(
+                    out.contains("[truncated]"),
+                    "title={header_len}, message={message_len}"
+                );
+                assert!(
+                    out.len() <= MAX_OUTPUT_CHARS,
+                    "len={}, title={header_len}, message={message_len}",
+                    out.len()
+                );
+            }
+        }
     }
 
     #[test]

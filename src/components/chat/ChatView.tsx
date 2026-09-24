@@ -629,6 +629,8 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
     if (restoredDraft === undefined || !activeId) return;
     clearRestoredDraft(activeId);
     setText(restoredDraft);
+    setChatsDismissed(false);
+    setCaret(restoredDraft.length);
     requestAnimationFrame(() => {
       const el = ref.current;
       if (!el) return;
@@ -690,12 +692,12 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
     setChatsDismissed(false);
     setChatIndex(0);
     const next = token.start + inserted.length;
+    setCaret(next);
     requestAnimationFrame(() => {
       const el = ref.current;
       if (!el) return;
       el.focus();
       el.setSelectionRange(next, next);
-      setCaret(next);
       el.style.height = "auto";
       el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
     });

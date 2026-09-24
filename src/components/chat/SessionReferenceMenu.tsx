@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 import type { ConversationMeta } from "../../types";
 
 /** Autocomplete list shown while the user types a `#` chat reference in the
@@ -14,6 +15,12 @@ export function SessionReferenceMenu({
   onPick: (chat: ConversationMeta) => void;
   onDismiss: () => void;
 }) {
+  const activeRow = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    activeRow.current?.scrollIntoView({ block: "nearest" });
+  }, [activeIndex]);
+
   return (
     <>
       {/* click-away; keeping mousedown default so the textarea keeps focus */}
@@ -23,10 +30,11 @@ export function SessionReferenceMenu({
         onMouseDown={(e) => e.preventDefault()}
         onClick={onDismiss}
       />
-      <div className="pop-in absolute bottom-full left-0 z-40 mb-1 w-80 overflow-hidden rounded-xl border border-slate-200 bg-white py-1 shadow-xl dark:border-slate-700 dark:bg-slate-900">
+      <div className="pop-in absolute bottom-full left-0 z-40 mb-1 max-h-80 w-80 overflow-y-auto rounded-xl border border-slate-200 bg-white py-1 shadow-xl dark:border-slate-700 dark:bg-slate-900">
         {chats.map((chat, i) => (
           <button
             key={chat.id}
+            ref={i === activeIndex ? activeRow : undefined}
             type="button"
             className={`flex w-full flex-col items-start gap-0.5 px-3 py-2 text-left transition ${
               i === activeIndex ? "bg-slate-50 dark:bg-slate-800" : ""
