@@ -48,29 +48,34 @@ pub fn parse_request(args: &Value, active_id: &str) -> Result<(String, String), 
 /// Read one referenced chat and render the bounded transcript.
 pub fn execute(store: &Store, active_id: &str, args: &Value) -> Result<String, String> {
     let (conversation_id, query) = parse_request(args, active_id)?;
-    let title = {
+    let (title, stored_id) = {
         let cfg = store.config.lock().unwrap();
-        cfg.conversations
+        let meta = cfg
+            .conversations
             .iter()
             .find(|c| c.id == conversation_id)
-            .map(|c| c.title.clone())
-            .ok_or_else(|| format!("No saved chat with id {conversation_id}"))?
+            .ok_or_else(|| format!("No saved chat with id {conversation_id}"))?;
+        // The transcript path derives from the stored id, never the argument.
+        (meta.title.clone(), meta.id.clone())
     };
     let (_, raw) = store
-        .load_conversation(&conversation_id)
-        .ok_or_else(|| format!("Chat {conversation_id} has no saved transcript"))?;
-    Ok(build_context(&title, &conversation_id, &raw, &query))
+        .load_conversation(&stored_id)
+        .ok_or_else(|| format!("Chat {stored_id} has no saved transcript"))?;
+    Ok(build_context(&title, &stored_id, &raw, &query))
 }
 
-/// `#chat_<uuid>` tokens in a user message: word-anchored, deduplicated, in
-/// first-seen order. The id is normalised, so it cannot smuggle extra entries.
+/// `#chat_<uuid>` tokens in a user message: word-anchored, a trailing run of
+/// punctuation is ignored, deduplicated, in first-seen order. The id is
+/// normalised, so it cannot smuggle extra entries.
 pub fn extract_references(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for word in text.split_whitespace() {
         let Some(candidate) = word.strip_prefix("#chat_") else {
             continue;
         };
-        let candidate = candidate.trim_end_matches(|c: char| !c.is_ascii_hexdigit() && c != '-');
+        let candidate = candidate.trim_end_matches(|c: char| {
+            matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '"' | '\'')
+        });
         let Ok(id) = uuid::Uuid::parse_str(candidate) else {
             continue;
         };
@@ -338,6 +343,19 @@ mod tests {
         );
         assert_eq!(extract_references(&text), vec![OTHER.to_string()]);
         assert!(extract_references("C# is a language").is_empty());
+    }
+
+    #[test]
+    fn extract_references_strips_only_a_trailing_punctuation_run() {
+        for suffix in [".", ",", ";", ":", "!", "?", ")", "]", "}", "\"", "'"] {
+            let text = format!("see #chat_{OTHER}{suffix}");
+            assert_eq!(
+                extract_references(&text),
+                vec![OTHER.to_string()],
+                "suffix {suffix:?}"
+            );
+        }
+        assert!(extract_references(&format!("see #chat_{OTHER}- and #chat_{OTHER}xyz")).is_empty());
     }
 
     #[test]
