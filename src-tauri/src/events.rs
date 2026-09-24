@@ -38,6 +38,14 @@ pub enum BackendEvent {
         tool_call_id: String,
         text: String,
     },
+    /// A mid-turn user message was injected into the running turn at the next
+    /// assistant-turn boundary. `id` is the frontend bubble id.
+    SteeringDelivered {
+        conversation_id: String,
+        id: String,
+        text: String,
+        ts: String,
+    },
     /// A full assistant turn (text + tool calls) is complete.
     MessageDone {
         conversation_id: String,

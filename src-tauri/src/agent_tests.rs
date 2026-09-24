@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::Agent;
+use crate::agent::{Agent, PendingSteer, SteeringQueue};
 use crate::config::{
     AgentMode, ApprovalMode, ConversationMeta, EffortLevel, ProviderConfig, Store, SubagentConfig,
 };
@@ -36,6 +36,8 @@ enum MockRound {
     Gated(Arc<tokio::sync::Barrier>, String),
     /// Never resolve (cancellation probe).
     Hang,
+    /// Push a steering message (id `s1`), then run the inner round.
+    Steer(Arc<SteeringQueue>, String, Box<MockRound>),
 }
 
 type ScriptMap = Arc<Mutex<HashMap<String, VecDeque<MockRound>>>>;
@@ -51,6 +53,7 @@ struct CapturedRound {
     system: String,
     model: String,
     effort: Option<String>,
+    users: Vec<String>,
 }
 
 static CAPTURES: LazyLock<Mutex<HashMap<String, Vec<CapturedRound>>>> =
@@ -112,12 +115,34 @@ impl LlmProvider for MockProvider {
                     .unwrap_or_default(),
                 model: opts.model.clone(),
                 effort: opts.effort.map(|e| e.as_str().to_string()),
+                users: messages
+                    .iter()
+                    .filter_map(|m| match m {
+                        Msg::User { text, .. } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect(),
             });
-        let round = SCRIPTS
+        let mut round = SCRIPTS
             .lock()
             .unwrap()
             .get_mut(&key)
             .and_then(|q| q.pop_front());
+        // a scripted steer lands while this turn is still running, then the
+        // inner round proceeds
+        if let Some(steer) = round.take() {
+            match steer {
+                MockRound::Steer(queue, text, inner) => {
+                    queue.lock().unwrap().push_back(PendingSteer {
+                        id: "s1".into(),
+                        text,
+                        ts: "2026-09-24T00:00:00Z".into(),
+                    });
+                    round = Some(*inner);
+                }
+                other => round = Some(other),
+            }
+        }
         match round {
             Some(MockRound::Text(t)) => {
                 tx.send(ProviderEvent::TextDelta(t)).await.ok();
@@ -150,6 +175,9 @@ impl LlmProvider for MockProvider {
                 std::future::pending::<()>().await;
                 unreachable!("pending never resolves")
             }
+            // only reachable if a script nests a steer inside a steer, which
+            // no test does: the outer steer is unwrapped above
+            Some(MockRound::Steer(_, _, _)) => unreachable!("nested steer"),
             None => {
                 tx.send(ProviderEvent::TextDelta(format!("no script for {key:?}")))
                     .await
@@ -238,7 +266,13 @@ fn test_agent_full(
     (agent, sink, store, dir)
 }
 
-async fn run(agent: &Agent, conversation_id: &str, prompt: &str, ct: &CancellationToken) {
+async fn run_with_steering(
+    agent: &Agent,
+    conversation_id: &str,
+    prompt: &str,
+    ct: &CancellationToken,
+    steering: Arc<SteeringQueue>,
+) {
     agent
         .run_turn(
             conversation_id.to_string(),
@@ -247,8 +281,20 @@ async fn run(agent: &Agent, conversation_id: &str, prompt: &str, ct: &Cancellati
             Vec::new(),
             prompt.to_string(),
             ct.clone(),
+            steering,
         )
         .await;
+}
+
+async fn run(agent: &Agent, conversation_id: &str, prompt: &str, ct: &CancellationToken) {
+    run_with_steering(
+        agent,
+        conversation_id,
+        prompt,
+        ct,
+        Arc::new(Mutex::new(VecDeque::new())),
+    )
+    .await;
 }
 
 fn tool_results(store: &Store, conversation_id: &str) -> Vec<String> {
@@ -572,6 +618,7 @@ async fn cancelling_the_turn_cancels_subagents() {
                 Vec::new(),
                 "t5-main".into(),
                 task_ct,
+                Arc::new(Mutex::new(VecDeque::new())),
             )
             .await;
     });
@@ -1566,4 +1613,98 @@ async fn a_plan_mode_parent_also_gives_a_read_only_child() {
     assert!(!child[0].tool_names.contains(&"ducky__fs_write".to_string()));
     assert!(!child[0].tool_names.contains(&"ducky__present_plan".to_string()));
     assert!(child[0].system.contains("plan mode"), "{}", child[0].system);
+}
+
+#[tokio::test]
+async fn steering_enters_after_the_current_tools() {
+    let steering: Arc<SteeringQueue> = Arc::new(Mutex::new(VecDeque::new()));
+    script(
+        "steer-a",
+        vec![MockRound::Steer(
+            steering.clone(),
+            "change of plan".into(),
+            Box::new(MockRound::Tools(vec![(
+                "ducky__fs_list".into(),
+                serde_json::json!({}),
+            )])),
+        )],
+    );
+    // the steered turn is keyed by the steer's own text: it becomes the last
+    // user message when the loop delivers it
+    script("change of plan", vec![MockRound::Text("done".into())]);
+
+    let (agent, sink, store) = test_agent("steer-a");
+    let ct = CancellationToken::new();
+    run_with_steering(&agent, "steer-a", "steer-a", &ct, steering).await;
+
+    let captured = captures_for("change of plan");
+    assert_eq!(captured.len(), 1, "the steer reached the provider");
+    assert!(
+        captured[0].users.contains(&"change of plan".to_string()),
+        "the steer is among the user messages: {:?}",
+        captured[0].users
+    );
+
+    let delivered: Vec<(String, String)> = sink
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            BackendEvent::SteeringDelivered { id, text, .. } => Some((id.clone(), text.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        delivered,
+        vec![("s1".to_string(), "change of plan".to_string())]
+    );
+
+    let (_, messages) = store.load_conversation("steer-a").unwrap();
+    let kinds: Vec<&str> = messages
+        .iter()
+        .map(|m| m["kind"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        kinds,
+        vec!["user", "assistant", "tool_result", "user", "assistant"]
+    );
+    assert_eq!(messages[0]["text"], "steer-a");
+    assert_eq!(messages[3]["text"], "change of plan");
+    assert_eq!(messages[4]["text"], "done");
+}
+
+#[tokio::test]
+async fn steering_extends_a_run_that_was_finishing() {
+    let steering: Arc<SteeringQueue> = Arc::new(Mutex::new(VecDeque::new()));
+    script(
+        "steer-b",
+        vec![MockRound::Steer(
+            steering.clone(),
+            "one more thing".into(),
+            Box::new(MockRound::Text("first".into())),
+        )],
+    );
+    script("one more thing", vec![MockRound::Text("second".into())]);
+
+    let (agent, sink, _store) = test_agent("steer-b");
+    let ct = CancellationToken::new();
+    run_with_steering(&agent, "steer-b", "steer-b", &ct, steering).await;
+
+    let text = chat_text(&sink);
+    assert!(text.contains("first"), "turn 1 streamed: {text:?}");
+    assert!(
+        text.contains("second"),
+        "the steered turn streamed: {text:?}"
+    );
+    assert_eq!(captures_for("one more thing").len(), 1);
+
+    let done = sink
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| matches!(e, BackendEvent::MessageDone { .. }))
+        .count();
+    assert_eq!(done, 1, "one run, one message_done");
 }

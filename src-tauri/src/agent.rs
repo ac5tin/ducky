@@ -2,8 +2,8 @@
 //! calls, feeds results back to the model and repeats until the model is
 //! done. Everything streams to the webview as `BackendEvent`s.
 
-use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use tokio_util::sync::CancellationToken;
 
@@ -352,9 +352,23 @@ fn system_message(
     Msg::System { text }
 }
 
+/// A message the user sent while the turn was running; it is delivered at the
+/// next assistant-turn boundary, after the current turn's tool calls.
+#[derive(Clone, Debug)]
+pub struct PendingSteer {
+    /// Frontend bubble id, echoed back on delivery so the UI can clear it.
+    pub id: String,
+    pub text: String,
+    pub ts: String,
+}
+
+/// Mid-turn messages waiting for the next assistant-turn boundary.
+pub type SteeringQueue = Mutex<VecDeque<PendingSteer>>;
+
 /// Runtime state for a conversation that is currently generating.
 pub struct ConversationRuntime {
     pub ct: CancellationToken,
+    pub steering: Arc<SteeringQueue>,
 }
 
 impl Agent {
@@ -698,6 +712,7 @@ impl Agent {
     }
 
     /// Run one user turn to completion. Errors stream as `chat_error`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_turn(
         &self,
         conversation_id: String,
@@ -706,6 +721,7 @@ impl Agent {
         mut history: Vec<Msg>,
         user_text: String,
         ct: CancellationToken,
+        steering: Arc<SteeringQueue>,
     ) {
         let result = self
             .run_turn_inner(
@@ -715,6 +731,7 @@ impl Agent {
                 &mut history,
                 user_text,
                 &ct,
+                &steering,
             )
             .await;
 
@@ -747,6 +764,7 @@ impl Agent {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_turn_inner(
         &self,
         conversation_id: &str,
@@ -755,6 +773,7 @@ impl Agent {
         history: &mut Vec<Msg>,
         user_text: String,
         ct: &CancellationToken,
+        steering: &Arc<SteeringQueue>,
     ) -> Result<(), String> {
         history.push(Msg::User {
             text: user_text,
@@ -781,6 +800,7 @@ impl Agent {
             max_iterations,
             ct,
             &RunScope::Main,
+            Some(steering),
         )
         .await
         .map(|_| ())
@@ -796,8 +816,24 @@ impl Agent {
         max_iterations: u32,
         ct: &CancellationToken,
         scope: &RunScope,
+        steering: Option<&SteeringQueue>,
     ) -> Result<Option<String>, String> {
         for _ in 0..max_iterations {
+            // A steer waits for the current turn's tool calls to settle: it
+            // enters here, before the next model call, one message per turn.
+            if let Some(steer) = steering.and_then(|q| q.lock().unwrap().pop_front()) {
+                history.push(Msg::User {
+                    text: steer.text.clone(),
+                    ts: Some(steer.ts.clone()),
+                });
+                self.persist(conversation_id, history)?;
+                self.sink.emit(BackendEvent::SteeringDelivered {
+                    conversation_id: conversation_id.to_string(),
+                    id: steer.id,
+                    text: steer.text,
+                    ts: steer.ts,
+                });
+            }
             let (provider, default_model, _provider_name) = self.provider_for(provider_id)?;
             let model = if model.is_empty() {
                 default_model
@@ -1027,6 +1063,11 @@ impl Agent {
             }
 
             if stop != StopReason::ToolUse || calls.is_empty() {
+                // a steer that arrived while this turn was finishing keeps the
+                // run alive; the next iteration delivers it
+                if steering.is_some_and(|q| !q.lock().unwrap().is_empty()) {
+                    continue;
+                }
                 return Ok(Some(text));
             }
 
@@ -1484,6 +1525,7 @@ impl Agent {
                 max_iterations,
                 &child,
                 &scope,
+                None,
             )
             .await;
         match outcome {

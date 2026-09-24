@@ -1,7 +1,7 @@
 //! Tauri commands — the whole backend API surface the webview talks to.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -820,6 +820,8 @@ pub async fn chat_send(
     let auto_title = history.is_empty() && title_empty;
 
     let ct = CancellationToken::new();
+    // mid-turn messages the user sends while this turn is running
+    let steering: Arc<crate::agent::SteeringQueue> = Arc::new(Mutex::new(VecDeque::new()));
     {
         // both locks held together (always in this order) so a concurrent
         // /compact can never slip between the check and the insert
@@ -830,7 +832,10 @@ pub async fn chat_send(
         let mut runtimes = state.runtimes.lock().unwrap();
         runtimes.insert(
             conversation_id.clone(),
-            Arc::new(ConversationRuntime { ct: ct.clone() }),
+            Arc::new(ConversationRuntime {
+                ct: ct.clone(),
+                steering: steering.clone(),
+            }),
         );
     }
 
@@ -896,7 +901,15 @@ pub async fn chat_send(
     tokio::spawn(async move {
         app_state
             .agent
-            .run_turn(conversation_id_task, provider_id, model, history, text, ct)
+            .run_turn(
+                conversation_id_task,
+                provider_id,
+                model,
+                history,
+                text,
+                ct,
+                steering,
+            )
             .await;
         // drop the runtime once the turn finishes
         // (keep a small delay so late cancel calls resolve harmlessly)
