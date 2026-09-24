@@ -779,6 +779,16 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
         default_model: "",
     },
     ProviderPreset {
+        id: "xai",
+        label: "xAI (Grok)",
+        tagline: "Grok models from console.x.ai",
+        base_url: "https://api.x.ai/v1",
+        api_type: ApiType::OpenAi,
+        needs_key: true,
+        key_url: "https://console.x.ai/team/default/api-keys",
+        default_model: "",
+    },
+    ProviderPreset {
         id: "zai-coding",
         label: "Z.ai Coding Plan",
         tagline: "GLM models via the coding-plan endpoint",
@@ -806,6 +816,36 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
         api_type: ApiType::OpenAi,
         needs_key: true,
         key_url: "https://opencode.ai/auth",
+        default_model: "",
+    },
+    ProviderPreset {
+        id: "opencode-go",
+        label: "OpenCode Go",
+        tagline: "Subscription models from the OpenCode gateway",
+        base_url: "https://opencode.ai/zen/go/v1",
+        api_type: ApiType::OpenAi,
+        needs_key: true,
+        key_url: "https://opencode.ai/auth",
+        default_model: "",
+    },
+    ProviderPreset {
+        id: "qwen-token-plan",
+        label: "Qwen Token Plan",
+        tagline: "Qwen, DeepSeek and GLM via Alibaba Model Studio",
+        base_url: "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        api_type: ApiType::OpenAi,
+        needs_key: true,
+        key_url: "https://bailian.console.aliyun.com/cn-beijing/subscription/token-plan",
+        default_model: "",
+    },
+    ProviderPreset {
+        id: "commandcode",
+        label: "CommandCode",
+        tagline: "Provider API models via api.commandcode.ai",
+        base_url: "https://api.commandcode.ai/provider/v1",
+        api_type: ApiType::OpenAi,
+        needs_key: true,
+        key_url: "https://commandcode.ai/studio",
         default_model: "",
     },
     ProviderPreset {
@@ -1276,6 +1316,31 @@ fn headers_from_json(v: Option<&serde_json::Value>) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_presets_stay_unique_and_addressable() {
+        let mut ids: Vec<&str> = PROVIDER_PRESETS.iter().map(|p| p.id).collect();
+        ids.sort_unstable();
+        let count = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), count, "preset ids must be unique");
+        for preset in PROVIDER_PRESETS {
+            assert!(!preset.label.is_empty(), "{} needs a label", preset.id);
+            assert!(
+                !preset.base_url.is_empty() || preset.id == "custom",
+                "{} needs a base URL",
+                preset.id
+            );
+            if preset.needs_key {
+                assert!(!preset.key_url.is_empty(), "{} needs a key URL", preset.id);
+            }
+            // every preset must speak a protocol the provider layer implements
+            assert!(matches!(preset.api_type, ApiType::OpenAi | ApiType::Anthropic));
+        }
+        for id in ["opencode-go", "qwen-token-plan", "commandcode", "xai"] {
+            assert!(preset_by_id(id).is_some(), "{id} preset is missing");
+        }
+    }
 
     #[test]
     fn config_roundtrip() {

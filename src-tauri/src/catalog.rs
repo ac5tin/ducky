@@ -263,7 +263,17 @@ fn provider_aliases(kind: &str) -> Vec<&'static str> {
         "groq" => vec!["groq"],
         "ollama" => vec!["ollama", "ollama-cloud"],
         "lmstudio" => vec!["lmstudio"],
-        "opencode" => vec!["opencode", "opencode-go"],
+        "opencode" => vec!["opencode"],
+        "opencode-go" => vec!["opencode-go"],
+        "qwen-token-plan" => vec![
+            "alibaba-token-plan-cn",
+            "alibaba-token-plan",
+            "alibaba-cn",
+            "alibaba",
+        ],
+        "xai" => vec!["xai"],
+        // "commandcode" has no models.dev entry: its models resolve through
+        // the bare-id scan, which finds the canonical labs.
         _ => vec![],
     }
 }
@@ -341,6 +351,33 @@ mod tests {
                         "reasoning_options": [{ "type": "effort", "values": ["high", "max"] }]
                     }
                 }
+            },
+            "xai": {
+                "id": "xai",
+                "models": {
+                    "grok-4.7": {
+                        "reasoning": true,
+                        "reasoning_options": [{ "type": "effort", "values": ["low", "medium", "high", "xhigh"] }]
+                    }
+                }
+            },
+            "opencode-go": {
+                "id": "opencode-go",
+                "models": {
+                    "glm-5.3-flash": {
+                        "reasoning": true,
+                        "reasoning_options": [{ "type": "effort", "values": ["low", "high", "max"] }]
+                    }
+                }
+            },
+            "alibaba-token-plan-cn": {
+                "id": "alibaba-token-plan-cn",
+                "models": {
+                    "qwen3.8-max": {
+                        "reasoning": true,
+                        "reasoning_options": [{ "type": "effort", "values": ["low", "medium", "xhigh"] }]
+                    }
+                }
             }
         });
         parse_index(&serde_json::to_string(&body).unwrap()).unwrap()
@@ -366,6 +403,42 @@ mod tests {
         assert_eq!(
             lookup(&index, "anthropic", "claude-opus-4.7"),
             vec![EffortLevel::Low, EffortLevel::Medium, EffortLevel::High]
+        );
+    }
+
+    #[test]
+    fn new_provider_kinds_resolve_their_catalog_providers() {
+        let index = fixture();
+        assert_eq!(
+            lookup(&index, "xai", "grok-4.7"),
+            vec![
+                EffortLevel::Low,
+                EffortLevel::Medium,
+                EffortLevel::High,
+                EffortLevel::XHigh
+            ]
+        );
+        assert_eq!(
+            lookup(&index, "opencode-go", "glm-5.3-flash"),
+            vec![EffortLevel::Low, EffortLevel::High, EffortLevel::Max]
+        );
+        assert_eq!(
+            lookup(&index, "qwen-token-plan", "qwen3.8-max"),
+            vec![
+                EffortLevel::Low,
+                EffortLevel::Medium,
+                EffortLevel::XHigh
+            ]
+        );
+        // CommandCode has no catalog entry: its models fall back to the bare scan
+        assert_eq!(
+            lookup(&index, "commandcode", "gpt-5.5"),
+            lookup(&index, "openai", "gpt-5.5")
+        );
+        // a Go-only model that no catalog provider lists falls back to the trio
+        assert_eq!(
+            lookup(&index, "opencode-go", "mystery-model"),
+            EffortLevel::default_levels()
         );
     }
 
