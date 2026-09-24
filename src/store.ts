@@ -3,6 +3,7 @@ import { create } from "zustand";
 import { check as updaterCheck, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import * as api from "./api";
+import { withSteeringAdded, withSteeringRemoved } from "./chatSteering";
 import { resolveDraftModel } from "./chatDraft";
 import { toLayout } from "./groups";
 import { expandInitPrompt, parseSlashCommand } from "./slashCommands";
@@ -25,6 +26,7 @@ import type {
   ProviderPreset,
   RawMessage,
   ServerSummary,
+  SteeringMessage,
   ToolCallState,
 } from "./types";
 
@@ -58,14 +60,6 @@ export interface ToolItem {
 }
 
 export type ChatItem = UserItem | AssistantItem | ToolItem;
-
-/** A message submitted while its conversation was mid-turn; held until the
- * turn ends, then sent FIFO (one per turn end). */
-export interface QueuedMessage {
-  id: string;
-  text: string;
-  ts: string;
-}
 
 export interface Toast {
   id: string;
@@ -176,8 +170,9 @@ interface StoreState {
   compactingConversationIds: Set<string>;
   /** Undone prompts waiting to be restored into the composer, by conversation. */
   restoredDrafts: Record<string, string>;
-  /** Per-conversation FIFO of messages waiting for the current turn to end. */
-  messageQueues: Record<string, QueuedMessage[]>;
+  /** Per-conversation messages steered into the running turn, awaiting
+   * delivery confirmation from the backend. */
+  steeringQueues: Record<string, SteeringMessage[]>;
   titleGeneratingIds: Set<string>;
   /** Last provider token usage per conversation. */
   usageByConversation: Record<string, { input?: number; output?: number }>;
@@ -234,7 +229,7 @@ interface StoreState {
   /** Remove a selected prompt and re-run the edited text. */
   editMessage: (messageIndex: number | undefined, text: string) => Promise<boolean>;
   stop: () => void;
-  removeQueued: (id: string) => void;
+  removeSteering: (id: string) => void;
   /** `/compact`: summarise the conversation's history. */
   compactConversation: (id: string, instructions?: string) => Promise<void>;
   /** `/undo`: drop the last turn and revert its file changes. */
@@ -346,7 +341,7 @@ export const useStore = create<StoreState>((set, get) => ({
   busyConversationIds: new Set(),
   compactingConversationIds: new Set(),
   restoredDrafts: {},
-  messageQueues: {},
+  steeringQueues: {},
   titleGeneratingIds: new Set(),
   usageByConversation: {},
 
@@ -520,8 +515,8 @@ export const useStore = create<StoreState>((set, get) => ({
       terminalOpenIds.delete(id);
       const titleGeneratingIds = new Set(s.titleGeneratingIds);
       titleGeneratingIds.delete(id);
-      const { [id]: _queue, ...messageQueues } = s.messageQueues;
-      return { terminalOpenIds, titleGeneratingIds, messageQueues };
+      const { [id]: _queue, ...steeringQueues } = s.steeringQueues;
+      return { terminalOpenIds, titleGeneratingIds, steeringQueues };
     });
     const state = get();
     if (state.activeConversationId === id) {
@@ -678,7 +673,7 @@ export const useStore = create<StoreState>((set, get) => ({
 
   async send(text): Promise<boolean> {
     // slash commands never reach the model as chat text — and unlike real
-    // messages they are never queued behind a running turn
+    // messages they are never steered into a running turn
     const command = parseSlashCommand(text);
     if (command) {
       if (command.unknown) {
@@ -721,21 +716,33 @@ export const useStore = create<StoreState>((set, get) => ({
     }
     let id = get().activeConversationId;
     if (id && get().busyConversationIds.has(id)) {
-      // mid-turn: hold the message, it is sent when the turn ends
+      // mid-turn: steer into the running turn. The bubble stays pending until
+      // the backend confirms delivery.
       const convId = id;
+      const pending: SteeringMessage = {
+        id: `u-steer-${++queueSeq}`,
+        text,
+        ts: new Date().toISOString(),
+      };
       set((s) => ({
-        messageQueues: {
-          ...s.messageQueues,
-          [convId]: [
-            ...(s.messageQueues[convId] ?? []),
-            {
-              id: `u-queue-${++queueSeq}`,
-              text,
-              ts: new Date().toISOString(),
-            },
-          ],
-        },
+        steeringQueues: withSteeringAdded(s.steeringQueues, convId, pending),
       }));
+      try {
+        await api.chatSteer(convId, pending.id, text);
+      } catch {
+        // The run ended before the steer landed: send it as a normal turn —
+        // but only if the run-end flush has not already sent it (the dead
+        // runtime lingers briefly, so this Err can arrive after flushSteering
+        // drained the bubble).
+        const stillPending = (get().steeringQueues[convId] ?? []).some(
+          (m) => m.id === pending.id,
+        );
+        if (!stillPending) return true;
+        set((s) => ({
+          steeringQueues: withSteeringRemoved(s.steeringQueues, convId, pending.id),
+        }));
+        await dispatchSend(convId, text, set, get);
+      }
       return true;
     }
     if (!id) {
@@ -830,14 +837,11 @@ export const useStore = create<StoreState>((set, get) => ({
     }
   },
 
-  removeQueued(id) {
+  removeSteering(id) {
     const convId = get().activeConversationId;
     if (!convId) return;
     set((s) => ({
-      messageQueues: {
-        ...s.messageQueues,
-        [convId]: (s.messageQueues[convId] ?? []).filter((m) => m.id !== id),
-      },
+      steeringQueues: withSteeringRemoved(s.steeringQueues, convId, id),
     }));
   },
 
@@ -1151,16 +1155,18 @@ function flushPending(set: SetFn, get: GetFn) {
   });
 }
 
-// --- message queue ------------------------------------------------------------
-// Messages submitted mid-turn live in messageQueues and are sent FIFO, one per
-// turn end (message_done / chat_error), via drainQueue.
+// --- steering queue ----------------------------------------------------------
+// Messages submitted mid-turn are steered into the running turn at the next
+// assistant-turn boundary (one per turn). The bubble stays pending until the
+// backend confirms delivery; anything left when a run ends is sent as a normal
+// turn, so a cancelled run loses nothing.
 
 let queueSeq = 0;
 
 /** Starts a turn for `convId`. Transcript updates, the `streaming` mirror and
- * the title flag apply only to the active conversation — a background drain
- * (queue firing in a chat the user switched away from) must not touch the
- * visible transcript. */
+ * the title flag apply only to the active conversation — a background flush
+ * (a pending steer firing in a chat the user switched away from) must not
+ * touch the visible transcript. */
 async function dispatchSend(
   convId: string,
   text: string,
@@ -1209,21 +1215,22 @@ async function dispatchSend(
         titleGeneratingIds,
       };
     });
-    // the turn never started, so no message_done will arrive to drain the rest
+    // the turn never started, so no message_done will arrive to flush the rest
     if (active) await get().reloadItems(convId);
-    drainQueue(convId, set, get);
+    flushSteering(convId, set, get);
     return false;
   }
 }
 
-/** Sends the next queued message for `convId`, if any. One per call — the
- * sent message re-marks the conversation busy, so the next one waits for that
- * turn's message_done. */
-function drainQueue(convId: string, set: SetFn, get: GetFn) {
-  const queue = get().messageQueues[convId];
+/** Sends the next pending steer for `convId` as a normal turn, if any. One per
+ * call — the sent message re-marks the conversation busy, so the next one waits
+ * for that turn's message_done. This is the lossless fallback for a cancelled
+ * run or a steer that lost the race with the end of the turn. */
+function flushSteering(convId: string, set: SetFn, get: GetFn) {
+  const queue = get().steeringQueues[convId];
   if (!queue?.length) return;
   const [next, ...rest] = queue;
-  set({ messageQueues: { ...get().messageQueues, [convId]: rest } });
+  set({ steeringQueues: { ...get().steeringQueues, [convId]: rest } });
   void dispatchSend(convId, next.text, set, get);
 }
 
@@ -1257,6 +1264,31 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
       );
       break;
     }
+    case "steering_delivered": {
+      // flushPending already ran: text streamed so far lands above the bubble
+      const active = event.conversation_id === get().activeConversationId;
+      set((s) => {
+        const steeringQueues = withSteeringRemoved(
+          s.steeringQueues,
+          event.conversation_id,
+          event.id,
+        );
+        if (!active) return { steeringQueues };
+        return {
+          steeringQueues,
+          items: [
+            ...s.items,
+            {
+              kind: "user" as const,
+              id: `u-steer-${event.id}`,
+              text: event.text,
+              ts: event.ts,
+            },
+          ],
+        };
+      });
+      break;
+    }
     case "message_done": {
       const active = event.conversation_id === get().activeConversationId;
       set((s) => {
@@ -1264,7 +1296,7 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
         busy.delete(event.conversation_id);
         if (!active) {
           // a turn ending in the background still clears its busy flag and
-          // may fire the next queued message — but never the visible chat
+          // may fire the next pending steer — but never the visible chat
           return { busyConversationIds: busy };
         }
         const items = s.items.map((item) =>
@@ -1279,11 +1311,11 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
           .refreshConfig()
           .catch(() => {});
         void get().reloadItems(event.conversation_id).then(() => {
-          drainQueue(event.conversation_id, set, get);
+          flushSteering(event.conversation_id, set, get);
         });
         break;
       }
-      drainQueue(event.conversation_id, set, get);
+      flushSteering(event.conversation_id, set, get);
       break;
     }
     case "usage": {
@@ -1330,11 +1362,11 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
             }
             return { items, streaming: false };
           });
-          drainQueue(event.conversation_id, set, get);
+          flushSteering(event.conversation_id, set, get);
         });
         break;
       }
-      drainQueue(event.conversation_id, set, get);
+      flushSteering(event.conversation_id, set, get);
       break;
     }
     case "tool_call_update": {

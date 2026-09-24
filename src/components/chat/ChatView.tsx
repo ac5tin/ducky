@@ -33,11 +33,11 @@ import { rfc9557, shortTime } from "../../time";
 export function ChatView() {
   const items = useStore((s) => s.items);
   const activeId = useStore((s) => s.activeConversationId);
-  const queued = useStore((s) =>
-    s.activeConversationId ? s.messageQueues[s.activeConversationId] : undefined,
+  const steering = useStore((s) =>
+    s.activeConversationId ? s.steeringQueues[s.activeConversationId] : undefined,
   );
-  const removeQueued = useStore((s) => s.removeQueued);
   const editMessage = useStore((s) => s.editMessage);
+  const removeSteering = useStore((s) => s.removeSteering);
   const streaming = useStore(
     (s) =>
       !!s.activeConversationId &&
@@ -97,7 +97,7 @@ export function ChatView() {
         });
       }
     }
-  }, [items, queued, streaming, activeId]);
+  }, [items, steering, streaming, activeId]);
 
   if (!activeId) {
     return <EmptyState />;
@@ -198,14 +198,14 @@ export function ChatView() {
               key={item.id}
               item={item}
               onEdit={handleEditMessage}
-              editDisabled={streaming || !!queued?.length}
+              editDisabled={streaming || !!steering?.length}
             />
           ))}
-          {queued?.map((m) => (
-            <QueuedBubble
+          {steering?.map((m) => (
+            <SteeringBubble
               key={m.id}
               message={m}
-              onRemove={() => removeQueued(m.id)}
+              onRemove={() => removeSteering(m.id)}
             />
           ))}
           <div className="h-2" />
@@ -555,11 +555,11 @@ function RanInitCard({ text }: { text: string }) {
   );
 }
 
-function QueuedBubble({
+function SteeringBubble({
   message,
   onRemove,
 }: {
-  message: import("../../store").QueuedMessage;
+  message: import("../../types").SteeringMessage;
   onRemove: () => void;
 }) {
   return (
@@ -570,11 +570,11 @@ function QueuedBubble({
         </div>
         <div className="mt-1 flex items-center justify-end gap-1.5 px-1 text-[11px] text-slate-400 dark:text-slate-500">
           <Icon name="clock" className="h-3 w-3" />
-          <span>Queued</span>
+          <span>Steering</span>
           <button
             className="rounded p-0.5 transition hover:text-rose-500"
-            aria-label="Remove from queue"
-            title="Remove from queue"
+            aria-label="Remove steering message"
+            title="Remove steering message"
             onClick={onRemove}
           >
             <Icon name="x" className="h-3 w-3" />
@@ -651,7 +651,8 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
   const submit = () => {
     const t = text.trim();
     if (!t || compacting) return;
-    // while the agent is responding the store queues the message instead
+    // while the agent is responding the store steers the message into the
+    // running turn instead
     setText("");
     send(t).catch((e) => console.error(e));
   };
@@ -692,7 +693,7 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
               rows={1}
               placeholder={
                 streaming
-                  ? "Queue a message — it sends when the response finishes…"
+                  ? "Steer the response — it enters after the current step…"
                   : "Ask anything — your connected tools are available automatically…"
               }
               className="max-h-40 min-h-[44px] flex-1 resize-none rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-sm outline-none transition focus:border-sky-400 focus:ring-2 focus:ring-sky-100 dark:border-slate-700 dark:bg-slate-900 dark:focus:border-sky-500 dark:focus:ring-sky-900/40"
