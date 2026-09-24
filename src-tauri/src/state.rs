@@ -29,8 +29,8 @@ pub struct AppState {
     pub bridge: Arc<InteractiveBridge>,
     pub manager: Arc<McpManager>,
     pub agent: Arc<Agent>,
-    /// models.dev catalog for per-model effort levels.
-    pub catalog: crate::catalog::Catalog,
+    /// models.dev catalog for per-model effort levels and wire protocols.
+    pub catalog: Arc<crate::catalog::Catalog>,
     /// Cancellation tokens for conversations that are generating a reply.
     pub runtimes: Mutex<HashMap<String, Arc<ConversationRuntime>>>,
     /// Cancellation tokens for in-flight chat-title generation.
@@ -50,13 +50,16 @@ impl AppState {
     ) -> Arc<Self> {
         let bridge = Arc::new(InteractiveBridge::new(sink.clone(), store.clone()));
         let manager = Arc::new(McpManager::new(store.clone(), bridge.clone(), sink.clone()));
+        let catalog = Arc::new(crate::catalog::Catalog::new(
+            &data_dir.join("models-dev.json"),
+        ));
         let agent = Arc::new(Agent {
             store: store.clone(),
             manager: manager.clone(),
             bridge: bridge.clone(),
             sink: sink.clone(),
+            catalog: catalog.clone(),
         });
-        let catalog = crate::catalog::Catalog::new(&data_dir.join("models-dev.json"));
         Arc::new(Self {
             store,
             sink,

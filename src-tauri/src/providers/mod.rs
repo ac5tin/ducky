@@ -6,6 +6,7 @@
 
 pub mod anthropic;
 pub mod openai;
+pub mod responses;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -136,6 +137,80 @@ pub trait LlmProvider: Send + Sync {
 /// rather than present as a generic HTTP library.
 pub(crate) const USER_AGENT: &str = concat!("ducky/", env!("CARGO_PKG_VERSION"));
 
+/// Wire protocol one request uses. A gateway may serve different models of one
+/// catalogue over different wires, so this is resolved per model rather than
+/// per connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Wire {
+    /// OpenAI-compatible `/chat/completions`.
+    Chat,
+    /// Anthropic `/messages`.
+    Messages,
+    /// OpenAI `/responses`.
+    Responses,
+}
+
+impl Wire {
+    /// The wire a connection speaks unless the model says otherwise.
+    pub fn default_for(api_type: ApiType) -> Self {
+        match api_type {
+            ApiType::OpenAi => Wire::Chat,
+            ApiType::Anthropic => Wire::Messages,
+        }
+    }
+}
+
+/// Gateways that serve one catalogue over more than one wire.
+///
+/// Everything else stays on the connection's own wire. models.dev publishes a
+/// package per model for every provider, so following that map everywhere would
+/// move OpenAI, xAI and OpenRouter traffic off `/chat/completions`.
+fn serves_several_wires(kind: &str) -> bool {
+    matches!(kind, "opencode" | "opencode-go")
+}
+
+/// Resolve the wire for one model. `catalog_wire` is the models.dev answer for
+/// gateways that publish one. CommandCode has no catalog entry, and serves its
+/// Claude models on `/messages` only, which its model ids make recognisable.
+pub fn wire_for_model(cfg: &ProviderConfig, model: &str, catalog_wire: Option<Wire>) -> Wire {
+    if cfg.kind == "commandcode" && model.trim().to_ascii_lowercase().starts_with("claude-") {
+        return Wire::Messages;
+    }
+    if serves_several_wires(&cfg.kind) {
+        if let Some(wire) = catalog_wire {
+            return wire;
+        }
+    }
+    Wire::default_for(cfg.api_type)
+}
+
+/// Headers a gateway needs in addition to authentication.
+///
+/// OpenCode's relay rejects a request that carries no session id
+/// (`400 MissingSessionID`) and asks clients to identify themselves, so the
+/// conversation id travels with the request. It goes only to that host, so no
+/// other provider ever sees it; a lookalike host such as
+/// `opencode.ai.example.test` does not match.
+pub(crate) fn gateway_headers(
+    base_url: &str,
+    session_id: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let Some(session) = session_id.filter(|id| !id.is_empty()) else {
+        return Vec::new();
+    };
+    let host = reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase));
+    if !matches!(host.as_deref(), Some(h) if h == "opencode.ai" || h.ends_with(".opencode.ai")) {
+        return Vec::new();
+    }
+    vec![
+        ("x-opencode-session", session.to_string()),
+        ("x-opencode-client", "ducky".to_string()),
+    ]
+}
+
 pub(crate) fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(20))
@@ -234,22 +309,41 @@ where
     Ok(())
 }
 
+/// Build the provider for the connection's default wire. Used where no model is
+/// involved yet: listing models and testing a connection.
 pub fn build_provider(
     cfg: &ProviderConfig,
     api_key: Option<&str>,
 ) -> std::sync::Arc<dyn LlmProvider> {
+    build_wired_provider(cfg, api_key, Wire::default_for(cfg.api_type))
+}
+
+/// Build the provider for one wire of a connection.
+pub fn build_wired_provider(
+    cfg: &ProviderConfig,
+    api_key: Option<&str>,
+    wire: Wire,
+) -> std::sync::Arc<dyn LlmProvider> {
     let key = api_key.map(|s| s.to_string());
-    match cfg.api_type {
-        ApiType::OpenAi => std::sync::Arc::new(openai::OpenAiProvider {
+    match wire {
+        Wire::Chat => std::sync::Arc::new(openai::OpenAiProvider {
             base_url: cfg.base_url.clone(),
             api_key: key,
             name: cfg.name.clone(),
             // Z.ai needs `thinking` enabled for `reasoning_effort` to apply
             thinking_toggle: matches!(cfg.kind.as_str(), "zai" | "zai-coding"),
         }),
-        ApiType::Anthropic => std::sync::Arc::new(anthropic::AnthropicProvider {
+        Wire::Messages => std::sync::Arc::new(anthropic::AnthropicProvider {
             base_url: cfg.base_url.clone(),
             api_key: key.unwrap_or_default(),
+            name: cfg.name.clone(),
+            // CommandCode accepts these models only with `Authorization: Bearer`;
+            // Anthropic itself and OpenCode read `x-api-key`.
+            bearer: cfg.kind == "commandcode",
+        }),
+        Wire::Responses => std::sync::Arc::new(responses::ResponsesProvider {
+            base_url: cfg.base_url.clone(),
+            api_key: key,
             name: cfg.name.clone(),
         }),
     }
@@ -258,6 +352,86 @@ pub fn build_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wires_resolve_per_model() {
+        let cfg = |kind: &str, api_type: ApiType| ProviderConfig {
+            id: "p".into(),
+            kind: kind.into(),
+            name: "P".into(),
+            base_url: "https://example.test/v1".into(),
+            api_type,
+            default_model: None,
+            models: Vec::new(),
+            created_at: "now".into(),
+        };
+
+        // the catalog answer wins when a gateway publishes one
+        let go = cfg("opencode-go", ApiType::OpenAi);
+        assert_eq!(
+            wire_for_model(&go, "grok-4.7", Some(Wire::Responses)),
+            Wire::Responses
+        );
+        assert_eq!(
+            wire_for_model(&go, "minimax-m3", Some(Wire::Messages)),
+            Wire::Messages
+        );
+        // no catalog answer: the connection's own wire
+        assert_eq!(wire_for_model(&go, "glm-5.3", None), Wire::Chat);
+        assert_eq!(wire_for_model(&go, "grok-4.7", None), Wire::Chat);
+
+        // CommandCode serves Claude models on /messages only
+        let cc = cfg("commandcode", ApiType::OpenAi);
+        assert_eq!(
+            wire_for_model(&cc, "claude-sonnet-5", None),
+            Wire::Messages
+        );
+        assert_eq!(wire_for_model(&cc, "Claude-Opus-5", None), Wire::Messages);
+        assert_eq!(wire_for_model(&cc, "gpt-6-sol", None), Wire::Chat);
+
+        // only the multi-wire gateways follow the catalog: models.dev declares a
+        // package for every provider, and following it here would move every
+        // OpenAI, xAI and OpenRouter model off /chat/completions
+        let xai = cfg("xai", ApiType::OpenAi);
+        assert_eq!(
+            wire_for_model(&xai, "grok-4.7", Some(Wire::Responses)),
+            Wire::Chat
+        );
+        let openai = cfg("openai", ApiType::OpenAi);
+        assert_eq!(
+            wire_for_model(&openai, "gpt-6-sol", Some(Wire::Responses)),
+            Wire::Chat
+        );
+        assert_eq!(
+            wire_for_model(&cc, "gpt-6-sol", Some(Wire::Responses)),
+            Wire::Chat
+        );
+        // a Claude model on a gateway with no Anthropic route stays put too
+        assert_eq!(
+            wire_for_model(&openai, "claude-sonnet-5", None),
+            Wire::Chat
+        );
+
+        // other gateways keep their connection's wire
+        let anthropic = cfg("anthropic", ApiType::Anthropic);
+        assert_eq!(
+            wire_for_model(&anthropic, "claude-opus-4.7", None),
+            Wire::Messages
+        );
+    }
+
+    #[test]
+    fn gateway_headers_only_go_to_opencode() {
+        let go = gateway_headers("https://opencode.ai/zen/go/v1", Some("conv-1"));
+        assert_eq!(go[0], ("x-opencode-session", "conv-1".to_string()));
+        assert_eq!(go[1], ("x-opencode-client", "ducky".to_string()));
+        assert!(gateway_headers("https://opencode.ai/zen/v1", Some("c")).len() == 2);
+        assert!(gateway_headers("https://api.x.ai/v1", Some("conv-1")).is_empty());
+        assert!(gateway_headers("https://api.commandcode.ai/provider/v1", Some("c")).is_empty());
+        assert!(gateway_headers("https://opencode.ai.example.test/v1", Some("c")).is_empty());
+        assert!(gateway_headers("https://opencode.ai/zen/go/v1", None).is_empty());
+        assert!(gateway_headers("https://opencode.ai/zen/go/v1", Some("")).is_empty());
+    }
 
     #[test]
     fn sse_feed_handles_split_chunks() {

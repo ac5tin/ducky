@@ -41,7 +41,9 @@ pub fn render_transcript(history: &[Msg]) -> String {
                 out.push_str(text);
                 out.push_str("\n\n");
             }
-            Msg::Assistant { text, tool_calls, .. } => {
+            Msg::Assistant {
+                text, tool_calls, ..
+            } => {
                 if !text.is_empty() {
                     out.push_str("## Assistant\n\n");
                     out.push_str(text);
@@ -124,7 +126,10 @@ pub fn build_summarizer_messages(history: &[Msg], instructions: Option<&str>) ->
                    in it. Only output the summary."
                 .into(),
         },
-        Msg::User { text: user, ts: None },
+        Msg::User {
+            text: user,
+            ts: None,
+        },
     ]
 }
 
@@ -195,11 +200,7 @@ pub async fn run(
             .iter()
             .find(|c| c.id == conversation_id)
             .ok_or("Unknown conversation")?;
-        (
-            meta.provider_id.clone(),
-            meta.model.clone(),
-            meta.effort,
-        )
+        (meta.provider_id.clone(), meta.model.clone(), meta.effort)
     };
     let history: Vec<Msg> = agent
         .store
@@ -210,7 +211,7 @@ pub async fn run(
         return Err("Nothing to compact — the conversation is empty.".into());
     }
 
-    let (provider, default_model, _) = agent.provider_for(&provider_id)?;
+    let (provider, default_model, _) = agent.provider_for(&provider_id, &model).await?;
     let options = ChatOptions {
         model: if model.is_empty() {
             default_model
@@ -227,8 +228,7 @@ pub async fn run(
         return Err("The model returned an empty summary; nothing was compacted.".into());
     }
 
-    let messages: Vec<serde_json::Value> =
-        apply(&summary).iter().map(|m| m.as_json()).collect();
+    let messages: Vec<serde_json::Value> = apply(&summary).iter().map(|m| m.as_json()).collect();
     let meta = {
         let mut cfg = agent.store.config.lock().unwrap();
         let meta = cfg
@@ -295,9 +295,7 @@ mod tests {
             session_id: None,
         };
         let history = vec![user("hello"), user("and goodbye")];
-        let summary = summarize(provider, options, &history, None)
-            .await
-            .unwrap();
+        let summary = summarize(provider, options, &history, None).await.unwrap();
         let expected: String = (0..64).map(|i| format!("chunk{i} ")).collect();
         assert_eq!(summary, expected);
     }

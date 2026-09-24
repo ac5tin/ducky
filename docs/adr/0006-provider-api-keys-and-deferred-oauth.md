@@ -66,24 +66,29 @@ HTTP library's name, which OpenCode asks of its clients.
 
 ## Consequences
 
-- All four providers work today with the existing OpenAI-compatible adapter
-  and the existing `provider_keys` secrets map. No new wire protocol, no new
-  secret storage, no new auth code.
+- All four providers work with the API key and the existing `provider_keys`
+  secrets map. No new secret storage and no new auth code.
 - OpenCode Go is usable: title generation, `/compact` and MCP sampling carry
   the conversation's session id too, so no request falls into the
   `MissingSessionID` error. Only one session id is used per conversation, which
   is what the provider asks for so its prompt cache stays warm.
 - Other providers never see the session header. The host check rejects
   lookalike hosts such as `opencode.ai.example.test`.
-- OpenCode Go models that the provider serves only on `/responses` (for
-  example Grok 4.7 and GPT 6 Luna) are not reachable yet. The provider returns
-  its own error for those model ids; every model it serves on
-  `/chat/completions` works.
-- CommandCode serves 9 Claude models on `/messages` only, which needs a bearer
-  -authenticated Anthropic call rather than the `x-api-key` header the Anthropic
-  adapter sends. They are filtered out of the model picker (a model that
-  declares `supported_endpoints` without `/chat/completions` is not offered),
-  so the 72 remaining models all work.
+- OpenCode Go serves its catalogue over three wires, so one connection can now
+  reach every model. The wire is resolved per model, not per connection:
+  models.dev publishes a package per model (`@ai-sdk/openai` → `/responses`,
+  `@ai-sdk/anthropic` → `/messages`, otherwise `/chat/completions`), and that
+  map is followed **only** for `opencode` and `opencode-go`. models.dev
+  declares a package for every provider, so following it everywhere would move
+  OpenAI, xAI and OpenRouter traffic off `/chat/completions`.
+- The `/messages` wire reads a different auth header per gateway: `x-api-key`
+  for Anthropic and OpenCode, `Authorization: Bearer` for CommandCode. Both are
+  verified by probing each endpoint with a deliberately invalid key and reading
+  which header the error names.
+- CommandCode's 9 Claude models work: `claude-*` routes to `/messages` with a
+  bearer token, matching what the reference client does. The other 72 models
+  stay on `/chat/completions`. The earlier picker filter is gone, since the
+  models are reachable now.
 - Alibaba needs no `enable_thinking`: its hybrid Qwen3.5/3.7/3.8 models enable
   thinking by default, so the parameter is only ever used to turn it off. The
   adapter still sends `reasoning_effort` when the user picks a level.
@@ -96,12 +101,14 @@ HTTP library's name, which OpenCode asks of its clients.
   client is approved.
 - xAI documents partner OAuth for non-Grok-CLI clients, or the user accepts
   the Grok CLI client explicitly.
-- OpenCode Go's `/responses`-only models become the models users ask for. That
-  needs a Responses adapter (a second wire protocol next to `chat/completions`),
-  which is a separate decision from auth.
-- Someone wants Claude through CommandCode or OpenCode: it needs an
-  Anthropic-wire path that authenticates with a bearer token, not the current
-  `x-api-key` header, plus a second preset per gateway because one connection
-  speaks one protocol.
+- A model resolves to the wrong wire. models.dev lags a gateway's own model
+  list, and a cold catalog falls back to `/chat/completions`; the CommandCode
+  rule is a model-id prefix, not a published list.
+- Another gateway starts serving several wires. The gate in
+  `serves_several_wires` is the one place to extend, after checking its auth
+  header and that following models.dev will not move its other models.
+- The Responses adapter is fixture-tested only. It has no live 200 yet, because
+  it needs a real key; the first user with one should confirm text, tool calls
+  and usage against OpenCode Go's Grok or GPT models.
 - Qwen Token Plan or OpenCode Go report abuse-routing problems that the
   session header would fix.

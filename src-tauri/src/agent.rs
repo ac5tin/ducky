@@ -12,7 +12,8 @@ use crate::events::{BackendEvent, EventSink};
 use crate::mcp::bridge::{ApprovalDecision, SamplingBackend};
 use crate::mcp::manager::{content_to_text, McpManager};
 use crate::providers::{
-    build_provider, LlmProvider, Msg, ProviderEvent, StopReason, ToolCall, ToolDef,
+    build_wired_provider, wire_for_model, LlmProvider, Msg, ProviderEvent, StopReason, ToolCall,
+    ToolDef,
 };
 
 /// Maximum subagent nesting depth. The main agent runs at depth 0; a
@@ -225,6 +226,10 @@ pub struct Agent {
     pub manager: Arc<McpManager>,
     pub bridge: Arc<crate::mcp::bridge::InteractiveBridge>,
     pub sink: Arc<dyn EventSink>,
+    /// models.dev catalog. Gateways like OpenCode Go serve part of one
+    /// catalogue over `/responses` or `/messages`, and that map decides which
+    /// adapter a model needs.
+    pub catalog: Arc<crate::catalog::Catalog>,
 }
 
 /// The mode block for the system prompt. `Default` returns `None` so default
@@ -417,9 +422,13 @@ impl Agent {
         }
     }
 
-    pub(crate) fn provider_for(
+    /// Build the provider for a conversation's model. The model picks the wire:
+    /// a gateway can serve part of its catalogue over `/responses` or
+    /// `/messages` while the rest stays on `/chat/completions`.
+    pub(crate) async fn provider_for(
         &self,
         provider_id: &str,
+        model: &str,
     ) -> Result<(Arc<dyn LlmProvider>, String, String), String> {
         #[cfg(test)]
         {
@@ -435,15 +444,25 @@ impl Agent {
             .find(|p| p.id == provider_id)
             .ok_or("The provider for this conversation is no longer configured")?;
         let key = self.store.provider_key(&provider_cfg.id);
-        let model = provider_cfg
+        let default_model = provider_cfg
             .default_model
             .clone()
             .filter(|m| !m.is_empty())
             .or_else(|| provider_cfg.models.first().cloned())
             .unwrap_or_default();
+        let effective_model = if model.trim().is_empty() {
+            default_model.clone()
+        } else {
+            model.to_string()
+        };
+        let catalog_wire = self
+            .catalog
+            .model_wire(&provider_cfg.kind, &effective_model)
+            .await;
+        let wire = wire_for_model(provider_cfg, &effective_model, catalog_wire);
         Ok((
-            build_provider(provider_cfg, key.as_deref()),
-            model,
+            build_wired_provider(provider_cfg, key.as_deref(), wire),
+            default_model,
             provider_cfg.name.clone(),
         ))
     }
@@ -839,7 +858,8 @@ impl Agent {
                     ts: steer.ts,
                 });
             }
-            let (provider, default_model, _provider_name) = self.provider_for(provider_id)?;
+            let (provider, default_model, _provider_name) =
+                self.provider_for(provider_id, model).await?;
             let model = if model.is_empty() {
                 default_model
             } else {
@@ -1454,6 +1474,7 @@ impl Agent {
             manager: self.manager.clone(),
             bridge: self.bridge.clone(),
             sink: self.sink.clone(),
+            catalog: self.catalog.clone(),
         };
         let conversation = conversation_id.to_string();
         let ct = ct.clone();
@@ -2064,7 +2085,9 @@ impl Agent {
             (cfg.settings.clone(), meta)
         };
         let resolved = crate::title::resolve_title_model(&settings, &meta);
-        let (provider, default_model, _) = self.provider_for(&resolved.provider_id)?;
+        let (provider, default_model, _) = self
+            .provider_for(&resolved.provider_id, &resolved.model)
+            .await?;
         let model = if resolved.model.is_empty() {
             default_model
         } else {

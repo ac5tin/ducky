@@ -144,27 +144,6 @@ impl OpenAiProvider {
     }
 }
 
-/// Headers OpenCode's gateway needs. Its relay rejects requests without a
-/// session id (`400 MissingSessionID`) and asks clients to identify themselves
-/// instead of presenting as a generic HTTP library. Only that host receives
-/// them, so the conversation id never leaks to other providers; a lookalike
-/// host such as `opencode.ai.example.test` does not match.
-fn opencode_session_headers(
-    base_url: &str,
-    session_id: Option<&str>,
-) -> Option<[(&'static str, String); 2]> {
-    let session = session_id.filter(|id| !id.is_empty())?;
-    let host = reqwest::Url::parse(base_url)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))?;
-    (host == "opencode.ai" || host.ends_with(".opencode.ai")).then(|| {
-        [
-            ("x-opencode-session", session.to_string()),
-            ("x-opencode-client", "ducky".to_string()),
-        ]
-    })
-}
-
 /// Accumulated state for one streamed turn.
 #[derive(Default)]
 struct Turn {
@@ -252,10 +231,7 @@ impl LlmProvider for OpenAiProvider {
         let body = Self::build_body(messages, tools, opts, self.thinking_toggle);
 
         let mut request = self.auth_headers(http_client().post(self.endpoint("/chat/completions")));
-        for (name, value) in opencode_session_headers(&self.base_url, opts.session_id.as_deref())
-            .into_iter()
-            .flatten()
-        {
+        for (name, value) in super::gateway_headers(&self.base_url, opts.session_id.as_deref()) {
             request = request.header(name, value);
         }
         let response = request.json(&body).send().await?;
@@ -320,26 +296,12 @@ impl LlmProvider for OpenAiProvider {
             .and_then(|d| d.as_array())
             .map(|a| {
                 a.iter()
-                    .filter(|m| supports_chat_completions(m))
                     .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(String::from))
                     .collect()
             })
             .unwrap_or_default();
         models.sort();
         Ok(models)
-    }
-}
-
-/// Some gateways publish a per-model `supported_endpoints` list. A model whose
-/// list omits `/chat/completions` rejects every request this adapter sends, so
-/// it is kept out of the picker instead of failing after selection. A missing
-/// or empty list means "unknown" and keeps the model.
-fn supports_chat_completions(model: &Value) -> bool {
-    match model.get("supported_endpoints").and_then(|e| e.as_array()) {
-        Some(endpoints) if !endpoints.is_empty() => endpoints
-            .iter()
-            .any(|e| e.as_str() == Some("/chat/completions")),
-        _ => true,
     }
 }
 
@@ -432,49 +394,6 @@ mod tests {
             turn.handle_chunk(&chunk2, "t").unwrap(),
             Some(ProviderEvent::ReasoningDelta(_))
         ));
-    }
-
-    #[test]
-    fn hidden_wire_protocols_are_kept_out_of_the_picker() {
-        // CommandCode-style listing: Claude models declare /messages only
-        assert!(!supports_chat_completions(&json!({
-            "id": "claude-sonnet-5",
-            "supported_endpoints": ["/messages"]
-        })));
-        assert!(supports_chat_completions(&json!({
-            "id": "deepseek-v4-flash",
-            "supported_endpoints": ["/chat/completions"]
-        })));
-        // absent or empty list means unknown, so keep the model
-        assert!(supports_chat_completions(&json!({"id": "grok-4.7"})));
-        assert!(supports_chat_completions(&json!({
-            "id": "mystery",
-            "supported_endpoints": []
-        })));
-    }
-
-    #[test]
-    fn opencode_requests_carry_a_stable_session_header() {
-        let go = opencode_session_headers("https://opencode.ai/zen/go/v1", Some("conv-1"))
-            .expect("OpenCode Go needs the session header");
-        assert_eq!(go[0], ("x-opencode-session", "conv-1".to_string()));
-        assert_eq!(go[1], ("x-opencode-client", "ducky".to_string()));
-        // Zen sits on the same relay
-        assert!(opencode_session_headers("https://opencode.ai/zen/v1", Some("c")).is_some());
-        // every other provider keeps the conversation id private
-        assert!(opencode_session_headers("https://api.x.ai/v1", Some("conv-1")).is_none());
-        assert!(
-            opencode_session_headers("https://api.commandcode.ai/provider/v1", Some("c"))
-                .is_none()
-        );
-        assert!(opencode_session_headers("https://api.openai.com/v1", Some("c")).is_none());
-        // a lookalike host must not match
-        assert!(
-            opencode_session_headers("https://opencode.ai.example.test/v1", Some("c")).is_none()
-        );
-        // one-shot calls with no conversation send nothing
-        assert!(opencode_session_headers("https://opencode.ai/zen/go/v1", None).is_none());
-        assert!(opencode_session_headers("https://opencode.ai/zen/go/v1", Some("")).is_none());
     }
 
     #[test]

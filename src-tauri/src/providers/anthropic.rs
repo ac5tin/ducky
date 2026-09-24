@@ -14,6 +14,9 @@ pub struct AnthropicProvider {
     pub api_key: String,
     /// Display name used in error messages.
     pub name: String,
+    /// Gateways that read `Authorization: Bearer` instead of `x-api-key` on
+    /// this wire (CommandCode). Anthropic itself and OpenCode want `x-api-key`.
+    pub bearer: bool,
 }
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -22,6 +25,27 @@ impl AnthropicProvider {
     fn endpoint(&self, path: &str) -> String {
         let base = self.base_url.trim_end_matches('/');
         format!("{base}{path}")
+    }
+
+    /// Identity, auth, protocol version and the gateway's session id.
+    fn request(
+        &self,
+        req: reqwest::RequestBuilder,
+        opts: Option<&ChatOptions>,
+    ) -> reqwest::RequestBuilder {
+        let mut req = req
+            .header(reqwest::header::USER_AGENT, super::USER_AGENT)
+            .header("anthropic-version", ANTHROPIC_VERSION);
+        req = if self.bearer {
+            req.bearer_auth(&self.api_key)
+        } else {
+            req.header("x-api-key", &self.api_key)
+        };
+        let session = opts.and_then(|o| o.session_id.as_deref());
+        for (name, value) in super::gateway_headers(&self.base_url, session) {
+            req = req.header(name, value);
+        }
+        req
     }
 
     /// Convert the unified message list to Anthropic's wire format.
@@ -176,11 +200,8 @@ impl LlmProvider for AnthropicProvider {
         let (system, wire_msgs) = Self::messages_to_wire(messages);
         let body = Self::build_body(&system, wire_msgs, tools, opts);
 
-        let response = http_client()
-            .post(self.endpoint("/messages"))
-            .header(reqwest::header::USER_AGENT, super::USER_AGENT)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
+        let response = self
+            .request(http_client().post(self.endpoint("/messages")), Some(opts))
             .json(&body)
             .send()
             .await?;
@@ -297,11 +318,8 @@ impl LlmProvider for AnthropicProvider {
     }
 
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
-        let response = http_client()
-            .get(self.endpoint("/models"))
-            .header(reqwest::header::USER_AGENT, super::USER_AGENT)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
+        let response = self
+            .request(http_client().get(self.endpoint("/models")), None)
             .send()
             .await?;
         let response = ensure_ok(response, &self.name).await?;
@@ -400,6 +418,46 @@ mod tests {
             "tool results must merge into one user message"
         );
         assert_eq!(wire2[2]["content"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn auth_header_follows_the_gateway() {
+        let provider = |base_url: &str, bearer: bool| AnthropicProvider {
+            base_url: base_url.into(),
+            api_key: "secret".into(),
+            name: "t".into(),
+            bearer,
+        };
+        let http = http_client();
+        let opts = ChatOptions {
+            model: "minimax-m3".into(),
+            session_id: Some("conv-1".into()),
+            ..ChatOptions::default()
+        };
+
+        // OpenCode reads x-api-key, and its relay needs the session id
+        let opencode = provider("https://opencode.ai/zen/go/v1", false);
+        let req = opencode
+            .request(http.post("https://opencode.ai/zen/go/v1/messages"), Some(&opts))
+            .build()
+            .expect("request builds");
+        assert_eq!(req.headers().get("x-api-key").unwrap(), "secret");
+        assert!(req.headers().get("authorization").is_none());
+        assert_eq!(req.headers().get("x-opencode-session").unwrap(), "conv-1");
+        assert_eq!(req.headers().get("anthropic-version").unwrap(), "2023-06-01");
+
+        // CommandCode reads Authorization, and is not an OpenCode host
+        let commandcode = provider("https://api.commandcode.ai/provider/v1", true);
+        let req = commandcode
+            .request(
+                http.post("https://api.commandcode.ai/provider/v1/messages"),
+                Some(&opts),
+            )
+            .build()
+            .expect("request builds");
+        assert_eq!(req.headers().get("authorization").unwrap(), "Bearer secret");
+        assert!(req.headers().get("x-api-key").is_none());
+        assert!(req.headers().get("x-opencode-session").is_none());
     }
 
     #[test]

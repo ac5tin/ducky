@@ -283,6 +283,7 @@ fn test_agent_full(
         manager,
         bridge,
         sink: sink.clone(),
+        catalog: Arc::new(crate::catalog::Catalog::new(&dir.join("models-dev.json"))),
     });
     (agent, sink, store, dir)
 }

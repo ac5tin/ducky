@@ -12,6 +12,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::config::EffortLevel;
+use crate::providers::Wire;
 
 pub const CATALOG_URL: &str = "https://models.dev/api.json";
 const MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
@@ -21,6 +22,10 @@ const MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 pub type Index = HashMap<String, HashMap<String, Vec<EffortLevel>>>;
 /// context window (tokens) per provider id -> model id.
 pub type ContextIndex = HashMap<String, HashMap<String, u64>>;
+/// wire protocol per provider id -> model id, for gateways that serve one
+/// catalogue over several wires. Absent entries mean "the connection's own
+/// wire".
+pub type WireIndex = HashMap<String, HashMap<String, Wire>>;
 
 pub struct Catalog {
     state: Mutex<CatalogState>,
@@ -31,6 +36,7 @@ pub struct Catalog {
 struct CatalogState {
     index: Option<Index>,
     context: Option<ContextIndex>,
+    wires: Option<WireIndex>,
     /// When the in-memory index was fetched; `None` = loaded from disk (stale).
     fetched_at: Option<Instant>,
 }
@@ -40,10 +46,15 @@ impl Catalog {
         let index = std::fs::read_to_string(cache_path)
             .ok()
             .and_then(|raw| serde_json::from_str(&raw).ok());
+        // the wire map has its own cache file so the effort index keeps its shape
+        let wires = wire_cache_path(cache_path)
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|raw| serde_json::from_str(&raw).ok());
         Self {
             state: Mutex::new(CatalogState {
                 index,
                 context: None,
+                wires,
                 fetched_at: None,
             }),
             cache_path: Some(cache_path.to_path_buf()),
@@ -68,6 +79,14 @@ impl Catalog {
         lookup_context(st.context.as_ref()?, kind, model)
     }
 
+    /// The wire a model is served on, for gateways whose catalogue spans more
+    /// than one. `None` means "use the connection's own wire".
+    pub async fn model_wire(&self, kind: &str, model: &str) -> Option<Wire> {
+        self.refresh_if_stale().await;
+        let st = self.state.lock().unwrap();
+        lookup_wire(st.wires.as_ref()?, kind, model)
+    }
+
     async fn refresh_if_stale(&self) {
         {
             let st = self.state.lock().unwrap();
@@ -78,11 +97,12 @@ impl Catalog {
             }
         }
         match fetch_catalog().await {
-            Ok((index, context)) => {
-                self.store_cache(&index);
+            Ok((index, context, wires)) => {
+                self.store_cache(&index, &wires);
                 let mut st = self.state.lock().unwrap();
                 st.index = Some(index);
                 st.context = Some(context);
+                st.wires = Some(wires);
                 st.fetched_at = Some(Instant::now());
             }
             Err(e) => {
@@ -91,7 +111,7 @@ impl Catalog {
         }
     }
 
-    fn store_cache(&self, index: &Index) {
+    fn store_cache(&self, index: &Index, wires: &WireIndex) {
         let Some(path) = &self.cache_path else {
             return;
         };
@@ -102,10 +122,20 @@ impl Catalog {
             std::fs::create_dir_all(parent).ok();
         }
         std::fs::write(path, json).ok();
+        if let (Some(wire_path), Ok(json)) = (wire_cache_path(path), serde_json::to_string(wires))
+        {
+            std::fs::write(wire_path, json).ok();
+        }
     }
 }
 
-async fn fetch_catalog() -> anyhow::Result<(Index, ContextIndex)> {
+/// Sibling cache file for the wire map, so the effort index keeps its shape.
+fn wire_cache_path(cache_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let stem = cache_path.file_stem()?.to_string_lossy().into_owned();
+    Some(cache_path.with_file_name(format!("{stem}-wires.json")))
+}
+
+async fn fetch_catalog() -> anyhow::Result<(Index, ContextIndex, WireIndex)> {
     let body = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()?
@@ -122,11 +152,12 @@ pub fn parse_index(body: &str) -> anyhow::Result<Index> {
     Ok(parse_catalog(body)?.0)
 }
 
-pub fn parse_catalog(body: &str) -> anyhow::Result<(Index, ContextIndex)> {
+pub fn parse_catalog(body: &str) -> anyhow::Result<(Index, ContextIndex, WireIndex)> {
     let value: serde_json::Value = serde_json::from_str(body)?;
     let Some(providers) = value.as_object() else {
         anyhow::bail!("unexpected catalog shape");
     };
+    let mut wires = WireIndex::new();
     let mut index = Index::new();
     let mut context = ContextIndex::new();
     for (provider_id, pv) in providers {
@@ -152,9 +183,47 @@ pub fn parse_catalog(body: &str) -> anyhow::Result<(Index, ContextIndex)> {
                         .insert(model_id.clone(), n);
                 }
             }
+            if let Some(wire) = mv
+                .pointer("/provider/npm")
+                .and_then(|v| v.as_str())
+                .and_then(wire_from_npm)
+            {
+                wires
+                    .entry(provider_id.clone())
+                    .or_default()
+                    .insert(model_id.clone(), wire);
+            }
         }
     }
-    Ok((index, context))
+    Ok((index, context, wires))
+}
+
+/// The AI SDK package a models.dev model declares: Anthropic's package is the
+/// `/messages` wire, the OpenAI package is `/responses`, and the
+/// openai-compatible package is `/chat/completions` (also the default when a
+/// model declares nothing).
+fn wire_from_npm(npm: &str) -> Option<Wire> {
+    match npm {
+        "@ai-sdk/anthropic" => Some(Wire::Messages),
+        "@ai-sdk/openai" => Some(Wire::Responses),
+        _ => None,
+    }
+}
+
+/// Wire for a Ducky provider kind + model id. Gateways that do not publish a
+/// per-model wire have no entry, which leaves the connection's own wire in
+/// charge.
+pub fn lookup_wire(index: &WireIndex, kind: &str, model: &str) -> Option<Wire> {
+    let model = model.trim();
+    if model.is_empty() {
+        return None;
+    }
+    for pid in provider_aliases(kind) {
+        if let Some(wire) = index.get(pid).and_then(|m| m.get(model)) {
+            return Some(*wire);
+        }
+    }
+    None
 }
 
 /// Union of all `effort`-type `reasoning_options` values, catalog order.
@@ -435,6 +504,50 @@ mod tests {
         assert_eq!(
             lookup(&index, "opencode-go", "mystery-model"),
             EffortLevel::default_levels()
+        );
+    }
+
+    #[test]
+    fn reads_the_wire_a_gateway_publishes_per_model() {
+        let (_, _, wires) = parse_catalog(
+            &serde_json::to_string(&json!({
+                "opencode-go": {
+                    "id": "opencode-go",
+                    "models": {
+                        "grok-4.7": { "reasoning": true, "provider": { "npm": "@ai-sdk/openai" } },
+                        "minimax-m3": { "reasoning": true, "provider": { "npm": "@ai-sdk/anthropic" } },
+                        "glm-5.3": { "reasoning": true, "provider": { "npm": "@ai-sdk/openai-compatible" } },
+                        "mystery": { "reasoning": true }
+                    }
+                },
+                "alibaba-token-plan-cn": {
+                    "id": "alibaba-token-plan-cn",
+                    "models": {
+                        "qwen3.8-max": { "reasoning": true, "provider": { "npm": "@ai-sdk/openai-compatible" } }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            lookup_wire(&wires, "opencode-go", "grok-4.7"),
+            Some(Wire::Responses)
+        );
+        assert_eq!(
+            lookup_wire(&wires, "opencode-go", "minimax-m3"),
+            Some(Wire::Messages)
+        );
+        // the compatible package declares nothing to switch to
+        assert_eq!(lookup_wire(&wires, "opencode-go", "glm-5.3"), None);
+        assert_eq!(lookup_wire(&wires, "opencode-go", "mystery"), None);
+        // a gateway with no entry, and an empty model id, resolve to nothing
+        assert_eq!(lookup_wire(&wires, "commandcode", "claude-sonnet-5"), None);
+        assert_eq!(lookup_wire(&wires, "opencode-go", ""), None);
+        // the alias maps the Ducky kind onto its catalog provider
+        assert_eq!(
+            lookup_wire(&wires, "qwen-token-plan", "qwen3.8-max"),
+            None
         );
     }
 
