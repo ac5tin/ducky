@@ -1054,6 +1054,10 @@ async fn read_only_mode_hides_mutating_tools() {
     assert!(names.contains(&"ducky__fs_search".to_string()), "{names:?}");
     // the subagent tool stays: its children inherit this mode
     assert!(names.contains(&SUBAGENT.to_string()), "{names:?}");
+    assert!(
+        names.contains(&"ducky__read_session_context".to_string()),
+        "{names:?}"
+    );
     assert!(!names.contains(&"ducky__fs_write".to_string()), "{names:?}");
     assert!(!names.contains(&"ducky__fs_mkdir".to_string()), "{names:?}");
     assert!(!names.contains(&"ducky__set_mode".to_string()), "{names:?}");
@@ -1068,6 +1072,10 @@ async fn plan_mode_offers_the_plan_tool_only() {
 
     let names = captures_for("m2-main")[0].tool_names.clone();
     assert!(names.contains(&"ducky__present_plan".to_string()), "{names:?}");
+    assert!(
+        names.contains(&"ducky__read_session_context".to_string()),
+        "{names:?}"
+    );
     assert!(!names.contains(&"ducky__fs_write".to_string()), "{names:?}");
     assert!(!names.contains(&"ducky__set_mode".to_string()), "{names:?}");
 }
@@ -1151,6 +1159,67 @@ async fn default_mode_allows_the_same_write() {
     run(&agent, "m6-conv", "m6-main", &CancellationToken::new()).await;
 
     assert!(dir.join("allowed.txt").exists());
+}
+
+#[tokio::test]
+async fn read_session_context_runs_through_the_engine() {
+    let chat_id = "33333333-3333-4333-8333-333333333333";
+    let now = chrono::Utc::now().to_rfc3339();
+    let (agent, sink, store) = test_agent("rc-conv");
+    let old = ConversationMeta {
+        id: chat_id.to_string(),
+        title: "Trip planning".to_string(),
+        provider_id: "mock".to_string(),
+        model: "mock-model".to_string(),
+        effort: None,
+        mcp_ids: None,
+        mode: AgentMode::Default,
+        auto_readonly: false,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    store.config.lock().unwrap().conversations.push(old.clone());
+    store
+        .save_conversation(
+            &old,
+            &[serde_json::json!({ "kind": "user", "text": "we booked the ferry for Tuesday" })],
+            &[],
+        )
+        .unwrap();
+
+    script(
+        "rc-main",
+        vec![
+            MockRound::Tools(vec![(
+                "ducky__read_session_context".to_string(),
+                serde_json::json!({ "conversation_id": chat_id, "query": "ferry" }),
+            )]),
+            MockRound::Text("done".into()),
+        ],
+    );
+    run(&agent, "rc-conv", "rc-main", &CancellationToken::new()).await;
+
+    let results: Vec<String> = sink
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|event| match event {
+            BackendEvent::ToolCallUpdate {
+                tool_call_id,
+                result_text,
+                ..
+            } if tool_call_id.contains("read_session_context") => result_text.clone(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(results[0].contains("ferry"), "{}", results[0]);
+    assert!(
+        !results[0].contains("handled by the chat engine"),
+        "{}",
+        results[0]
+    );
 }
 
 // ---------------------------------------------------------------------------

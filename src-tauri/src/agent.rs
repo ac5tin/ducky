@@ -1702,13 +1702,22 @@ impl Agent {
         // Builtins run in-process — no server to connect. Result text goes
         // straight to the model and the tool card.
         if crate::builtin::is_builtin(&call.name) {
-            let cwd = {
-                let cfg = self.store.config.lock().unwrap();
-                cfg.settings.effective_working_dir(&self.store.home_dir)
-            };
-            let result = tokio::select! {
-                _ = ct.cancelled() => Err("cancelled by user".to_string()),
-                r = crate::builtin::execute(&call.name, &call.arguments, &cwd) => r,
+            // a chat read needs the store and the active chat id, not a cwd
+            let result = if call.name == crate::builtin::session_context::READ_SESSION_CONTEXT {
+                crate::builtin::session_context::execute(
+                    &self.store,
+                    conversation_id,
+                    &call.arguments,
+                )
+            } else {
+                let cwd = {
+                    let cfg = self.store.config.lock().unwrap();
+                    cfg.settings.effective_working_dir(&self.store.home_dir)
+                };
+                tokio::select! {
+                    _ = ct.cancelled() => Err("cancelled by user".to_string()),
+                    r = crate::builtin::execute(&call.name, &call.arguments, &cwd) => r,
+                }
             };
             return match result {
                 Ok(text) => {
