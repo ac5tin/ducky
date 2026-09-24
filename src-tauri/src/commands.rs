@@ -919,6 +919,44 @@ pub async fn chat_send(
     Ok(())
 }
 
+/// Queue a mid-turn message for a running turn. `Err` when no turn is running
+/// for the conversation — the caller then sends the text as a normal message.
+pub(crate) fn queue_steer(
+    runtimes: &Mutex<HashMap<String, Arc<ConversationRuntime>>>,
+    conversation_id: &str,
+    steer: crate::agent::PendingSteer,
+) -> Result<(), String> {
+    let runtimes = runtimes.lock().unwrap();
+    let runtime = runtimes
+        .get(conversation_id)
+        .ok_or("No running turn for this conversation")?;
+    runtime.steering.lock().unwrap().push_back(steer);
+    Ok(())
+}
+
+/// Steer the running turn for `conversation_id`: the message enters the loop
+/// after the current turn's tool calls, before the next model call.
+#[tauri::command]
+pub async fn chat_steer(
+    state: State<'_, Arc<AppState>>,
+    conversation_id: String,
+    id: String,
+    text: String,
+) -> Result<(), String> {
+    if text.trim().is_empty() {
+        return Err("Message is empty".into());
+    }
+    queue_steer(
+        &state.runtimes,
+        &conversation_id,
+        crate::agent::PendingSteer {
+            id,
+            text,
+            ts: now(),
+        },
+    )
+}
+
 #[tauri::command]
 pub fn chat_cancel(state: State<'_, Arc<AppState>>, conversation_id: String) {
     if let Some(rt) = state.runtimes.lock().unwrap().get(&conversation_id) {
@@ -1824,5 +1862,41 @@ mod tests {
         assert_eq!(result.truncated, 2);
         assert_eq!(result.kept_messages, messages[..2]);
         assert_eq!(result.kept_records, vec![first]);
+    }
+
+    fn steer(id: &str, text: &str) -> crate::agent::PendingSteer {
+        crate::agent::PendingSteer {
+            id: id.into(),
+            text: text.into(),
+            ts: "2026-09-24T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn queue_steer_pushes_to_a_running_turn() {
+        let steering: Arc<crate::agent::SteeringQueue> = Arc::new(Mutex::new(VecDeque::new()));
+        let mut runtimes = HashMap::new();
+        runtimes.insert(
+            "c1".to_string(),
+            Arc::new(ConversationRuntime {
+                ct: CancellationToken::new(),
+                steering: steering.clone(),
+            }),
+        );
+        let runtimes = Mutex::new(runtimes);
+
+        queue_steer(&runtimes, "c1", steer("s1", "change of plan")).unwrap();
+
+        let queued = steering.lock().unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].id, "s1");
+        assert_eq!(queued[0].text, "change of plan");
+    }
+
+    #[test]
+    fn queue_steer_errors_without_a_running_turn() {
+        let runtimes: Mutex<HashMap<String, Arc<ConversationRuntime>>> = Mutex::new(HashMap::new());
+        let err = queue_steer(&runtimes, "c1", steer("s1", "too late")).unwrap_err();
+        assert_eq!(err, "No running turn for this conversation");
     }
 }
