@@ -7,6 +7,7 @@ import type { ApiType, ProviderPreset } from "../types";
 
 /** First-run wizard: provider → key → optional first connector. */
 export function Onboarding() {
+  const config = useStore((s) => s.config);
   const presets = useStore((s) => s.presets);
   const suggestions = useStore((s) => s.suggestions);
   const refreshConfig = useStore((s) => s.refreshConfig);
@@ -71,6 +72,14 @@ export function Onboarding() {
   return (
     <div className="h-full overflow-y-auto bg-gradient-to-b from-sky-50 to-white dark:from-slate-900 dark:to-slate-950">
       <div className="mx-auto flex min-h-full max-w-xl flex-col justify-center px-6 py-10">
+        {config?.onboarding_complete && (
+          <div className="mb-4 flex justify-end">
+            <Button variant="ghost" onClick={() => setView("settings")}>
+              <Icon name="x" className="h-4 w-4" />
+              Close
+            </Button>
+          </div>
+        )}
         {/* step indicator */}
         <div className="mb-8 flex items-center gap-2">
           {[0, 1, 2, 3].map((i) => (
