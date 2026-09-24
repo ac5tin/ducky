@@ -856,6 +856,13 @@ export const useStore = create<StoreState>((set, get) => ({
     // remember the id and let the settle path retract it again.
     if (steeringInFlight.has(id)) steeringWithdrawn.add(id);
     void api.chatUnsteer(convId, id).catch(() => {});
+    // Withdrawing the head can unblock a flush that already ran and skipped it
+    // while that head was in flight. Without this, a later settled steer would
+    // wait for a turn that is not running. While a run IS active, its own
+    // message_done / chat_error flushes, so do not flush here.
+    if (!get().busyConversationIds.has(convId)) {
+      flushSteering(convId, set, get);
+    }
   },
 
   async compactConversation(id, instructions) {
