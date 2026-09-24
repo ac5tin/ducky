@@ -822,6 +822,10 @@ pub async fn chat_send(
     let ct = CancellationToken::new();
     // mid-turn messages the user sends while this turn is running
     let steering: Arc<crate::agent::SteeringQueue> = Arc::new(Mutex::new(VecDeque::new()));
+    let runtime = Arc::new(ConversationRuntime {
+        ct: ct.clone(),
+        steering: steering.clone(),
+    });
     {
         // both locks held together (always in this order) so a concurrent
         // /compact can never slip between the check and the insert
@@ -830,13 +834,7 @@ pub async fn chat_send(
             return Err("This conversation is being compacted — try again in a moment.".into());
         }
         let mut runtimes = state.runtimes.lock().unwrap();
-        runtimes.insert(
-            conversation_id.clone(),
-            Arc::new(ConversationRuntime {
-                ct: ct.clone(),
-                steering: steering.clone(),
-            }),
-        );
+        runtimes.insert(conversation_id.clone(), runtime.clone());
     }
 
     // /undo bookkeeping: capture the project's state before this turn can
@@ -907,16 +905,34 @@ pub async fn chat_send(
                 model,
                 history,
                 text,
-                ct,
-                steering,
+                runtime.ct.clone(),
+                runtime.steering.clone(),
             )
             .await;
-        // drop the runtime once the turn finishes
+        // drop this turn's runtime, but only if no follow-up turn replaced it
         // (keep a small delay so late cancel calls resolve harmlessly)
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        app_state.runtimes.lock().unwrap().remove(&conversation_id);
+        retire_runtime(&app_state.runtimes, &conversation_id, &runtime);
     });
     Ok(())
+}
+
+/// Drop a finished turn's runtime from the map, unless a follow-up turn has
+/// already replaced it. The flush that starts that follow-up can land inside
+/// this turn's linger, and removing its runtime would leave a running turn
+/// unstoppable and unsteerable.
+pub(crate) fn retire_runtime(
+    runtimes: &Mutex<HashMap<String, Arc<ConversationRuntime>>>,
+    conversation_id: &str,
+    runtime: &Arc<ConversationRuntime>,
+) {
+    let mut runtimes = runtimes.lock().unwrap();
+    if runtimes
+        .get(conversation_id)
+        .is_some_and(|current| Arc::ptr_eq(current, runtime))
+    {
+        runtimes.remove(conversation_id);
+    }
 }
 
 /// Queue a mid-turn message for a running turn. `Err` when no turn is running
@@ -1951,5 +1967,41 @@ mod tests {
     fn unqueue_steer_is_ok_without_a_running_turn() {
         let runtimes: Mutex<HashMap<String, Arc<ConversationRuntime>>> = Mutex::new(HashMap::new());
         unqueue_steer(&runtimes, "c1", "s1").unwrap();
+    }
+
+    #[test]
+    fn retire_runtime_removes_its_own_runtime() {
+        let runtime = Arc::new(ConversationRuntime {
+            ct: CancellationToken::new(),
+            steering: Arc::new(Mutex::new(VecDeque::new())),
+        });
+        let mut runtimes = HashMap::new();
+        runtimes.insert("c1".to_string(), runtime.clone());
+        let runtimes = Mutex::new(runtimes);
+
+        retire_runtime(&runtimes, "c1", &runtime);
+
+        assert!(runtimes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn retire_runtime_leaves_a_replaced_runtime() {
+        let old = Arc::new(ConversationRuntime {
+            ct: CancellationToken::new(),
+            steering: Arc::new(Mutex::new(VecDeque::new())),
+        });
+        let follow_up = Arc::new(ConversationRuntime {
+            ct: CancellationToken::new(),
+            steering: Arc::new(Mutex::new(VecDeque::new())),
+        });
+        let mut runtimes = HashMap::new();
+        runtimes.insert("c1".to_string(), follow_up.clone());
+        let runtimes = Mutex::new(runtimes);
+
+        retire_runtime(&runtimes, "c1", &old);
+
+        let mapped = runtimes.lock().unwrap();
+        assert_eq!(mapped.len(), 1);
+        assert!(Arc::ptr_eq(mapped.get("c1").unwrap(), &follow_up));
     }
 }

@@ -15,14 +15,18 @@ export function withSteeringAdded(
   };
 }
 
-/** The first pending steer whose `chat_steer` invoke has settled. A steer
- *  still in flight must not be sent as a normal turn: the backend may accept
- *  it and inject the same text twice. */
+/** The pending steer that may be sent as a normal turn, or undefined when none
+ *  may. A steer whose `chat_steer` invoke has not settled must not be sent: the
+ *  backend may still accept it and inject the same text twice. A later steer
+ *  must not jump ahead of one still in flight, or that late `Ok` lands in the
+ *  wrong turn. */
 export function nextFlushableSteer(
   queue: SteeringMessage[],
   inFlight: ReadonlySet<string>,
 ): SteeringMessage | undefined {
-  return queue.find((m) => !inFlight.has(m.id));
+  const head = queue[0];
+  if (!head || inFlight.has(head.id)) return undefined;
+  return head;
 }
 
 /** A copy of `queues` with the message whose `id` matches removed for

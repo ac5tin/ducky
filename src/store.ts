@@ -1325,7 +1325,14 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
         return {
           steeringQueues,
           items: [
-            ...s.items,
+            // the turn that just finished is not streaming any more; the steer
+            // starts a new one, and a stale caret would blink on the finished
+            // answer until the whole run ends
+            ...s.items.map((item) =>
+              item.kind === "assistant" && item.streaming
+                ? { ...item, streaming: false }
+                : item,
+            ),
             {
               kind: "user" as const,
               id: `u-steer-${event.id}`,

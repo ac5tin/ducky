@@ -35,9 +35,14 @@ test("a delivery for a background conversation still clears its queue", () => {
   assert.deepEqual(after.a, [msg("1", "x")]);
 });
 
-test("flush skips a steer whose invoke is still in flight", () => {
+test("flush waits while the head steer's invoke is in flight", () => {
   const queue = [msg("1", "in flight"), msg("2", "settled")];
-  assert.deepEqual(nextFlushableSteer(queue, new Set(["1"])), msg("2", "settled"));
+  assert.equal(nextFlushableSteer(queue, new Set(["1"])), undefined);
+});
+
+test("flush takes the head once it has settled, even if a later steer is in flight", () => {
+  const queue = [msg("1", "settled"), msg("2", "in flight")];
+  assert.deepEqual(nextFlushableSteer(queue, new Set(["2"])), msg("1", "settled"));
 });
 
 test("flush waits when every pending steer is in flight", () => {
