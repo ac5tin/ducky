@@ -25,10 +25,17 @@ import { ModelPicker } from "./ModelPicker";
 import { ModePicker } from "./ModePicker";
 import { WorkingDirChip } from "./WorkingDirChip";
 import { SlashCommandMenu } from "./SlashCommandMenu";
+import { SessionReferenceMenu } from "./SessionReferenceMenu";
 import { TerminalPanel } from "./TerminalPanel";
 import { TokenMeter } from "./tokenUsage";
 import { ChatConnectorsDialog } from "./ChatConnectorsDialog";
 import { rfc9557, shortTime } from "../../time";
+import {
+  sessionReferenceInsertion,
+  sessionReferenceMatches,
+  sessionReferenceToken,
+} from "../../sessionReferences";
+import type { ConversationMeta } from "../../types";
 
 export function ChatView() {
   const items = useStore((s) => s.items);
@@ -611,6 +618,10 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
   // slash context reopens it
   const [dismissed, setDismissed] = useState(false);
   const [menuIndex, setMenuIndex] = useState(0);
+  // `#` chat references: same keyboard contract as the slash menu
+  const [caret, setCaret] = useState(0);
+  const [chatIndex, setChatIndex] = useState(0);
+  const [chatsDismissed, setChatsDismissed] = useState(false);
   const ref = useRef<HTMLTextAreaElement>(null);
 
   // /undo puts the removed prompt back into the composer
@@ -634,6 +645,29 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
     return filterCommands(t);
   }, [text]);
   const menuOpen = slashMatches.length > 0 && !dismissed && !compacting;
+  const referenceToken = useMemo(
+    () => sessionReferenceToken(text, caret),
+    [text, caret],
+  );
+  const chatMatches = useMemo(
+    () =>
+      referenceToken
+        ? sessionReferenceMatches(
+            config?.conversations ?? [],
+            referenceToken.query,
+            activeId,
+          )
+        : [],
+    [referenceToken, config, activeId],
+  );
+  const chatMenuOpen =
+    referenceToken !== null &&
+    chatMatches.length > 0 &&
+    !chatsDismissed &&
+    !compacting;
+  const activeChat = Math.min(chatIndex, chatMatches.length - 1);
+  // only one menu can own the keyboard at a time
+  const commandMenuOpen = menuOpen && !chatMenuOpen;
   const activeMatch = Math.min(menuIndex, slashMatches.length - 1);
 
   const completeCommand = (command: SlashCommand) => {
@@ -643,6 +677,25 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
       const el = ref.current;
       if (!el) return;
       el.focus();
+      el.style.height = "auto";
+      el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+    });
+  };
+
+  const completeChatReference = (chat: ConversationMeta) => {
+    const token = sessionReferenceToken(text, caret);
+    if (!token) return;
+    const inserted = sessionReferenceInsertion(chat.id);
+    setText(`${text.slice(0, token.start)}${inserted}${text.slice(caret)}`);
+    setChatsDismissed(false);
+    setChatIndex(0);
+    const next = token.start + inserted.length;
+    requestAnimationFrame(() => {
+      const el = ref.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(next, next);
+      setCaret(next);
       el.style.height = "auto";
       el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
     });
@@ -666,7 +719,15 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
   return (
     <div className="border-t border-slate-200 bg-white/80 px-5 py-3.5 backdrop-blur dark:border-slate-800 dark:bg-slate-950/70">
       <div className="relative mx-auto flex max-w-3xl items-end gap-2">
-        {menuOpen && (
+        {chatMenuOpen && (
+          <SessionReferenceMenu
+            chats={chatMatches}
+            activeIndex={activeChat}
+            onPick={completeChatReference}
+            onDismiss={() => setChatsDismissed(true)}
+          />
+        )}
+        {commandMenuOpen && (
           <SlashCommandMenu
             commands={slashMatches}
             activeIndex={activeMatch}
@@ -698,11 +759,20 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
               }
               className="max-h-40 min-h-[44px] flex-1 resize-none rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-sm outline-none transition focus:border-sky-400 focus:ring-2 focus:ring-sky-100 dark:border-slate-700 dark:bg-slate-900 dark:focus:border-sky-500 dark:focus:ring-sky-900/40"
               onChange={(e) => {
-                setText(e.target.value);
-                if (!e.target.value.trim().startsWith("/")) setDismissed(false);
+                const next = e.target.value;
+                const nextCaret = e.target.selectionStart ?? next.length;
+                setText(next);
+                setCaret(nextCaret);
+                if (!next.trim().startsWith("/")) setDismissed(false);
+                if (!sessionReferenceToken(next, nextCaret)) {
+                  setChatsDismissed(false);
+                }
                 e.currentTarget.style.height = "auto";
                 e.currentTarget.style.height = `${Math.min(e.currentTarget.scrollHeight, 160)}px`;
               }}
+              onSelect={(e) => setCaret(e.currentTarget.selectionStart ?? 0)}
+              onKeyUp={(e) => setCaret(e.currentTarget.selectionStart ?? 0)}
+              onClick={(e) => setCaret(e.currentTarget.selectionStart ?? 0)}
               onKeyDown={(e) => {
                 if (e.key === "Tab" && e.shiftKey) {
                   // Shift+Tab cycles the agent mode, before the slash menu's
@@ -711,18 +781,37 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
                   cycleMode();
                   return;
                 }
-                if (menuOpen && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+                if (chatMenuOpen && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+                  e.preventDefault();
+                  const step = e.key === "ArrowDown" ? 1 : chatMatches.length - 1;
+                  setChatIndex((activeChat + step) % chatMatches.length);
+                  return;
+                }
+                if (
+                  chatMenuOpen &&
+                  (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey))
+                ) {
+                  e.preventDefault();
+                  completeChatReference(chatMatches[activeChat]);
+                  return;
+                }
+                if (chatMenuOpen && e.key === "Escape") {
+                  e.preventDefault();
+                  setChatsDismissed(true);
+                  return;
+                }
+                if (commandMenuOpen && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
                   e.preventDefault();
                   const step = e.key === "ArrowDown" ? 1 : slashMatches.length - 1;
                   setMenuIndex((activeMatch + step) % slashMatches.length);
                   return;
                 }
-                if (menuOpen && e.key === "Tab") {
+                if (commandMenuOpen && e.key === "Tab") {
                   e.preventDefault();
                   completeCommand(slashMatches[activeMatch]);
                   return;
                 }
-                if (menuOpen && e.key === "Escape") {
+                if (commandMenuOpen && e.key === "Escape") {
                   e.preventDefault();
                   setDismissed(true);
                   return;
@@ -730,7 +819,7 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
                 if (e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();
                   if (
-                    menuOpen &&
+                    commandMenuOpen &&
                     `/${slashMatches[activeMatch].name}` !== text.trim()
                   ) {
                     // still typing a command name — complete it, don't submit
