@@ -707,6 +707,7 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
     // while the agent is responding the store steers the message into the
     // running turn instead
     setText("");
+    setChatsDismissed(false);
     send(t).catch((e) => console.error(e));
   };
 
