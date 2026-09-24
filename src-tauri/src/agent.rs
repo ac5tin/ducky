@@ -929,6 +929,18 @@ impl Agent {
             };
             let mut snapshot = history.clone();
             snapshot.insert(0, system_message(&cwd, scope, &main_prompt, mode));
+            // A message that references an earlier chat carries an id token;
+            // the model only sees the token, so remind it that the history is
+            // not loaded and how to read it. In-memory only: never persisted.
+            let reference_text = history.iter().rev().find_map(|m| match m {
+                Msg::User { text, .. } => Some(text.as_str()),
+                _ => None,
+            });
+            if let Some(reminder) =
+                reference_text.and_then(crate::builtin::session_context::reference_reminder)
+            {
+                snapshot.insert(1, Msg::System { text: reminder });
+            }
             let conversation_effort = {
                 let cfg = self.store.config.lock().unwrap();
                 cfg.conversations

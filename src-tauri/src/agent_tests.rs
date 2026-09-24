@@ -53,6 +53,9 @@ static SCRIPTS: LazyLock<ScriptMap> =
 struct CapturedRound {
     tool_names: Vec<String>,
     system: String,
+    /// Every system message in the request, in order: the main system message
+    /// first, the model-only reference reminder (when present) second.
+    systems: Vec<String>,
     model: String,
     effort: Option<String>,
     users: Vec<String>,
@@ -115,6 +118,13 @@ impl LlmProvider for MockProvider {
                         _ => None,
                     })
                     .unwrap_or_default(),
+                systems: messages
+                    .iter()
+                    .filter_map(|m| match m {
+                        Msg::System { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect(),
                 model: opts.model.clone(),
                 effort: opts.effort.map(|e| e.as_str().to_string()),
                 users: messages
@@ -1101,6 +1111,51 @@ async fn effective_mode_falls_back_to_the_app_default() {
     assert_eq!(agent.effective_mode("nope"), AgentMode::Auto);
     // ...but the conversation's own mode wins over it
     assert_eq!(agent.effective_mode("m4-conv"), AgentMode::Default);
+}
+
+#[tokio::test]
+async fn references_add_a_model_only_reminder() {
+    let chat_id = "11111111-1111-4111-8111-111111111111";
+    let prompt = format!("what did we pick in #chat_{chat_id}");
+    script(&prompt, vec![MockRound::Text("done".into())]);
+    let (agent, _sink, store) = test_agent("r1-conv");
+    run(&agent, "r1-conv", &prompt, &CancellationToken::new()).await;
+
+    let rounds = captures_for(&prompt);
+    assert!(
+        rounds[0].systems.iter().any(|s| s.contains(chat_id)),
+        "{:?}",
+        rounds[0].systems
+    );
+    assert!(
+        rounds[0]
+            .systems
+            .iter()
+            .any(|s| s.contains("ducky__read_session_context")),
+        "{:?}",
+        rounds[0].systems
+    );
+
+    // the reminder is request-only: the saved transcript keeps one user turn
+    let (_, messages) = store.load_conversation("r1-conv").unwrap();
+    assert!(
+        !messages.iter().any(|m| m["kind"] == "system"),
+        "{messages:?}"
+    );
+    assert!(messages
+        .iter()
+        .any(|m| m["text"].as_str().unwrap_or_default().contains(chat_id)));
+}
+
+#[tokio::test]
+async fn typed_hash_text_is_not_a_reference() {
+    let prompt = "what about #chat_notauuid and C#";
+    script(prompt, vec![MockRound::Text("done".into())]);
+    let (agent, _sink, _store) = test_agent("r2-conv");
+    run(&agent, "r2-conv", prompt, &CancellationToken::new()).await;
+
+    let rounds = captures_for(prompt);
+    assert_eq!(rounds[0].systems.len(), 1, "{:?}", rounds[0].systems);
 }
 
 // ---------------------------------------------------------------------------
