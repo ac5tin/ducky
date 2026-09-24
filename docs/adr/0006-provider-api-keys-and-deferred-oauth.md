@@ -60,9 +60,15 @@ When provider OAuth is added later, it must:
 - All four providers work today with the existing OpenAI-compatible adapter
   and the existing `provider_keys` secrets map. No new wire protocol, no new
   secret storage, no new auth code.
-- OpenCode Go models that the provider serves only on `/responses`
-  (Grok 4.7/4.6, GPT 6 Luna, GPT 5.6 Luna) are not reachable yet; the provider
-  returns its own error for those model ids and the other 37 models work.
+- OpenCode Go models that the provider serves only on `/responses` (for
+  example Grok 4.7 and GPT 6 Luna) are not reachable yet. The provider returns
+  its own error for those model ids; every model it serves on
+  `/chat/completions` works.
+- CommandCode serves 9 Claude models on `/messages` only, which needs a bearer
+  -authenticated Anthropic call rather than the `x-api-key` header the Anthropic
+  adapter sends. They are filtered out of the model picker (a model that
+  declares `supported_endpoints` without `/chat/completions` is not offered),
+  so the 72 remaining models all work.
 - Ducky does not send `x-opencode-session`. The provider calls it a preference
   ("your client should"), and the provider layer has no conversation id in
   `ChatOptions` to route it from.
@@ -80,5 +86,7 @@ When provider OAuth is added later, it must:
   the Grok CLI client explicitly.
 - OpenCode Go's `/responses`-only models become the models users ask for; that
   needs a Responses adapter, which is a separate decision from auth.
+- Someone wants Claude through CommandCode: it needs an Anthropic-wire path
+  with a bearer token, not the current `x-api-key` header.
 - Qwen Token Plan or OpenCode Go report abuse-routing problems that the
   session header would fix.

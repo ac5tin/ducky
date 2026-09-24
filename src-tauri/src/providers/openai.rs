@@ -295,12 +295,26 @@ impl LlmProvider for OpenAiProvider {
             .and_then(|d| d.as_array())
             .map(|a| {
                 a.iter()
+                    .filter(|m| supports_chat_completions(m))
                     .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(String::from))
                     .collect()
             })
             .unwrap_or_default();
         models.sort();
         Ok(models)
+    }
+}
+
+/// Some gateways publish a per-model `supported_endpoints` list. A model whose
+/// list omits `/chat/completions` rejects every request this adapter sends, so
+/// it is kept out of the picker instead of failing after selection. A missing
+/// or empty list means "unknown" and keeps the model.
+fn supports_chat_completions(model: &Value) -> bool {
+    match model.get("supported_endpoints").and_then(|e| e.as_array()) {
+        Some(endpoints) if !endpoints.is_empty() => endpoints
+            .iter()
+            .any(|e| e.as_str() == Some("/chat/completions")),
+        _ => true,
     }
 }
 
@@ -393,6 +407,25 @@ mod tests {
             turn.handle_chunk(&chunk2, "t").unwrap(),
             Some(ProviderEvent::ReasoningDelta(_))
         ));
+    }
+
+    #[test]
+    fn hidden_wire_protocols_are_kept_out_of_the_picker() {
+        // CommandCode-style listing: Claude models declare /messages only
+        assert!(!supports_chat_completions(&json!({
+            "id": "claude-sonnet-5",
+            "supported_endpoints": ["/messages"]
+        })));
+        assert!(supports_chat_completions(&json!({
+            "id": "deepseek-v4-flash",
+            "supported_endpoints": ["/chat/completions"]
+        })));
+        // absent or empty list means unknown, so keep the model
+        assert!(supports_chat_completions(&json!({"id": "grok-4.7"})));
+        assert!(supports_chat_completions(&json!({
+            "id": "mystery",
+            "supported_endpoints": []
+        })));
     }
 
     #[test]
