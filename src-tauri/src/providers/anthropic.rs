@@ -178,6 +178,7 @@ impl LlmProvider for AnthropicProvider {
 
         let response = http_client()
             .post(self.endpoint("/messages"))
+            .header(reqwest::header::USER_AGENT, super::USER_AGENT)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .json(&body)
@@ -298,6 +299,7 @@ impl LlmProvider for AnthropicProvider {
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         let response = http_client()
             .get(self.endpoint("/models"))
+            .header(reqwest::header::USER_AGENT, super::USER_AGENT)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .send()
@@ -419,6 +421,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             effort,
+            session_id: None,
         };
 
         let body = AnthropicProvider::build_body("", vec![], &[], &opts(Some(EffortLevel::Medium)));

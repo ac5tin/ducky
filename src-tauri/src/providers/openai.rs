@@ -29,6 +29,7 @@ impl OpenAiProvider {
     }
 
     fn auth_headers(&self, mut req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        req = req.header(reqwest::header::USER_AGENT, super::USER_AGENT);
         if let Some(key) = &self.api_key {
             req = req.bearer_auth(key);
         }
@@ -143,6 +144,27 @@ impl OpenAiProvider {
     }
 }
 
+/// Headers OpenCode's gateway needs. Its relay rejects requests without a
+/// session id (`400 MissingSessionID`) and asks clients to identify themselves
+/// instead of presenting as a generic HTTP library. Only that host receives
+/// them, so the conversation id never leaks to other providers; a lookalike
+/// host such as `opencode.ai.example.test` does not match.
+fn opencode_session_headers(
+    base_url: &str,
+    session_id: Option<&str>,
+) -> Option<[(&'static str, String); 2]> {
+    let session = session_id.filter(|id| !id.is_empty())?;
+    let host = reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))?;
+    (host == "opencode.ai" || host.ends_with(".opencode.ai")).then(|| {
+        [
+            ("x-opencode-session", session.to_string()),
+            ("x-opencode-client", "ducky".to_string()),
+        ]
+    })
+}
+
 /// Accumulated state for one streamed turn.
 #[derive(Default)]
 struct Turn {
@@ -229,11 +251,14 @@ impl LlmProvider for OpenAiProvider {
     ) -> anyhow::Result<StopReason> {
         let body = Self::build_body(messages, tools, opts, self.thinking_toggle);
 
-        let response = self
-            .auth_headers(http_client().post(self.endpoint("/chat/completions")))
-            .json(&body)
-            .send()
-            .await?;
+        let mut request = self.auth_headers(http_client().post(self.endpoint("/chat/completions")));
+        for (name, value) in opencode_session_headers(&self.base_url, opts.session_id.as_deref())
+            .into_iter()
+            .flatten()
+        {
+            request = request.header(name, value);
+        }
+        let response = request.json(&body).send().await?;
         let response = ensure_ok(response, &self.name).await?;
 
         let mut turn = Turn::default();
@@ -429,6 +454,30 @@ mod tests {
     }
 
     #[test]
+    fn opencode_requests_carry_a_stable_session_header() {
+        let go = opencode_session_headers("https://opencode.ai/zen/go/v1", Some("conv-1"))
+            .expect("OpenCode Go needs the session header");
+        assert_eq!(go[0], ("x-opencode-session", "conv-1".to_string()));
+        assert_eq!(go[1], ("x-opencode-client", "ducky".to_string()));
+        // Zen sits on the same relay
+        assert!(opencode_session_headers("https://opencode.ai/zen/v1", Some("c")).is_some());
+        // every other provider keeps the conversation id private
+        assert!(opencode_session_headers("https://api.x.ai/v1", Some("conv-1")).is_none());
+        assert!(
+            opencode_session_headers("https://api.commandcode.ai/provider/v1", Some("c"))
+                .is_none()
+        );
+        assert!(opencode_session_headers("https://api.openai.com/v1", Some("c")).is_none());
+        // a lookalike host must not match
+        assert!(
+            opencode_session_headers("https://opencode.ai.example.test/v1", Some("c")).is_none()
+        );
+        // one-shot calls with no conversation send nothing
+        assert!(opencode_session_headers("https://opencode.ai/zen/go/v1", None).is_none());
+        assert!(opencode_session_headers("https://opencode.ai/zen/go/v1", Some("")).is_none());
+    }
+
+    #[test]
     fn effort_sets_reasoning_effort_and_thinking() {
         use crate::config::EffortLevel;
         let opts = ChatOptions {
@@ -436,6 +485,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             effort: Some(EffortLevel::High),
+            session_id: None,
         };
         let body = OpenAiProvider::build_body(&[], &[], &opts, true);
         assert_eq!(body["reasoning_effort"], "high");

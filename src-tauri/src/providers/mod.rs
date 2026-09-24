@@ -105,6 +105,11 @@ pub struct ChatOptions {
     pub temperature: Option<f32>,
     /// Reasoning effort requested for this turn (None = provider default).
     pub effort: Option<crate::config::EffortLevel>,
+    /// Stable id for the whole conversation, forwarded only to gateways that
+    /// route and cache per session. OpenCode's relay rejects requests without
+    /// it (`400 MissingSessionID`). `None` for calls that belong to no
+    /// conversation.
+    pub session_id: Option<String>,
 }
 
 #[async_trait]
@@ -126,6 +131,10 @@ pub trait LlmProvider: Send + Sync {
 // ---------------------------------------------------------------------------
 // HTTP helpers shared by both adapters
 // ---------------------------------------------------------------------------
+
+/// User agent sent to providers: OpenCode asks clients to identify themselves
+/// rather than present as a generic HTTP library.
+pub(crate) const USER_AGENT: &str = concat!("ducky/", env!("CARGO_PKG_VERSION"));
 
 pub(crate) fn http_client() -> reqwest::Client {
     reqwest::Client::builder()

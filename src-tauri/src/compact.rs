@@ -220,6 +220,7 @@ pub async fn run(
         max_tokens: None,
         temperature: None,
         effort,
+        session_id: Some(conversation_id.to_string()),
     };
     let summary = summarize(provider, options, &history, instructions).await?;
     if summary.trim().is_empty() {
@@ -291,6 +292,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             effort: None,
+            session_id: None,
         };
         let history = vec![user("hello"), user("and goodbye")];
         let summary = summarize(provider, options, &history, None)

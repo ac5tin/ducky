@@ -55,11 +55,26 @@ When provider OAuth is added later, it must:
 - keep **one auth method per connection**: an API key and an OAuth session are
   separate provider entries, never merged on one record.
 
+A second decision rides along because OpenCode Go does not work without it:
+OpenCode's relay rejects a request that carries no session id
+(`400 MissingSessionID`), so every request that belongs to a conversation now
+sends `x-opencode-session: <conversation id>` and `x-opencode-client: ducky`.
+The conversation id is passed through `ChatOptions::session_id` and sent only
+to `opencode.ai` hosts, never to other providers. The same request path also
+identifies Ducky with a real `User-Agent` (`ducky/<version>`) instead of the
+HTTP library's name, which OpenCode asks of its clients.
+
 ## Consequences
 
 - All four providers work today with the existing OpenAI-compatible adapter
   and the existing `provider_keys` secrets map. No new wire protocol, no new
   secret storage, no new auth code.
+- OpenCode Go is usable: title generation, `/compact` and MCP sampling carry
+  the conversation's session id too, so no request falls into the
+  `MissingSessionID` error. Only one session id is used per conversation, which
+  is what the provider asks for so its prompt cache stays warm.
+- Other providers never see the session header. The host check rejects
+  lookalike hosts such as `opencode.ai.example.test`.
 - OpenCode Go models that the provider serves only on `/responses` (for
   example Grok 4.7 and GPT 6 Luna) are not reachable yet. The provider returns
   its own error for those model ids; every model it serves on
@@ -69,12 +84,9 @@ When provider OAuth is added later, it must:
   adapter sends. They are filtered out of the model picker (a model that
   declares `supported_endpoints` without `/chat/completions` is not offered),
   so the 72 remaining models all work.
-- Ducky does not send `x-opencode-session`. The provider calls it a preference
-  ("your client should"), and the provider layer has no conversation id in
-  `ChatOptions` to route it from.
-- Alibaba reasoning is not forced on: the docs enable it with
-  `extra_body.enable_thinking`, which the OpenAI adapter does not send. Users
-  who pick an effort level still get `reasoning_effort`.
+- Alibaba needs no `enable_thinking`: its hybrid Qwen3.5/3.7/3.8 models enable
+  thinking by default, so the parameter is only ever used to turn it off. The
+  adapter still sends `reasoning_effort` when the user picks a level.
 - ChatGPT subscription access stays out of reach, so OpenAI remains
   pay-per-token through an API key.
 
@@ -84,9 +96,12 @@ When provider OAuth is added later, it must:
   client is approved.
 - xAI documents partner OAuth for non-Grok-CLI clients, or the user accepts
   the Grok CLI client explicitly.
-- OpenCode Go's `/responses`-only models become the models users ask for; that
-  needs a Responses adapter, which is a separate decision from auth.
-- Someone wants Claude through CommandCode: it needs an Anthropic-wire path
-  with a bearer token, not the current `x-api-key` header.
+- OpenCode Go's `/responses`-only models become the models users ask for. That
+  needs a Responses adapter (a second wire protocol next to `chat/completions`),
+  which is a separate decision from auth.
+- Someone wants Claude through CommandCode or OpenCode: it needs an
+  Anthropic-wire path that authenticates with a bearer token, not the current
+  `x-api-key` header, plus a second preset per gateway because one connection
+  speaks one protocol.
 - Qwen Token Plan or OpenCode Go report abuse-routing problems that the
   session header would fix.

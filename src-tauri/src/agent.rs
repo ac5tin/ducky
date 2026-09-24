@@ -954,6 +954,7 @@ impl Agent {
                 max_tokens: None,
                 temperature: None,
                 effort,
+                session_id: Some(conversation_id.to_string()),
             };
             let (tx, mut rx) = tokio::sync::mpsc::channel::<ProviderEvent>(256);
             let provider_call = provider.stream_chat(&snapshot, &tools, &options, tx);
@@ -2074,6 +2075,7 @@ impl Agent {
             max_tokens: Some(64),
             temperature: Some(0.3),
             effort: resolved.effort,
+            session_id: Some(conversation_id.to_string()),
         };
         let messages = vec![
             Msg::System {

@@ -1335,7 +1335,10 @@ mod tests {
                 assert!(!preset.key_url.is_empty(), "{} needs a key URL", preset.id);
             }
             // every preset must speak a protocol the provider layer implements
-            assert!(matches!(preset.api_type, ApiType::OpenAi | ApiType::Anthropic));
+            assert!(matches!(
+                preset.api_type,
+                ApiType::OpenAi | ApiType::Anthropic
+            ));
         }
         for id in ["opencode-go", "qwen-token-plan", "commandcode", "xai"] {
             assert!(preset_by_id(id).is_some(), "{id} preset is missing");

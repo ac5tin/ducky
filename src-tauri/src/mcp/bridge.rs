@@ -397,6 +397,7 @@ impl InteractiveBridge {
             max_tokens: Some(params.max_tokens),
             temperature: None,
             effort: None,
+            session_id: self.conversation_ctx_opt(),
         };
         let provider = backend.provider.clone();
         let handle = tokio::spawn(async move { provider.stream_chat(&msgs, &[], &opts, tx).await });

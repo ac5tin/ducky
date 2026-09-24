@@ -424,11 +424,7 @@ mod tests {
         );
         assert_eq!(
             lookup(&index, "qwen-token-plan", "qwen3.8-max"),
-            vec![
-                EffortLevel::Low,
-                EffortLevel::Medium,
-                EffortLevel::XHigh
-            ]
+            vec![EffortLevel::Low, EffortLevel::Medium, EffortLevel::XHigh]
         );
         // CommandCode has no catalog entry: its models fall back to the bare scan
         assert_eq!(
