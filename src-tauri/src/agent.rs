@@ -819,6 +819,11 @@ impl Agent {
         steering: Option<&SteeringQueue>,
     ) -> Result<Option<String>, String> {
         for _ in 0..max_iterations {
+            // A cancelled run must not consume a pending steer: the frontend
+            // resends it as a normal turn (spec: cancelled pending steers).
+            if ct.is_cancelled() {
+                return Err("cancelled".into());
+            }
             // A steer waits for the current turn's tool calls to settle: it
             // enters here, before the next model call, one message per turn.
             if let Some(steer) = steering.and_then(|q| q.lock().unwrap().pop_front()) {

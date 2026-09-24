@@ -38,6 +38,8 @@ enum MockRound {
     Hang,
     /// Push a steering message (id `s1`), then run the inner round.
     Steer(Arc<SteeringQueue>, String, Box<MockRound>),
+    /// Cancel the token, then run the inner round.
+    Cancel(CancellationToken, Box<MockRound>),
 }
 
 type ScriptMap = Arc<Mutex<HashMap<String, VecDeque<MockRound>>>>;
@@ -128,10 +130,10 @@ impl LlmProvider for MockProvider {
             .unwrap()
             .get_mut(&key)
             .and_then(|q| q.pop_front());
-        // a scripted steer lands while this turn is still running, then the
-        // inner round proceeds
-        if let Some(steer) = round.take() {
-            match steer {
+        // a scripted wrapper (steer, cancel) lands while this turn is still
+        // running, then the inner round proceeds
+        while let Some(wrapper) = round.take() {
+            match wrapper {
                 MockRound::Steer(queue, text, inner) => {
                     queue.lock().unwrap().push_back(PendingSteer {
                         id: "s1".into(),
@@ -140,7 +142,14 @@ impl LlmProvider for MockProvider {
                     });
                     round = Some(*inner);
                 }
-                other => round = Some(other),
+                MockRound::Cancel(ct, inner) => {
+                    ct.cancel();
+                    round = Some(*inner);
+                }
+                other => {
+                    round = Some(other);
+                    break;
+                }
             }
         }
         match round {
@@ -175,9 +184,11 @@ impl LlmProvider for MockProvider {
                 std::future::pending::<()>().await;
                 unreachable!("pending never resolves")
             }
-            // only reachable if a script nests a steer inside a steer, which
-            // no test does: the outer steer is unwrapped above
-            Some(MockRound::Steer(_, _, _)) => unreachable!("nested steer"),
+            // only reachable if a script nests a wrapper inside a wrapper,
+            // which no test does: wrappers are unwrapped above
+            Some(MockRound::Steer(_, _, _) | MockRound::Cancel(_, _)) => {
+                unreachable!("nested wrapper round")
+            }
             None => {
                 tx.send(ProviderEvent::TextDelta(format!("no script for {key:?}")))
                     .await
@@ -1707,4 +1718,54 @@ async fn steering_extends_a_run_that_was_finishing() {
         .filter(|e| matches!(e, BackendEvent::MessageDone { .. }))
         .count();
     assert_eq!(done, 1, "one run, one message_done");
+}
+
+#[tokio::test]
+async fn steering_is_not_delivered_when_the_run_is_cancelled() {
+    let steering: Arc<SteeringQueue> = Arc::new(Mutex::new(VecDeque::new()));
+    let ct = CancellationToken::new();
+    // The steer arrives during the tool round. The tool is a subagent that
+    // cancels the run while it is still in flight, so the cancel lands after
+    // the loop's last per-call `ct.is_cancelled()` check — the run reaches the
+    // next iteration with a steer still queued.
+    script(
+        "steer-c",
+        vec![MockRound::Steer(
+            steering.clone(),
+            "too late".into(),
+            Box::new(MockRound::Tools(vec![(
+                SUBAGENT.into(),
+                serde_json::json!({"task": "steer-c-sub"}),
+            )])),
+        )],
+    );
+    script(
+        "steer-c-sub",
+        vec![MockRound::Cancel(ct.clone(), Box::new(MockRound::Hang))],
+    );
+
+    let (agent, sink, _store) = test_agent("steer-c");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        run_with_steering(&agent, "steer-c", "steer-c", &ct, steering.clone()),
+    )
+    .await
+    .expect("the cancelled run must finish");
+
+    let delivered = sink
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| matches!(e, BackendEvent::SteeringDelivered { .. }))
+        .count();
+    assert_eq!(
+        delivered, 0,
+        "a cancelled run must not deliver the steer to a model that never ran"
+    );
+    assert_eq!(
+        steering.lock().unwrap().len(),
+        1,
+        "the steer stays queued so the frontend can resend it"
+    );
 }
