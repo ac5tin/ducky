@@ -8,17 +8,9 @@ export type MessageActionKind = "copy" | "edit";
 export type MessageActionItem = {
   kind: "user" | "assistant" | "tool";
   text: string;
+  messageIndex?: number;
   streaming?: boolean;
 };
-
-export function latestUserMessageIndex(
-  raw: readonly { kind: string }[],
-): number | undefined {
-  for (let i = raw.length - 1; i >= 0; i--) {
-    if (raw[i]?.kind === "user") return i;
-  }
-  return undefined;
-}
 
 export function messageActionKinds(
   item: MessageActionItem,
@@ -31,7 +23,7 @@ export function messageActionKinds(
     ) {
       return [];
     }
-    return ["copy", "edit"];
+    return item.messageIndex === undefined ? ["copy"] : ["copy", "edit"];
   }
   if (item.kind === "assistant" && item.text && !item.streaming) {
     return ["copy"];

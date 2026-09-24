@@ -1,19 +1,20 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import {
-  latestUserMessageIndex,
-  messageActionKinds,
-} from "./chatMessageActions.ts";
+import { messageActionKinds } from "./chatMessageActions.ts";
 
-const user = (text) => ({ kind: "user", text });
+const user = (text, messageIndex) => ({ kind: "user", text, messageIndex });
 const assistant = (text, streaming = false) => ({
   kind: "assistant",
   text,
   streaming,
 });
 
-test("normal user messages expose copy and edit", () => {
-  assert.deepEqual(messageActionKinds(user("fix the bug")), ["copy", "edit"]);
+test("persisted user messages expose copy and edit", () => {
+  assert.deepEqual(messageActionKinds(user("fix the bug", 1)), ["copy", "edit"]);
+});
+
+test("user messages without a raw index expose copy only", () => {
+  assert.deepEqual(messageActionKinds(user("still sending")), ["copy"]);
 });
 
 test("special or empty user messages expose no actions", () => {
@@ -27,22 +28,4 @@ test("only finished assistant text exposes copy", () => {
   assert.deepEqual(messageActionKinds(assistant("partial", true)), []);
   assert.deepEqual(messageActionKinds(assistant("")), []);
   assert.deepEqual(messageActionKinds({ kind: "tool", text: "result" }), []);
-});
-
-test("latest persisted user index is undefined when no user turn exists", () => {
-  assert.equal(
-    latestUserMessageIndex([
-      { kind: "assistant" },
-      { kind: "tool_result" },
-    ]),
-    undefined,
-  );
-  assert.equal(
-    latestUserMessageIndex([
-      { kind: "user" },
-      { kind: "assistant" },
-      { kind: "user" },
-    ]),
-    2,
-  );
 });

@@ -3,7 +3,6 @@ import { create } from "zustand";
 import { check as updaterCheck, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import * as api from "./api";
-import { latestUserMessageIndex } from "./chatMessageActions";
 import { resolveDraftModel } from "./chatDraft";
 import { toLayout } from "./groups";
 import { expandInitPrompt, parseSlashCommand } from "./slashCommands";
@@ -795,13 +794,11 @@ export const useStore = create<StoreState>((set, get) => ({
       return false;
     }
     try {
-      let boundary = messageIndex;
+      const boundary = messageIndex;
       if (boundary === undefined) {
-        // Only persisted turns use this fallback while their completion reloads.
-        const [, raw] = await api.conversationGet(id);
-        boundary = latestUserMessageIndex(raw);
+        get().toast("error", "Refresh the conversation before editing this message.");
+        return false;
       }
-      if (boundary === undefined) return false;
       await api.conversationTruncate(id, boundary);
       await get().reloadItems(id);
       const sent = await get().send(next);
@@ -1307,26 +1304,36 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
       set((s) => {
         const busy = new Set(s.busyConversationIds);
         busy.delete(event.conversation_id);
-        if (!active) return { busyConversationIds: busy };
-        const items = [...s.items];
-        const last = items[items.length - 1];
-        if (last?.kind === "assistant" && last.streaming) {
-          items[items.length - 1] = {
-            ...last,
-            streaming: false,
-            error: event.error,
-          };
-        } else {
-          items.push({
-            kind: "assistant",
-            id: `a-err-${Date.now()}`,
-            text: "",
-            ts: new Date().toISOString(),
-            error: event.error,
-          });
-        }
-        return { items, streaming: false, busyConversationIds: busy };
+        return active
+          ? { streaming: false, busyConversationIds: busy }
+          : { busyConversationIds: busy };
       });
+      if (active) {
+        void get().reloadItems(event.conversation_id).then(() => {
+          set((s) => {
+            const items = [...s.items];
+            const last = items[items.length - 1];
+            if (last?.kind === "assistant") {
+              items[items.length - 1] = {
+                ...last,
+                streaming: false,
+                error: event.error,
+              };
+            } else {
+              items.push({
+                kind: "assistant",
+                id: `a-err-${Date.now()}`,
+                text: "",
+                ts: new Date().toISOString(),
+                error: event.error,
+              });
+            }
+            return { items, streaming: false };
+          });
+          drainQueue(event.conversation_id, set, get);
+        });
+        break;
+      }
       drainQueue(event.conversation_id, set, get);
       break;
     }
