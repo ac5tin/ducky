@@ -438,13 +438,19 @@ mod tests {
         // OpenCode reads x-api-key, and its relay needs the session id
         let opencode = provider("https://opencode.ai/zen/go/v1", false);
         let req = opencode
-            .request(http.post("https://opencode.ai/zen/go/v1/messages"), Some(&opts))
+            .request(
+                http.post("https://opencode.ai/zen/go/v1/messages"),
+                Some(&opts),
+            )
             .build()
             .expect("request builds");
         assert_eq!(req.headers().get("x-api-key").unwrap(), "secret");
         assert!(req.headers().get("authorization").is_none());
         assert_eq!(req.headers().get("x-opencode-session").unwrap(), "conv-1");
-        assert_eq!(req.headers().get("anthropic-version").unwrap(), "2023-06-01");
+        assert_eq!(
+            req.headers().get("anthropic-version").unwrap(),
+            "2023-06-01"
+        );
 
         // CommandCode reads Authorization, and is not an OpenCode host
         let commandcode = provider("https://api.commandcode.ai/provider/v1", true);

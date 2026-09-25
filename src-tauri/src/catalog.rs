@@ -122,8 +122,7 @@ impl Catalog {
             std::fs::create_dir_all(parent).ok();
         }
         std::fs::write(path, json).ok();
-        if let (Some(wire_path), Ok(json)) = (wire_cache_path(path), serde_json::to_string(wires))
-        {
+        if let (Some(wire_path), Ok(json)) = (wire_cache_path(path), serde_json::to_string(wires)) {
             std::fs::write(wire_path, json).ok();
         }
     }
@@ -545,10 +544,7 @@ mod tests {
         assert_eq!(lookup_wire(&wires, "commandcode", "claude-sonnet-5"), None);
         assert_eq!(lookup_wire(&wires, "opencode-go", ""), None);
         // the alias maps the Ducky kind onto its catalog provider
-        assert_eq!(
-            lookup_wire(&wires, "qwen-token-plan", "qwen3.8-max"),
-            None
-        );
+        assert_eq!(lookup_wire(&wires, "qwen-token-plan", "qwen3.8-max"), None);
     }
 
     #[test]

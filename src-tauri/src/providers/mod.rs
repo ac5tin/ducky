@@ -382,10 +382,7 @@ mod tests {
 
         // CommandCode serves Claude models on /messages only
         let cc = cfg("commandcode", ApiType::OpenAi);
-        assert_eq!(
-            wire_for_model(&cc, "claude-sonnet-5", None),
-            Wire::Messages
-        );
+        assert_eq!(wire_for_model(&cc, "claude-sonnet-5", None), Wire::Messages);
         assert_eq!(wire_for_model(&cc, "Claude-Opus-5", None), Wire::Messages);
         assert_eq!(wire_for_model(&cc, "gpt-6-sol", None), Wire::Chat);
 
@@ -407,10 +404,7 @@ mod tests {
             Wire::Chat
         );
         // a Claude model on a gateway with no Anthropic route stays put too
-        assert_eq!(
-            wire_for_model(&openai, "claude-sonnet-5", None),
-            Wire::Chat
-        );
+        assert_eq!(wire_for_model(&openai, "claude-sonnet-5", None), Wire::Chat);
 
         // other gateways keep their connection's wire
         let anthropic = cfg("anthropic", ApiType::Anthropic);

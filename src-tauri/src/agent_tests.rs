@@ -44,8 +44,7 @@ enum MockRound {
 
 type ScriptMap = Arc<Mutex<HashMap<String, VecDeque<MockRound>>>>;
 
-static SCRIPTS: LazyLock<ScriptMap> =
-    LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+static SCRIPTS: LazyLock<ScriptMap> = LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
 /// What the mock saw in one request: the tools offered and the options used,
 /// so tests can assert on the system prompt, tool allowlist and overrides.
@@ -236,7 +235,12 @@ fn test_agent_in_mode(
 fn test_agent_in_dir(
     conversation_id: &str,
     mode: AgentMode,
-) -> (Arc<Agent>, Arc<CollectingSink>, Arc<Store>, std::path::PathBuf) {
+) -> (
+    Arc<Agent>,
+    Arc<CollectingSink>,
+    Arc<Store>,
+    std::path::PathBuf,
+) {
     test_agent_full(conversation_id, mode, true)
 }
 
@@ -476,7 +480,10 @@ async fn spawns_subagent_and_returns_final_answer() {
     script(
         "t1-main",
         vec![
-            MockRound::Tools(vec![(SUBAGENT.into(), serde_json::json!({"task": "t1-sub"}))]),
+            MockRound::Tools(vec![(
+                SUBAGENT.into(),
+                serde_json::json!({"task": "t1-sub"}),
+            )]),
             MockRound::Text("all done".into()),
         ],
     );
@@ -486,12 +493,15 @@ async fn spawns_subagent_and_returns_final_answer() {
     run(&agent, "t1-conv", "t1-main", &CancellationToken::new()).await;
 
     // the subagent's final answer is the tool result; the main answer streams
-    assert_eq!(tool_results(&store, "t1-conv"), vec!["sub answer".to_string()]);
+    assert_eq!(
+        tool_results(&store, "t1-conv"),
+        vec!["sub answer".to_string()]
+    );
     assert!(chat_text(&sink).contains("all done"));
     assert_eq!(subagent_text(&sink), "sub answer");
-    assert!(tool_cards(&sink).iter().any(|(s, t, r, parent)| {
-        s == "done" && r.as_deref() == Some("sub answer") && !parent
-    }));
+    assert!(tool_cards(&sink)
+        .iter()
+        .any(|(s, t, r, parent)| { s == "done" && r.as_deref() == Some("sub answer") && !parent }));
     assert!(tool_cards(&sink).iter().any(|(s, t, _, parent)| {
         s == "pending_approval" && t.as_deref() == Some(SUBAGENT) && !parent
     }));
@@ -526,8 +536,14 @@ async fn parallel_subagents_run_concurrently() {
             MockRound::Text("parallel done".into()),
         ],
     );
-    script("t2-a", vec![MockRound::Gated(barrier.clone(), "A result".into())]);
-    script("t2-b", vec![MockRound::Gated(barrier.clone(), "B result".into())]);
+    script(
+        "t2-a",
+        vec![MockRound::Gated(barrier.clone(), "A result".into())],
+    );
+    script(
+        "t2-b",
+        vec![MockRound::Gated(barrier.clone(), "B result".into())],
+    );
 
     let (agent, sink, store) = test_agent("t2-conv");
     tokio::time::timeout(
@@ -550,14 +566,20 @@ async fn subagents_nest_and_internal_cards_carry_parent() {
     script(
         "t3-main",
         vec![
-            MockRound::Tools(vec![(SUBAGENT.into(), serde_json::json!({"task": "t3-outer"}))]),
+            MockRound::Tools(vec![(
+                SUBAGENT.into(),
+                serde_json::json!({"task": "t3-outer"}),
+            )]),
             MockRound::Text("main done".into()),
         ],
     );
     script(
         "t3-outer",
         vec![
-            MockRound::Tools(vec![(SUBAGENT.into(), serde_json::json!({"task": "t3-inner"}))]),
+            MockRound::Tools(vec![(
+                SUBAGENT.into(),
+                serde_json::json!({"task": "t3-inner"}),
+            )]),
             MockRound::Text("outer finished".into()),
         ],
     );
@@ -583,7 +605,10 @@ async fn nesting_depth_is_capped() {
     script(
         "t4-main",
         vec![
-            MockRound::Tools(vec![(SUBAGENT.into(), serde_json::json!({"task": "t4-d1"}))]),
+            MockRound::Tools(vec![(
+                SUBAGENT.into(),
+                serde_json::json!({"task": "t4-d1"}),
+            )]),
             MockRound::Text("main done".into()),
         ],
     );
@@ -610,10 +635,7 @@ async fn nesting_depth_is_capped() {
     assert!(!subagent_text(&sink).contains("must never run"));
     // the chain unwinds back to the main agent
     assert!(chat_text(&sink).contains("main done"));
-    assert_eq!(
-        tool_results(&store, "t4-conv"),
-        vec!["d1 done".to_string()]
-    );
+    assert_eq!(tool_results(&store, "t4-conv"), vec!["d1 done".to_string()]);
 }
 
 #[tokio::test]
@@ -780,7 +802,9 @@ async fn unknown_agent_type_fails_fast() {
     run(&agent, "t8-conv", "t8-main", &CancellationToken::new()).await;
 
     assert!(tool_cards(&sink).iter().any(|(s, _t, r, _parent)| {
-        s == "error" && r.as_deref().is_some_and(|t| t.contains("unknown subagent type"))
+        s == "error"
+            && r.as_deref()
+                .is_some_and(|t| t.contains("unknown subagent type"))
     }));
     assert_eq!(
         tool_results(&store, "t8-conv"),
@@ -974,12 +998,7 @@ async fn main_system_prompt_applies_to_main_run_only() {
     script("t11-sub", vec![MockRound::Text("sub answer".into())]);
 
     let (agent, _sink, store) = test_agent("t11-conv");
-    store
-        .config
-        .lock()
-        .unwrap()
-        .settings
-        .system_prompt = "Always answer in haiku.".into();
+    store.config.lock().unwrap().settings.system_prompt = "Always answer in haiku.".into();
     run(&agent, "t11-conv", "t11-main", &CancellationToken::new()).await;
 
     // the main run's system message carries the custom prompt after the grounding
@@ -988,10 +1007,7 @@ async fn main_system_prompt_applies_to_main_run_only() {
     assert!(main[0].system.contains("Working directory"));
     assert!(main[0].system.contains("Always answer in haiku."));
     assert!(
-        main[0]
-            .system
-            .find("Working directory")
-            .unwrap()
+        main[0].system.find("Working directory").unwrap()
             < main[0].system.find("Always answer in haiku.").unwrap()
     );
     // the subagent run keeps its own persona flow, without the main prompt
@@ -1011,22 +1027,45 @@ fn mode_allows_matrix() {
 
     // Default and Auto keep every tool available
     for name in ["ducky__fs_write", "ducky__fs_read", "srv__search"] {
-        assert!(mode_allows(AgentMode::Default, name, false), "{name} in Default");
+        assert!(
+            mode_allows(AgentMode::Default, name, false),
+            "{name} in Default"
+        );
         assert!(mode_allows(AgentMode::Auto, name, false), "{name} in Auto");
     }
 
     // ReadOnly and Plan keep read-only tools and drop the rest
     for mode in [AgentMode::ReadOnly, AgentMode::Plan] {
-        assert!(mode_allows(mode, "ducky__fs_read", true), "read in {mode:?}");
-        assert!(mode_allows(mode, "srv__search", true), "mcp read in {mode:?}");
-        assert!(!mode_allows(mode, "ducky__fs_write", false), "write in {mode:?}");
+        assert!(
+            mode_allows(mode, "ducky__fs_read", true),
+            "read in {mode:?}"
+        );
+        assert!(
+            mode_allows(mode, "srv__search", true),
+            "mcp read in {mode:?}"
+        );
+        assert!(
+            !mode_allows(mode, "ducky__fs_write", false),
+            "write in {mode:?}"
+        );
         // an absent readOnlyHint is not read-only (MCP spec default)
-        assert!(!mode_allows(mode, "srv__write", false), "unannotated mcp in {mode:?}");
+        assert!(
+            !mode_allows(mode, "srv__write", false),
+            "unannotated mcp in {mode:?}"
+        );
     }
 
     // the subagent tool stays available: its children read this same mode
-    for mode in [AgentMode::Default, AgentMode::ReadOnly, AgentMode::Plan, AgentMode::Auto] {
-        assert!(mode_allows(mode, "ducky__subagent", false), "subagent in {mode:?}");
+    for mode in [
+        AgentMode::Default,
+        AgentMode::ReadOnly,
+        AgentMode::Plan,
+        AgentMode::Auto,
+    ] {
+        assert!(
+            mode_allows(mode, "ducky__subagent", false),
+            "subagent in {mode:?}"
+        );
     }
 
     // control tools only where they mean something
@@ -1035,7 +1074,11 @@ fn mode_allows_matrix() {
     assert!(!mode_allows(AgentMode::Plan, "ducky__set_mode", true));
     assert!(!mode_allows(AgentMode::ReadOnly, "ducky__set_mode", true));
     assert!(mode_allows(AgentMode::Plan, "ducky__present_plan", true));
-    assert!(!mode_allows(AgentMode::Default, "ducky__present_plan", true));
+    assert!(!mode_allows(
+        AgentMode::Default,
+        "ducky__present_plan",
+        true
+    ));
     assert!(!mode_allows(AgentMode::Auto, "ducky__present_plan", true));
 }
 
@@ -1043,7 +1086,10 @@ fn mode_allows_matrix() {
 fn mode_denial_names_the_mode_and_the_way_out() {
     use crate::agent::mode_denial;
     let read_only = mode_denial(AgentMode::ReadOnly, "ducky__fs_write");
-    assert!(read_only.contains("read-only mode is active"), "{read_only}");
+    assert!(
+        read_only.contains("read-only mode is active"),
+        "{read_only}"
+    );
     let plan = mode_denial(AgentMode::Plan, "ducky__fs_write");
     assert!(plan.contains("ducky__present_plan"), "{plan}");
     assert!(mode_denial(AgentMode::Plan, "ducky__set_mode").contains("auto mode"));
@@ -1072,7 +1118,10 @@ async fn read_only_mode_hides_mutating_tools() {
     assert!(!names.contains(&"ducky__fs_write".to_string()), "{names:?}");
     assert!(!names.contains(&"ducky__fs_mkdir".to_string()), "{names:?}");
     assert!(!names.contains(&"ducky__set_mode".to_string()), "{names:?}");
-    assert!(!names.contains(&"ducky__present_plan".to_string()), "{names:?}");
+    assert!(
+        !names.contains(&"ducky__present_plan".to_string()),
+        "{names:?}"
+    );
 }
 
 #[tokio::test]
@@ -1082,7 +1131,10 @@ async fn plan_mode_offers_the_plan_tool_only() {
     run(&agent, "m2-conv", "m2-main", &CancellationToken::new()).await;
 
     let names = captures_for("m2-main")[0].tool_names.clone();
-    assert!(names.contains(&"ducky__present_plan".to_string()), "{names:?}");
+    assert!(
+        names.contains(&"ducky__present_plan".to_string()),
+        "{names:?}"
+    );
     assert!(
         names.contains(&"ducky__read_session_context".to_string()),
         "{names:?}"
@@ -1100,7 +1152,10 @@ async fn auto_mode_offers_the_mode_tool_and_writes() {
     let names = captures_for("m3b-main")[0].tool_names.clone();
     assert!(names.contains(&"ducky__set_mode".to_string()), "{names:?}");
     assert!(names.contains(&"ducky__fs_write".to_string()), "{names:?}");
-    assert!(!names.contains(&"ducky__present_plan".to_string()), "{names:?}");
+    assert!(
+        !names.contains(&"ducky__present_plan".to_string()),
+        "{names:?}"
+    );
 }
 
 #[tokio::test]
@@ -1294,7 +1349,9 @@ async fn mode_text_reaches_the_model_and_default_adds_none() {
     script("m7-read", vec![MockRound::Text("ok".into())]);
     let (agent, _s, _st) = test_agent_in_mode("m7b-conv", AgentMode::ReadOnly);
     run(&agent, "m7b-conv", "m7-read", &CancellationToken::new()).await;
-    assert!(captures_for("m7-read")[0].system.contains("# Read-only mode"));
+    assert!(captures_for("m7-read")[0]
+        .system
+        .contains("# Read-only mode"));
 
     script("m7-auto", vec![MockRound::Text("ok".into())]);
     let (agent, _s, _st) = test_agent_in_mode("m7c-conv", AgentMode::Auto);
@@ -1340,12 +1397,19 @@ async fn approving_a_plan_leaves_plan_mode_and_reoffers_writes() {
     .await;
 
     // the plan reached the UI, unchanged
-    assert_eq!(plan_events(&sink), vec!["# Plan\n\n1. Do the thing.".to_string()]);
+    assert_eq!(
+        plan_events(&sink),
+        vec!["# Plan\n\n1. Do the thing.".to_string()]
+    );
     // approval flipped the mode, told the UI, and told the model to build
     assert_eq!(mode_of(&store, "p1-conv"), AgentMode::Default);
     assert_eq!(mode_events(&sink), vec![AgentMode::Default]);
     let results = tool_results(&store, "p1-conv");
-    assert!(results[0].contains("The user approved this plan"), "{}", results[0]);
+    assert!(
+        results[0].contains("The user approved this plan"),
+        "{}",
+        results[0]
+    );
     // and the next round offers the write tools again
     let names = captures_for("p1-main")[1].tool_names.clone();
     assert!(names.contains(&"ducky__fs_write".to_string()), "{names:?}");
@@ -1374,7 +1438,10 @@ async fn revising_a_plan_keeps_plan_mode_and_returns_the_feedback() {
     .await;
 
     assert_eq!(mode_of(&store, "p2-conv"), AgentMode::Plan);
-    assert!(mode_events(&sink).is_empty(), "no mode change on a revision");
+    assert!(
+        mode_events(&sink).is_empty(),
+        "no mode change on a revision"
+    );
     let results = tool_results(&store, "p2-conv");
     assert!(results[0].contains("shorter please"), "{}", results[0]);
     // still read-only on the next round
@@ -1388,8 +1455,14 @@ async fn a_second_plan_in_the_same_message_is_refused() {
         "p3-main",
         vec![
             MockRound::Tools(vec![
-                ("ducky__present_plan".into(), serde_json::json!({ "plan": "one" })),
-                ("ducky__present_plan".into(), serde_json::json!({ "plan": "two" })),
+                (
+                    "ducky__present_plan".into(),
+                    serde_json::json!({ "plan": "one" }),
+                ),
+                (
+                    "ducky__present_plan".into(),
+                    serde_json::json!({ "plan": "two" }),
+                ),
             ]),
             MockRound::Text("done".into()),
         ],
@@ -1408,7 +1481,11 @@ async fn a_second_plan_in_the_same_message_is_refused() {
     assert_eq!(plan_events(&sink), vec!["one".to_string()]);
     let results = tool_results(&store, "p3-conv");
     assert_eq!(results.len(), 2);
-    assert!(results[1].contains("only available in plan mode"), "{}", results[1]);
+    assert!(
+        results[1].contains("only available in plan mode"),
+        "{}",
+        results[1]
+    );
 }
 
 #[tokio::test]
@@ -1426,7 +1503,10 @@ async fn an_empty_plan_is_refused_without_asking_the_user() {
     let (agent, sink, store) = test_agent_in_mode("p4-conv", AgentMode::Plan);
     run(&agent, "p4-conv", "p4-main", &CancellationToken::new()).await;
 
-    assert!(plan_events(&sink).is_empty(), "no plan event for an empty plan");
+    assert!(
+        plan_events(&sink).is_empty(),
+        "no plan event for an empty plan"
+    );
     let results = tool_results(&store, "p4-conv");
     assert!(results[0].contains("non-empty"), "{}", results[0]);
     assert_eq!(mode_of(&store, "p4-conv"), AgentMode::Plan);
@@ -1478,9 +1558,9 @@ async fn cancelling_a_turn_settles_a_pending_plan() {
     let (agent, sink, store) = test_agent_in_mode("p7-conv", AgentMode::Plan);
     let handle = {
         let agent = agent.clone();
-        tokio::spawn(async move {
-            run(&agent, "p7-conv", "p7-main", &CancellationToken::new()).await
-        })
+        tokio::spawn(
+            async move { run(&agent, "p7-conv", "p7-main", &CancellationToken::new()).await },
+        )
     };
     let _ = wait_for_plan(&sink).await;
     agent.bridge.cancel_for_conversation("p7-conv");
@@ -1488,7 +1568,11 @@ async fn cancelling_a_turn_settles_a_pending_plan() {
 
     assert_eq!(mode_of(&store, "p7-conv"), AgentMode::Plan);
     let results = tool_results(&store, "p7-conv");
-    assert!(results[0].contains("cancelled the plan review"), "{}", results[0]);
+    assert!(
+        results[0].contains("cancelled the plan review"),
+        "{}",
+        results[0]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1514,7 +1598,10 @@ async fn auto_mode_can_switch_into_plan_mode() {
     assert_eq!(mode_events(&sink), vec![AgentMode::Plan]);
     // the very next round is read-only and offers the plan tool
     let names = captures_for("s1-main")[1].tool_names.clone();
-    assert!(names.contains(&"ducky__present_plan".to_string()), "{names:?}");
+    assert!(
+        names.contains(&"ducky__present_plan".to_string()),
+        "{names:?}"
+    );
     assert!(!names.contains(&"ducky__fs_write".to_string()), "{names:?}");
     assert!(!names.contains(&"ducky__set_mode".to_string()), "{names:?}");
     // the tool is chat flow: no consent prompt is raised, so no pending_approval
@@ -1578,7 +1665,11 @@ async fn the_model_cannot_leave_plan_mode_by_itself() {
     assert_eq!(mode_of(&store, "s3-conv"), AgentMode::Plan);
     assert!(mode_events(&sink).is_empty());
     let results = tool_results(&store, "s3-conv");
-    assert!(results[0].contains("only available in auto mode"), "{}", results[0]);
+    assert!(
+        results[0].contains("only available in auto mode"),
+        "{}",
+        results[0]
+    );
 }
 
 #[tokio::test]
@@ -1624,7 +1715,11 @@ async fn auto_mode_thrashing_ends_at_the_iteration_cap() {
         "capped by max_tool_iterations, got {}",
         results.len()
     );
-    assert!(results[1].contains("only available in auto mode"), "{}", results[1]);
+    assert!(
+        results[1].contains("only available in auto mode"),
+        "{}",
+        results[1]
+    );
 }
 
 #[tokio::test]
@@ -1632,7 +1727,10 @@ async fn control_tools_are_refused_inside_a_subagent() {
     script(
         "s6-main",
         vec![
-            MockRound::Tools(vec![(SUBAGENT.into(), serde_json::json!({ "task": "s6-sub" }))]),
+            MockRound::Tools(vec![(
+                SUBAGENT.into(),
+                serde_json::json!({ "task": "s6-sub" }),
+            )]),
             MockRound::Text("done".into()),
         ],
     );
@@ -1695,7 +1793,10 @@ async fn read_only_mode_makes_subagents_read_only_too() {
     script(
         "i1-main",
         vec![
-            MockRound::Tools(vec![(SUBAGENT.into(), serde_json::json!({ "task": "i1-sub" }))]),
+            MockRound::Tools(vec![(
+                SUBAGENT.into(),
+                serde_json::json!({ "task": "i1-sub" }),
+            )]),
             MockRound::Text("all done".into()),
         ],
     );
@@ -1717,7 +1818,9 @@ async fn read_only_mode_makes_subagents_read_only_too() {
     assert_eq!(child.len(), 2, "the write attempt came back as a result");
     assert!(!child[0].tool_names.contains(&"ducky__fs_write".to_string()));
     assert!(!child[0].tool_names.contains(&"ducky__set_mode".to_string()));
-    assert!(!child[0].tool_names.contains(&"ducky__present_plan".to_string()));
+    assert!(!child[0]
+        .tool_names
+        .contains(&"ducky__present_plan".to_string()));
     // the write never happened, and the child was told why
     assert!(!dir.join("sub-forced.txt").exists());
     assert!(
@@ -1737,7 +1840,10 @@ async fn a_plan_mode_parent_also_gives_a_read_only_child() {
     script(
         "i2-main",
         vec![
-            MockRound::Tools(vec![(SUBAGENT.into(), serde_json::json!({ "task": "i2-sub" }))]),
+            MockRound::Tools(vec![(
+                SUBAGENT.into(),
+                serde_json::json!({ "task": "i2-sub" }),
+            )]),
             MockRound::Text("all done".into()),
         ],
     );
@@ -1747,7 +1853,9 @@ async fn a_plan_mode_parent_also_gives_a_read_only_child() {
 
     let child = captures_for("i2-sub");
     assert!(!child[0].tool_names.contains(&"ducky__fs_write".to_string()));
-    assert!(!child[0].tool_names.contains(&"ducky__present_plan".to_string()));
+    assert!(!child[0]
+        .tool_names
+        .contains(&"ducky__present_plan".to_string()));
     assert!(child[0].system.contains("plan mode"), "{}", child[0].system);
 }
 
