@@ -162,6 +162,9 @@ interface StoreState {
   draftGroupId: string | null;
   /** Model staged on the draft page; null = no pick, defaults apply. */
   draftModel: string | null;
+  /** Provider staged on the draft page for the chat `send()` will create.
+   * Null = the app default provider applies. */
+  draftProviderId: string | null;
   /** Effort staged on the draft page; undefined = untouched (creation seeds
    * settings.default_effort), null = explicit "Default". */
   draftEffort: EffortLevel | null | undefined;
@@ -224,6 +227,10 @@ interface StoreState {
   generateTitle: (id: string) => Promise<void>;
   cancelTitle: (id: string) => Promise<void>;
   setActiveModel: (providerId: string, model: string) => Promise<void>;
+  /** Stage a provider for the chat the draft page will create. Switching
+   * providers drops a model staged for the previous one. No-op mid-chat: an
+   * existing conversation only retargets when a model is picked. */
+  stageDraftProvider: (providerId: string) => void;
   setActiveEffort: (effort: EffortLevel | null) => Promise<void>;
   /** Set the mode for the active chat, or stage it on the draft page. */
   setMode: (mode: AgentMode) => Promise<void>;
@@ -338,6 +345,7 @@ export const useStore = create<StoreState>((set, get) => ({
   activeConversationId: null,
   draftGroupId: null,
   draftModel: null,
+  draftProviderId: null,
   draftEffort: undefined,
   draftMode: null,
   items: [],
@@ -472,6 +480,7 @@ export const useStore = create<StoreState>((set, get) => ({
     set({
       activeConversationId: null,
       draftModel: null,
+      draftProviderId: null,
       draftEffort: undefined,
       draftMode: null,
       draftGroupId: null,
@@ -640,11 +649,19 @@ export const useStore = create<StoreState>((set, get) => ({
     const id = get().activeConversationId;
     if (!id) {
       // draft page: stage the pick for the chat that send() will create
-      set({ draftModel: model });
+      set({ draftModel: model, draftProviderId: providerId });
       return;
     }
     await api.conversationSetModel(id, providerId, model);
     await get().refreshConfig();
+  },
+
+  stageDraftProvider(providerId) {
+    if (get().activeConversationId) return;
+    // activeProvider() already reports the default provider, so picking that
+    // one back is not a change and must not drop a staged model
+    if (get().activeProvider()?.id === providerId) return;
+    set({ draftProviderId: providerId, draftModel: null, draftEffort: undefined });
   },
 
   async setActiveEffort(effort) {
@@ -762,7 +779,13 @@ export const useStore = create<StoreState>((set, get) => ({
         const { config } = get();
         // an app-level default model wins over "whatever was used last"
         const defaultProvider = defaultProviderOf(config);
-        const provider = defaultProvider ?? get().activeProvider();
+        // a provider picked on the draft page beats the app default
+        const draftProvider = get().draftProviderId
+          ? (config?.providers.find((p) => p.id === get().draftProviderId) ??
+            null)
+          : null;
+        const provider =
+          draftProvider ?? defaultProvider ?? get().activeProvider();
         if (!provider) {
           get().toast(
             "error",
@@ -782,7 +805,13 @@ export const useStore = create<StoreState>((set, get) => ({
           // non-fatal: the chat keeps the app default if this fails
           await api.conversationSetMode(meta.id, draftMode).catch(() => {});
         }
-        set({ draftModel: null, draftEffort: undefined, draftMode: null, draftGroupId: null });
+        set({
+          draftModel: null,
+          draftProviderId: null,
+          draftEffort: undefined,
+          draftMode: null,
+          draftGroupId: null,
+        });
         await get().refreshConfig();
         id = meta.id;
       } catch (e) {
@@ -1064,7 +1093,7 @@ export const useStore = create<StoreState>((set, get) => ({
   },
 
   activeProvider() {
-    const { config, activeConversationId } = get();
+    const { config, activeConversationId, draftProviderId } = get();
     if (!config) return null;
     if (activeConversationId) {
       const conv = config.conversations.find(
@@ -1072,6 +1101,9 @@ export const useStore = create<StoreState>((set, get) => ({
       );
       const provider = config.providers.find((p) => p.id === conv?.provider_id);
       if (provider) return provider;
+    } else if (draftProviderId) {
+      const picked = config.providers.find((p) => p.id === draftProviderId);
+      if (picked) return picked;
     }
     return defaultProviderOf(config) ?? config.providers[0] ?? null;
   },

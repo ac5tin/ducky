@@ -24,7 +24,16 @@ function config(overrides = {}) {
 }
 
 test("a pick staged on the draft page wins over everything", () => {
-  assert.equal(resolveDraftModel("staged", config(), provider), "staged");
+  assert.equal(resolveDraftModel("other", config(), provider), "other");
+});
+
+test("a model staged for another provider is not sent to this one", () => {
+  // switching providers on the draft page keeps no model from the last one
+  assert.equal(resolveDraftModel("claude-opus-5", config(), provider), "app-default");
+  assert.equal(
+    resolveDraftModel("claude-opus-5", null, { ...provider, default_model: null }),
+    "first",
+  );
 });
 
 test("the app default model beats the provider's own default", () => {
@@ -58,8 +67,8 @@ test("shown model on the draft page falls through to creation resolution", () =>
     "app-default",
   );
   assert.equal(
-    resolveShownModel(undefined, null, "staged", config(), provider),
-    "staged",
+    resolveShownModel(undefined, null, "other", config(), provider),
+    "other",
   );
   assert.equal(resolveShownModel(undefined, null, null, config(), null), "");
 });

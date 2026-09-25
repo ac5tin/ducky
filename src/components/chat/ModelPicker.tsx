@@ -15,7 +15,15 @@ export function ModelPicker({ dropUp = false }: { dropUp?: boolean }) {
   const setActiveEffort = useStore((s) => s.setActiveEffort);
   const refreshConfig = useStore((s) => s.refreshConfig);
   const setView = useStore((s) => s.setView);
+  const stageDraftProvider = useStore((s) => s.stageDraftProvider);
   const [open, setOpen] = useState(false);
+  // Which provider's models the open menu lists. Browsing alone never
+  // retargets a chat; only picking a model does.
+  const [browseId, setBrowseId] = useState<string | null>(null);
+
+  const providers = config?.providers ?? [];
+  const browse =
+    providers.find((p) => p.id === browseId) ?? activeProvider;
 
   const conversation = config?.conversations.find((c) => c.id === activeId);
   const currentModel = resolveShownModel(
@@ -64,7 +72,10 @@ export function ModelPicker({ dropUp = false }: { dropUp?: boolean }) {
     <div className="relative">
       <button
         className="flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm font-medium transition hover:bg-slate-100 dark:hover:bg-slate-800"
-        onClick={() => setOpen(!open)}
+        onClick={() => {
+          setOpen(!open);
+          setBrowseId(null);
+        }}
       >
         <span className="text-slate-400">{activeProvider.name}</span>
         <span className="max-w-56 truncate">{currentModel || "Choose a model"}</span>
@@ -79,12 +90,36 @@ export function ModelPicker({ dropUp = false }: { dropUp?: boolean }) {
               dropUp ? "bottom-full mb-1" : "top-full mt-1"
             }`}
           >
-            {activeProvider.models.length === 0 && (
+            {providers.length > 1 && (
+              <div className="border-b border-slate-200 pb-1 dark:border-slate-700">
+                <p className="px-3 pb-1 pt-1.5 text-xs font-medium text-slate-400">Provider</p>
+                {providers.map((p) => (
+                  <button
+                    key={p.id}
+                    className={`flex w-full items-center justify-between gap-2 px-3 py-1.5 text-left text-sm transition hover:bg-slate-50 dark:hover:bg-slate-800 ${
+                      p.id === browse?.id ? "font-semibold text-sky-600 dark:text-sky-400" : ""
+                    }`}
+                    onClick={() => {
+                      setBrowseId(p.id);
+                      // on the draft page this retargets the chat send() will
+                      // create; mid-chat it is inert until a model is picked
+                      stageDraftProvider(p.id);
+                    }}
+                  >
+                    <span className="truncate">{p.name}</span>
+                    <span className="shrink-0 text-xs text-slate-400">
+                      {p.models.length > 0 ? p.models.length : "no models"}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
+            {browse && browse.models.length === 0 && (
               <p className="px-3 py-2 text-xs text-slate-400">
                 No models fetched yet — refresh them in Settings → Providers.
               </p>
             )}
-            {activeProvider.models.map((model) => (
+            {(browse?.models ?? []).map((model) => (
               <button
                 key={model}
                 className={`flex w-full items-center justify-between gap-2 px-3 py-2 text-left text-sm transition hover:bg-slate-50 dark:hover:bg-slate-800 ${
@@ -92,7 +127,8 @@ export function ModelPicker({ dropUp = false }: { dropUp?: boolean }) {
                 }`}
                 onClick={() => {
                   setOpen(false);
-                  if (activeProvider) setActiveModel(activeProvider.id, model).catch((e) => console.error(e));
+                  setBrowseId(null);
+                  if (browse) setActiveModel(browse.id, model).catch((e) => console.error(e));
                 }}
               >
                 <span className="truncate">{model}</span>

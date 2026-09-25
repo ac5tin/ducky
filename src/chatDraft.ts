@@ -20,8 +20,15 @@ export function resolveDraftModel(
     config?.settings.default_provider_id === provider.id
       ? config.settings.default_model
       : null;
+  // A staged model only counts for the provider it was picked from: switching
+  // providers must not send one provider's model id to another's endpoint.
+  const stagedHere =
+    staged &&
+    (provider.models.includes(staged) || staged === provider.default_model)
+      ? staged
+      : null;
   return (
-    staged || appDefault || provider.default_model || provider.models[0] || ""
+    stagedHere || appDefault || provider.default_model || provider.models[0] || ""
   );
 }
 
