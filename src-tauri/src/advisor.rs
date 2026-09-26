@@ -65,10 +65,6 @@ pub fn err_no_model() -> String {
     "No advisor model is configured. Pick one in the chat header.".into()
 }
 
-pub fn err_no_key(provider_id: &str, model: &str) -> String {
-    format!("Advisor ({provider_id}:{model}) has no API key available.")
-}
-
 pub fn err_failed(err: &str) -> String {
     format!("Advisor call failed: {err}")
 }
@@ -428,10 +424,6 @@ mod tests {
         assert_eq!(
             err_no_model(),
             "No advisor model is configured. Pick one in the chat header."
-        );
-        assert_eq!(
-            err_no_key("p1", "m1"),
-            "Advisor (p1:m1) has no API key available."
         );
         assert_eq!(err_failed("boom"), "Advisor call failed: boom");
         assert!(err_cancelled().contains("cancelled"));

@@ -1039,7 +1039,12 @@ fn clear_captures(key: &str) {
 
 fn advisor_events(
     sink: &CollectingSink,
-) -> Vec<(String, String, Option<crate::events::AdvisorMeta>)> {
+) -> Vec<(
+    String,
+    String,
+    Option<crate::events::AdvisorMeta>,
+    Option<String>,
+)> {
     sink.events
         .lock()
         .unwrap()
@@ -1049,8 +1054,14 @@ fn advisor_events(
                 tool_call_id,
                 status,
                 advisor,
+                result_text,
                 ..
-            } => Some((tool_call_id.clone(), status.clone(), advisor.clone())),
+            } => Some((
+                tool_call_id.clone(),
+                status.clone(),
+                advisor.clone(),
+                result_text.clone(),
+            )),
             _ => None,
         })
         .collect()
@@ -1109,12 +1120,28 @@ async fn advisor_consult_returns_guidance_to_the_executor() {
 
     // the card: running with the advisor identity, then done with the guidance
     let events = advisor_events(&sink);
-    assert!(events
+    let running = events
         .iter()
-        .any(|(_, s, meta)| s == "running" && meta.is_some()));
+        .position(|(_, s, _, _)| s == "running")
+        .expect("the card starts as running");
+    let done = events
+        .iter()
+        .position(|(_, s, _, _)| s == "done")
+        .expect("the card settles as done");
+    assert!(running < done, "running comes before done");
+    // exactly the advisor's identity, not merely some meta
+    let meta = events[running]
+        .2
+        .clone()
+        .expect("the running card carries the advisor identity");
+    assert_eq!(meta.provider_id, "mock");
+    assert_eq!(meta.model, "advisor-model");
+    assert_eq!(meta.effort.as_deref(), Some("high"));
+    // and the progress text names the consult
+    let progress = events[running].3.as_deref().unwrap_or_default();
     assert!(
-        events.iter().any(|(_, s, _)| s == "done"),
-        "the card settles as done"
+        progress.contains("Consulting advisor"),
+        "running card text: {progress:?}"
     );
 
     // the executor got the guidance as the tool result
@@ -1125,7 +1152,7 @@ async fn advisor_consult_returns_guidance_to_the_executor() {
     // no approval prompt — including none auto-approved behind the scenes, so
     // this also fails if the dispatch ever moves below the consent gate
     assert!(
-        !events.iter().any(|(_, s, _)| s == "pending_approval"),
+        !events.iter().any(|(_, s, _, _)| s == "pending_approval"),
         "the consult needs no approval"
     );
     // the done card carries the guidance, like every other tool card

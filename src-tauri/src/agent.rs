@@ -750,6 +750,15 @@ impl Agent {
         let tool_names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
         let messages = crate::advisor::build_messages(history, &tool_names, &executor_system);
 
+        // Resolve the provider before the card goes up: a cancellation that
+        // lands while this await runs must not leave the card spinning — the
+        // `select!` below settles it as soon as the token is already cancelled.
+        let (provider, default_model, _) =
+            match self.provider_for(&spec.provider_id, &spec.model).await {
+                Ok(v) => v,
+                Err(e) => return fail(crate::advisor::err_failed(&e)),
+            };
+
         let label = if spec.model.trim().is_empty() {
             spec.provider_id.clone()
         } else {
@@ -775,11 +784,6 @@ impl Agent {
             parent,
         );
 
-        let (provider, default_model, _) =
-            match self.provider_for(&spec.provider_id, &spec.model).await {
-                Ok(v) => v,
-                Err(_) => return fail(crate::advisor::err_no_key(&spec.provider_id, &spec.model)),
-            };
         let options = crate::providers::ChatOptions {
             model: if spec.model.is_empty() {
                 default_model
