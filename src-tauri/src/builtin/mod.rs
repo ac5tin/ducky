@@ -30,6 +30,10 @@ pub const PRESENT_PLAN: &str = "ducky__present_plan";
 /// Let the model switch the conversation's mode. Offered only in auto mode.
 pub const SET_MODE: &str = "ducky__set_mode";
 
+/// Consult a stronger reviewer model. Executed by the agent loop like
+/// `ducky__subagent`; offered only while the conversation has a usable advisor.
+pub const ADVISOR: &str = "ducky__advisor";
+
 /// The definition an omitted `agent` argument resolves to (when it exists in
 /// the user's config; otherwise the spawn stays base-generic).
 pub const DEFAULT_SUBAGENT_NAME: &str = "General-Purpose";
@@ -130,6 +134,9 @@ pub async fn execute(name: &str, args: &Value, cwd: &Path) -> Result<String, Str
         Err(format!("{name} is handled by the chat engine"))
     } else if is_control(name) {
         // reached only if the engine's control branch is ever bypassed
+        Err(format!("{name} is handled by the chat engine"))
+    } else if name == ADVISOR {
+        // reached only if the engine's advisor branch is ever bypassed
         Err(format!("{name} is handled by the chat engine"))
     } else {
         Err(format!("Unknown builtin tool: {name}"))
@@ -364,6 +371,23 @@ static REGISTRY: LazyLock<Vec<BuiltinTool>> = LazyLock::new(|| {
             ),
             read_only: true,
         },
+        BuiltinTool {
+            name: ADVISOR,
+            description: "Consult a stronger reviewer model about the work in progress. Takes no \
+                      arguments: the whole conversation so far is forwarded automatically, so there \
+                      is nothing to explain or repeat. Use it before committing to an approach on a \
+                      multi-step task, when an error keeps recurring after your own fixes, and \
+                      before you tell the user the work is done. Skip it for short or mechanical \
+                      tasks: a consult costs the user a second model call billed at the reviewer's \
+                      rate. The advisor returns a plan, a correction, or a stop signal. It cannot \
+                      see anything that is not in this conversation and it cannot run tools. Weigh \
+                      its guidance seriously, but when your own evidence contradicts a specific \
+                      claim, say so in your next reply instead of following it blindly. Restate the \
+                      advisor's key guidance in your next visible reply — the consult itself appears \
+                      in a collapsed card.",
+            schema: obj(&[], serde_json::json!({})),
+            read_only: true,
+        },
     ]
 });
 
@@ -439,6 +463,24 @@ mod tests {
         assert_eq!(
             tool.schema["required"],
             serde_json::json!(["conversation_id", "query"])
+        );
+    }
+
+    #[test]
+    fn advisor_tool_is_read_only_with_no_arguments() {
+        let tool = lookup(ADVISOR).expect("advisor tool is registered");
+        assert!(tool.read_only, "the advisor must survive read-only modes");
+        assert!(!is_control(ADVISOR), "subagents must be able to consult it");
+        assert!(is_builtin(ADVISOR));
+        let required = tool.schema["required"].as_array();
+        assert!(required.is_none(), "the advisor takes no arguments");
+        assert_eq!(
+            tool.schema["properties"].as_object().map(|p| p.len()),
+            Some(0)
+        );
+        assert!(
+            tool.description.contains("Restate the advisor's key guidance"),
+            "the description carries the restate instruction"
         );
     }
 
