@@ -759,6 +759,15 @@ impl Agent {
                 Err(e) => return fail(crate::advisor::err_failed(&e)),
             };
 
+        // The model actually sent to the provider: an empty selection means the
+        // provider default, and the card records what ran — not what the config
+        // says later, when a provider edit could make a finished consult lie.
+        let model = if spec.model.is_empty() {
+            default_model
+        } else {
+            spec.model.clone()
+        };
+
         let label = if spec.model.trim().is_empty() {
             spec.provider_id.clone()
         } else {
@@ -776,7 +785,7 @@ impl Agent {
                 "tool": call.name,
                 "advisor": crate::events::AdvisorMeta {
                     provider_id: spec.provider_id.clone(),
-                    model: spec.model.clone(),
+                    model: model.clone(),
                     effort: spec.effort.map(|e| e.as_str().to_string()),
                 },
                 "result_text": result_text,
@@ -785,11 +794,7 @@ impl Agent {
         );
 
         let options = crate::providers::ChatOptions {
-            model: if spec.model.is_empty() {
-                default_model
-            } else {
-                spec.model.clone()
-            },
+            model,
             max_tokens: Some(crate::advisor::ADVISOR_MAX_TOKENS),
             temperature: None,
             effort: spec.effort,

@@ -77,17 +77,15 @@ export const ToolCallCard = memo(function ToolCallCard({
         )?.name
       : undefined,
   );
-  const advisorProvider = useStore((s) =>
-    s.config?.providers.find((p) => p.id === state.advisor?.provider_id),
-  );
-  // an empty advisor model means the provider default ran, so resolve it from
-  // the provider the way the header chip does
-  const advisorModel = state.advisor
-    ? state.advisor.model ||
-      advisorProvider?.default_model ||
-      advisorProvider?.models[0] ||
-      ""
-    : "";
+  // display name of the recorded provider, falling back to the raw id when a
+  // consult outlives a config edit; the lookup is skipped for ordinary calls
+  const advisorProviderName = useStore((s) => {
+    if (!state.advisor) return undefined;
+    return (
+      s.config?.providers.find((p) => p.id === state.advisor?.provider_id)
+        ?.name ?? state.advisor.provider_id
+    );
+  });
   const icon =
     status === "done"
       ? "check"
@@ -211,13 +209,11 @@ export const ToolCallCard = memo(function ToolCallCard({
           {state.advisor && (
             <div className="mb-3 flex flex-wrap items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400">
               <span className="rounded-md bg-slate-100 px-2 py-0.5 dark:bg-slate-800">
-                {advisorProvider?.name || state.advisor.provider_id}
+                {advisorProviderName}
               </span>
-              {advisorModel && (
-                <span className="rounded-md bg-slate-100 px-2 py-0.5 font-mono dark:bg-slate-800">
-                  {advisorModel}
-                </span>
-              )}
+              <span className="rounded-md bg-slate-100 px-2 py-0.5 font-mono dark:bg-slate-800">
+                {state.advisor.model || "provider default"}
+              </span>
               <span className="rounded-md bg-slate-100 px-2 py-0.5 dark:bg-slate-800">
                 effort: {state.advisor.effort ?? "default"}
               </span>
@@ -226,7 +222,7 @@ export const ToolCallCard = memo(function ToolCallCard({
           {state.advisor && status === "running" && (
             <p className="mb-3 truncate font-mono text-[11px] text-slate-400">
               Consulting advisor (
-              {advisorModel || advisorProvider?.name || state.advisor.provider_id}
+              {state.advisor.model || "provider default"}
               {state.advisor.effort ? ` · ${state.advisor.effort}` : ""})…
             </p>
           )}
