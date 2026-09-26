@@ -23,6 +23,7 @@ import { Markdown } from "../Markdown";
 import { ToolCallCard } from "./ToolCallCard";
 import { ModelPicker } from "./ModelPicker";
 import { ModePicker } from "./ModePicker";
+import { AdvisorChip } from "./AdvisorChip";
 import { WorkingDirChip } from "./WorkingDirChip";
 import { SlashCommandMenu } from "./SlashCommandMenu";
 import { SessionReferenceMenu } from "./SessionReferenceMenu";
@@ -117,6 +118,7 @@ export function ChatView() {
           <ModelPicker />
           <WorkingDirChip />
           <ModePicker />
+          <AdvisorChip />
           <button
             className={`rounded-lg p-1.5 transition ${
               terminalOpen
@@ -891,6 +893,7 @@ function EmptyState() {
           <ModelPicker dropUp />
           <WorkingDirChip />
           <ModePicker dropUp />
+          <AdvisorChip dropUp />
         </div>
         <Composer autoFocus />
       </div>
