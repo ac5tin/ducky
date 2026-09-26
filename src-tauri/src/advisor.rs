@@ -3,6 +3,83 @@
 //! here; the provider call and the tool card live in `agent.rs`.
 
 use crate::config::{AppSettings, ConversationMeta, EffortLevel, ProviderConfig};
+use crate::providers::Msg;
+
+pub const ADVISOR_SYSTEM_PROMPT: &str = r#"You are the advisor in an advisor-strategy pattern. An executor model is
+running a task end to end — calling tools, reading results, iterating. It has
+stopped to ask you for guidance. You read the shared conversation and answer
+with exactly one of: a plan (concrete next steps the executor should take), a
+correction (the executor is on a wrong path — say where, and what to do
+instead), or a stop signal (the work should halt and the user should be
+asked). You never call tools. You never produce user-facing prose. Be concise
+and directive, and name files, functions and line numbers from the
+conversation. Ground every claim in the conversation; when the conversation
+does not settle the question, say what is missing rather than guessing. No
+preamble, no apology, no meta-commentary about being an advisor."#;
+
+pub const ADVISOR_ASK: &str =
+    "Decide what the executor should do next from the conversation above and give it the guidance it needs.";
+
+pub const ADVISOR_MAX_TOKENS: u32 = 2048;
+
+pub fn build_messages(history: &[Msg], tool_names: &[String], executor_system: &str) -> Vec<Msg> {
+    let joined = if tool_names.is_empty() {
+        "none".to_owned()
+    } else {
+        tool_names.join(", ")
+    };
+    let system = format!(
+        "{ADVISOR_SYSTEM_PROMPT}\n\nThe executor is running under this system prompt:\n{executor_system}\n\nTools the executor can call: {joined}"
+    );
+
+    let mut transcript = history.to_vec();
+    let trailing_tool_call = transcript.last().and_then(|message| match message {
+        Msg::Assistant {
+            text, tool_calls, ..
+        } if !tool_calls.is_empty() => Some(text.is_empty()),
+        _ => None,
+    });
+    match trailing_tool_call {
+        Some(true) => {
+            transcript.pop();
+        }
+        Some(false) => {
+            if let Some(Msg::Assistant { tool_calls, .. }) = transcript.last_mut() {
+                tool_calls.clear();
+            }
+        }
+        None => {}
+    }
+
+    let mut messages = Vec::with_capacity(transcript.len() + 2);
+    messages.push(Msg::System { text: system });
+    messages.extend(transcript);
+    messages.push(Msg::User {
+        text: ADVISOR_ASK.into(),
+        ts: None,
+    });
+    messages
+}
+
+pub fn err_no_model() -> String {
+    "No advisor model is configured. Pick one in the chat header.".into()
+}
+
+pub fn err_no_key(provider_id: &str, model: &str) -> String {
+    format!("Advisor ({provider_id}:{model}) has no API key available.")
+}
+
+pub fn err_failed(err: &str) -> String {
+    format!("Advisor call failed: {err}")
+}
+
+pub fn err_cancelled() -> String {
+    "Advisor call was cancelled before it completed.".into()
+}
+
+pub fn err_empty() -> String {
+    "Advisor returned no text content.".into()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdvisorSpec {
@@ -67,6 +144,7 @@ pub fn validate_selection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::{Msg, ToolCall};
 
     fn provider(id: &str) -> ProviderConfig {
         ProviderConfig {
@@ -192,5 +270,145 @@ mod tests {
         assert_eq!(err, "Pick a provider before setting a model");
         let err = validate_selection(None, None, Some(EffortLevel::High), &providers).unwrap_err();
         assert_eq!(err, "Pick a provider before setting a model");
+    }
+
+    fn user(text: &str) -> Msg {
+        Msg::User {
+            text: text.into(),
+            ts: None,
+        }
+    }
+
+    fn assistant(text: &str, calls: Vec<(&str, &str)>) -> Msg {
+        Msg::Assistant {
+            text: text.into(),
+            tool_calls: calls
+                .into_iter()
+                .map(|(id, name)| ToolCall {
+                    id: id.into(),
+                    name: name.into(),
+                    arguments: serde_json::json!({}),
+                })
+                .collect(),
+            ts: None,
+        }
+    }
+
+    fn tool_result(id: &str, text: &str) -> Msg {
+        Msg::ToolResult {
+            call_id: id.into(),
+            text: text.into(),
+            is_error: false,
+        }
+    }
+
+    fn system_text(messages: &[Msg]) -> String {
+        messages
+            .iter()
+            .find_map(|m| match m {
+                Msg::System { text } => Some(text.clone()),
+                _ => None,
+            })
+            .expect("advisor request has a system message")
+    }
+
+    fn names() -> Vec<String> {
+        vec!["ducky__fs_read".into(), "ducky__advisor".into()]
+    }
+
+    #[test]
+    fn build_messages_leads_with_one_system_message() {
+        let history = vec![user("hello")];
+        let msgs = build_messages(&history, &names(), "You are the executor.");
+        assert_eq!(
+            msgs.iter()
+                .filter(|m| matches!(m, Msg::System { .. }))
+                .count(),
+            1
+        );
+        assert!(matches!(msgs[0], Msg::System { .. }));
+        let system = system_text(&msgs);
+        assert!(system.contains("advisor-strategy pattern"));
+        assert!(system.contains("You are the executor."));
+        assert!(system.contains("ducky__advisor"));
+    }
+
+    #[test]
+    fn build_messages_strips_the_in_flight_tool_calls_and_keeps_text() {
+        let history = vec![
+            user("do the thing"),
+            assistant("I should ask the advisor", vec![("c1", "ducky__advisor")]),
+        ];
+        let msgs = build_messages(&history, &names(), "sys");
+        let Msg::Assistant {
+            text, tool_calls, ..
+        } = &msgs[2]
+        else {
+            panic!("assistant message survives with its text");
+        };
+        assert_eq!(text, "I should ask the advisor");
+        assert!(tool_calls.is_empty());
+        assert!(matches!(msgs.last(), Some(Msg::User { .. })));
+    }
+
+    #[test]
+    fn build_messages_drops_an_empty_trailing_assistant_message() {
+        let history = vec![
+            user("do the thing"),
+            tool_result("c0", "some result"),
+            assistant("", vec![("c1", "ducky__advisor")]),
+        ];
+        let msgs = build_messages(&history, &names(), "sys");
+        // system + user + tool_result + the synthetic ask
+        assert_eq!(msgs.len(), 4);
+        assert!(matches!(msgs[2], Msg::ToolResult { .. }));
+        assert!(matches!(msgs[3], Msg::User { .. }));
+    }
+
+    #[test]
+    fn build_messages_keeps_a_user_tail_and_appends_the_ask_once() {
+        let history = vec![user("do the thing")];
+        let msgs = build_messages(&history, &names(), "sys");
+        assert_eq!(msgs.len(), 3);
+        let Msg::User { text, .. } = &msgs[2] else {
+            panic!("ask is a user message")
+        };
+        assert_eq!(text, ADVISOR_ASK);
+    }
+
+    #[test]
+    fn build_messages_keeps_earlier_advisor_guidance() {
+        let history = vec![
+            user("do the thing"),
+            assistant("", vec![("c1", "ducky__advisor")]),
+            tool_result("c1", "Split the migration in two commits."),
+            assistant("working", vec![("c2", "ducky__advisor")]),
+        ];
+        let msgs = build_messages(&history, &names(), "sys");
+        assert!(msgs.iter().any(|m| matches!(
+            m,
+            Msg::ToolResult { text, .. } if text == "Split the migration in two commits."
+        )));
+    }
+
+    #[test]
+    fn build_messages_reports_no_tools() {
+        let msgs = build_messages(&[user("hi")], &[], "sys");
+        assert!(system_text(&msgs).contains("Tools the executor can call: none"));
+    }
+
+    #[test]
+    fn error_texts_are_pinned() {
+        assert_eq!(
+            err_no_model(),
+            "No advisor model is configured. Pick one in the chat header."
+        );
+        assert_eq!(
+            err_no_key("p1", "m1"),
+            "Advisor (p1:m1) has no API key available."
+        );
+        assert_eq!(err_failed("boom"), "Advisor call failed: boom");
+        assert!(err_cancelled().contains("cancelled"));
+        assert_eq!(err_empty(), "Advisor returned no text content.");
     }
 }
