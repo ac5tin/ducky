@@ -131,6 +131,7 @@ pub fn validate_selection(
     effort: Option<EffortLevel>,
     providers: &[ProviderConfig],
 ) -> Result<(), String> {
+    let provider_id = provider_id.filter(|id| !id.trim().is_empty());
     if let Some(provider_id) = provider_id {
         if !providers.iter().any(|provider| provider.id == provider_id) {
             return Err("That provider is no longer configured".into());
@@ -270,6 +271,22 @@ mod tests {
         assert_eq!(err, "Pick a provider before setting a model");
         let err = validate_selection(None, None, Some(EffortLevel::High), &providers).unwrap_err();
         assert_eq!(err, "Pick a provider before setting a model");
+    }
+
+    #[test]
+    fn selection_validation_treats_blank_as_unset() {
+        let providers = vec![provider("p1")];
+        // a blank provider id clears the override: nothing else is set → Ok
+        assert!(validate_selection(Some(""), None, None, &providers).is_ok());
+        // but a model without a provider is still rejected
+        assert_eq!(
+            validate_selection(Some(""), Some("m1"), None, &providers).unwrap_err(),
+            "Pick a provider before setting a model"
+        );
+        assert_eq!(
+            validate_selection(None, Some("m1"), None, &providers).unwrap_err(),
+            "Pick a provider before setting a model"
+        );
     }
 
     fn user(text: &str) -> Msg {

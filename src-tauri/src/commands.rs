@@ -392,6 +392,25 @@ pub async fn settings_set(
         if let Some(v) = settings.default_effort {
             c.settings.default_effort = v;
         }
+        if let Some(v) = settings.advisor_enabled_by_default {
+            c.settings.advisor_enabled_by_default = v;
+        }
+        if let Some(v) = settings.advisor_provider_id {
+            let v = if v.trim().is_empty() { None } else { Some(v) };
+            if let Some(id) = &v {
+                if !c.providers.iter().any(|p| &p.id == id) {
+                    return Err(format!("Unknown provider {id}"));
+                }
+            }
+            c.settings.advisor_provider_id = v;
+        }
+        if let Some(v) = settings.advisor_model {
+            let v = if v.trim().is_empty() { None } else { Some(v) };
+            c.settings.advisor_model = v;
+        }
+        if let Some(v) = settings.advisor_effort {
+            c.settings.advisor_effort = v;
+        }
         if let Some(v) = settings.title_provider_id {
             let v = if v.trim().is_empty() { None } else { Some(v) };
             if let Some(id) = &v {
@@ -462,6 +481,11 @@ pub struct AppSettingsPatch {
     pub default_model: Option<String>,
     #[serde(default, deserialize_with = "deserialize_clearable")]
     pub default_effort: Option<Option<config::EffortLevel>>,
+    pub advisor_enabled_by_default: Option<bool>,
+    pub advisor_provider_id: Option<String>,
+    pub advisor_model: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_clearable")]
+    pub advisor_effort: Option<Option<config::EffortLevel>>,
     pub title_provider_id: Option<String>,
     pub title_model: Option<String>,
     #[serde(default, deserialize_with = "deserialize_clearable")]
@@ -503,9 +527,13 @@ pub fn conversation_create(
     model: String,
     group_id: Option<String>,
 ) -> ConversationMeta {
-    let (effort, mode) = {
+    let (effort, mode, advisor_enabled) = {
         let cfg = state.store.config.lock().unwrap();
-        (cfg.settings.default_effort, cfg.settings.default_mode)
+        (
+            cfg.settings.default_effort,
+            cfg.settings.default_mode,
+            cfg.settings.advisor_enabled_by_default,
+        )
     };
     let meta = ConversationMeta {
         id: uuid(),
@@ -516,7 +544,7 @@ pub fn conversation_create(
         mcp_ids: None,
         mode,
         auto_readonly: false,
-        advisor_enabled: false,
+        advisor_enabled,
         advisor_provider_id: None,
         advisor_model: None,
         advisor_effort: None,
@@ -595,6 +623,36 @@ pub fn conversation_set_effort(
             return Err("Unknown conversation".into());
         };
         meta.effort = effort;
+    }
+    state.store.save_config().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn conversation_set_advisor(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    enabled: bool,
+    provider_id: Option<String>,
+    model: Option<String>,
+    effort: Option<config::EffortLevel>,
+) -> Result<(), String> {
+    let provider_id = provider_id.filter(|id| !id.trim().is_empty());
+    let model = model.filter(|model| !model.trim().is_empty());
+    {
+        let mut c = state.store.config.lock().unwrap();
+        crate::advisor::validate_selection(
+            provider_id.as_deref(),
+            model.as_deref(),
+            effort,
+            &c.providers,
+        )?;
+        let Some(meta) = c.conversations.iter_mut().find(|c| c.id == id) else {
+            return Err("Unknown conversation".into());
+        };
+        meta.advisor_enabled = enabled;
+        meta.advisor_provider_id = provider_id;
+        meta.advisor_model = model;
+        meta.advisor_effort = effort;
     }
     state.store.save_config().map_err(|e| e.to_string())
 }

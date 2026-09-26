@@ -96,6 +96,11 @@ export const settingsSet = (settings: {
   default_model?: string;
   /** null clears the default effort; undefined leaves it unchanged. */
   default_effort?: EffortLevel | null;
+  advisor_enabled_by_default?: boolean;
+  advisor_provider_id?: string | null;
+  advisor_model?: string | null;
+  /** null clears advisor effort; undefined leaves it unchanged. */
+  advisor_effort?: EffortLevel | null;
   default_mode?: AgentMode;
   title_provider_id?: string;
   title_model?: string;
@@ -156,6 +161,21 @@ export const conversationSetModel = (
 
 export const conversationSetEffort = (id: string, effort: EffortLevel | null) =>
   invoke<void>("conversation_set_effort", { id, effort });
+
+export const conversationSetAdvisor = (
+  id: string,
+  enabled: boolean,
+  providerId: string | null,
+  model: string | null,
+  effort: EffortLevel | null,
+) =>
+  invoke<void>("conversation_set_advisor", {
+    id,
+    enabled,
+    providerId,
+    model,
+    effort,
+  });
 
 export const conversationSetMode = (id: string, mode: AgentMode) =>
   invoke<void>("conversation_set_mode", { id, mode });

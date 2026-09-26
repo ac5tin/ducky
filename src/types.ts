@@ -87,6 +87,14 @@ export interface AppSettings {
         default_model: string | null;
         /** Reasoning effort new chats start with; null = model default. */
         default_effort: EffortLevel | null;
+        /** Whether new chats have the advisor enabled. */
+        advisor_enabled_by_default: boolean;
+        /** Provider used for advisor calls; null = not configured. */
+        advisor_provider_id: string | null;
+        /** Model used for advisor calls; null = provider default. */
+        advisor_model: string | null;
+        /** Reasoning effort for advisor calls; null = model default. */
+        advisor_effort: EffortLevel | null;
         /** Mode new chats start in. */
         default_mode: AgentMode;
         /** Provider used to generate chat titles; null = the chat's provider. */
@@ -109,6 +117,10 @@ export interface ConversationMeta {
         provider_id: string;
         model: string;
         effort: EffortLevel | null;
+        advisor_enabled: boolean;
+        advisor_provider_id: string | null;
+        advisor_model: string | null;
+        advisor_effort: EffortLevel | null;
         mode: AgentMode;
         mcp_ids?: string[] | null;
         created_at: string;

@@ -232,6 +232,12 @@ interface StoreState {
    * existing conversation only retargets when a model is picked. */
   stageDraftProvider: (providerId: string) => void;
   setActiveEffort: (effort: EffortLevel | null) => Promise<void>;
+  setActiveAdvisor: (selection: {
+    enabled: boolean;
+    provider_id: string | null;
+    model: string | null;
+    effort: EffortLevel | null;
+  }) => Promise<void>;
   /** Set the mode for the active chat, or stage it on the draft page. */
   setMode: (mode: AgentMode) => Promise<void>;
   setActiveMcpIds: (mcpIds: string[] | null) => Promise<void>;
@@ -689,6 +695,19 @@ export const useStore = create<StoreState>((set, get) => ({
     const id = get().activeConversationId;
     if (!id) return;
     await api.conversationSetMcpIds(id, mcpIds);
+    await get().refreshConfig();
+  },
+
+  async setActiveAdvisor(selection) {
+    const id = get().activeConversationId;
+    if (!id) return;
+    await api.conversationSetAdvisor(
+      id,
+      selection.enabled,
+      selection.provider_id,
+      selection.model,
+      selection.effort,
+    );
     await get().refreshConfig();
   },
 
