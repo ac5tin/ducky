@@ -687,6 +687,131 @@ impl Agent {
         text
     }
 
+    /// `ducky__advisor`: forward the conversation so far to the selected
+    /// reviewer model and hand its guidance back as the tool result. One
+    /// provider call, no retry. It runs no tools, so it skips the approval
+    /// gate — the engine's dispatch branch returns before the consent prompt.
+    async fn advisor_tool(
+        &self,
+        conversation_id: &str,
+        call: &ToolCall,
+        scope: &RunScope,
+        history: &[Msg],
+        tools: &[ToolDef],
+        ct: &CancellationToken,
+    ) -> String {
+        let parent = scope.parent_tool_call_id();
+        // re-resolve from the live config: the selection may have changed
+        // since the tool list was built for this iteration
+        let spec = {
+            let cfg = self.store.config.lock().unwrap();
+            cfg.conversations
+                .iter()
+                .find(|c| c.id == conversation_id)
+                .and_then(|meta| crate::advisor::resolve(&cfg.settings, meta, &cfg.providers))
+        };
+        // one place settles every failure: error card + `Error:` tool result
+        let fail = |msg: String| -> String {
+            self.emit_tool_update(
+                conversation_id,
+                &call.id,
+                "error",
+                serde_json::json!({
+                    "tool": call.name,
+                    "result_text": &msg,
+                    "is_error": true,
+                }),
+                parent,
+            );
+            format!("Error: {msg}")
+        };
+        let Some(spec) = spec else {
+            return fail(crate::advisor::err_no_model());
+        };
+
+        // the advisor is shown what the executor's own system message says,
+        // so a consult from a subagent carries the subagent persona
+        let (cwd, main_prompt) = {
+            let cfg = self.store.config.lock().unwrap();
+            (
+                cfg.settings.effective_working_dir(&self.store.home_dir),
+                cfg.settings.system_prompt.clone(),
+            )
+        };
+        let executor_system = match system_message(
+            &cwd,
+            scope,
+            &main_prompt,
+            self.effective_mode(conversation_id),
+        ) {
+            Msg::System { text } => text,
+            _ => unreachable!("system_message always builds a system message"),
+        };
+        let tool_names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+        let messages = crate::advisor::build_messages(history, &tool_names, &executor_system);
+
+        let label = if spec.model.trim().is_empty() {
+            spec.provider_id.clone()
+        } else {
+            spec.model.clone()
+        };
+        let result_text = match spec.effort {
+            Some(effort) => format!("Consulting advisor ({label} · {})…", effort.as_str()),
+            None => format!("Consulting advisor ({label})…"),
+        };
+        self.emit_tool_update(
+            conversation_id,
+            &call.id,
+            "running",
+            serde_json::json!({
+                "tool": call.name,
+                "advisor": crate::events::AdvisorMeta {
+                    provider_id: spec.provider_id.clone(),
+                    model: spec.model.clone(),
+                    effort: spec.effort.map(|e| e.as_str().to_string()),
+                },
+                "result_text": result_text,
+            }),
+            parent,
+        );
+
+        let (provider, default_model, _) =
+            match self.provider_for(&spec.provider_id, &spec.model).await {
+                Ok(v) => v,
+                Err(_) => return fail(crate::advisor::err_no_key(&spec.provider_id, &spec.model)),
+            };
+        let options = crate::providers::ChatOptions {
+            model: if spec.model.is_empty() {
+                default_model
+            } else {
+                spec.model.clone()
+            },
+            max_tokens: Some(crate::advisor::ADVISOR_MAX_TOKENS),
+            temperature: None,
+            effort: spec.effort,
+            session_id: Some(conversation_id.to_string()),
+        };
+
+        let result = tokio::select! {
+            _ = ct.cancelled() => return fail(crate::advisor::err_cancelled()),
+            r = crate::providers::collect_stream_text(provider, &messages, &[], &options) => r,
+        };
+        let guidance = match result {
+            Ok(text) if !text.trim().is_empty() => text,
+            Ok(_) => return fail(crate::advisor::err_empty()),
+            Err(e) => return fail(crate::advisor::err_failed(&e)),
+        };
+
+        self.emit_tool_update(
+            conversation_id,
+            &call.id,
+            "done",
+            serde_json::json!({ "tool": call.name, "result_text": guidance }),
+            parent,
+        );
+        guidance
+    }
+
     /// Resolve a qualified tool name to its server + raw tool entry. Builtins
     /// are checked first so a user server can't shadow or spoof them.
     fn resolve_tool(
@@ -886,6 +1011,15 @@ impl Agent {
             let tool_filter = scope.tool_allowlist();
             let mode = self.effective_mode(conversation_id);
             let auto_readonly = self.auto_readonly(conversation_id);
+            // Resolved once per iteration from the same conversation meta the
+            // tool list is built from, so the two cannot disagree. `None` =
+            // disabled, unconfigured, or a selection that no longer resolves.
+            let advisor = {
+                let cfg = self.store.config.lock().unwrap();
+                allow
+                    .as_ref()
+                    .and_then(|meta| crate::advisor::resolve(&cfg.settings, meta, &cfg.providers))
+            };
             let mut tools: Vec<ToolDef> = self
                 .manager
                 .aggregated_tools()
@@ -922,6 +1056,10 @@ impl Agent {
             if !subagent_defs.is_empty() {
                 builtin_defs.retain(|t| t.name != crate::builtin::SUBAGENT);
                 builtin_defs.push(crate::builtin::subagent_tool_def(&subagent_defs));
+            }
+            // the advisor is offered only while the chat resolves to a usable selection
+            if advisor.is_none() {
+                builtin_defs.retain(|t| t.name != crate::builtin::ADVISOR);
             }
             if let Some(a) = tool_filter {
                 builtin_defs.retain(|t| tool_allowed(a, crate::builtin::SERVER_ID, &t.name));
@@ -1175,7 +1313,8 @@ impl Agent {
                         Err(text) => text,
                     }
                 } else {
-                    self.execute_tool(conversation_id, &call, scope, ct).await
+                    self.execute_tool(conversation_id, &call, scope, ct, history, &tools)
+                        .await
                 };
                 history.push(Msg::ToolResult {
                     call_id: call.id.clone(),
@@ -1614,6 +1753,8 @@ impl Agent {
         call: &ToolCall,
         scope: &RunScope,
         ct: &CancellationToken,
+        history: &[Msg],
+        tools: &[ToolDef],
     ) -> String {
         let parent = scope.parent_tool_call_id();
         let (entry, server_title) = match self.resolve_tool(&call.name) {
@@ -1693,6 +1834,15 @@ impl Agent {
                 crate::builtin::SET_MODE => self.set_mode_tool(conversation_id, call, parent).await,
                 _ => "Error: unknown control tool".to_string(),
             };
+        }
+
+        // The advisor runs no tools: one provider call, no consent prompt —
+        // returning here, before the pending_approval card and the gate, is
+        // what makes a consult approval-free.
+        if call.name == crate::builtin::ADVISOR {
+            return self
+                .advisor_tool(conversation_id, call, scope, history, tools, ct)
+                .await;
         }
 
         self.emit_tool_update(

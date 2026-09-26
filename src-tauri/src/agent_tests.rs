@@ -20,6 +20,7 @@ use crate::mcp::manager::McpManager;
 use crate::providers::{ChatOptions, LlmProvider, Msg, ProviderEvent, StopReason, ToolDef};
 
 const SUBAGENT: &str = "ducky__subagent";
+const ADVISOR: &str = "ducky__advisor";
 
 // ---------------------------------------------------------------------------
 // Scripted provider
@@ -1019,6 +1020,246 @@ async fn main_system_prompt_applies_to_main_run_only() {
     assert_eq!(sub.len(), 1);
     assert!(sub[0].system.contains("Working directory"));
     assert!(!sub[0].system.contains("Always answer in haiku."));
+}
+
+// ---------------------------------------------------------------------------
+// Advisor
+// ---------------------------------------------------------------------------
+
+/// The advisor's scripted reply is keyed by the constant ask text, so every
+/// test that triggers a consult shares one script key. Serialise them.
+static ADVISOR_TESTS: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// `CAPTURES` is process-global and never cleared between tests, so a test that
+/// asserts on the advisor's own request clears that key first.
+fn clear_captures(key: &str) {
+    CAPTURES.lock().unwrap().remove(key);
+}
+
+fn advisor_events(
+    sink: &CollectingSink,
+) -> Vec<(String, String, Option<crate::events::AdvisorMeta>)> {
+    sink.events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|e| match e {
+            BackendEvent::ToolCallUpdate {
+                tool_call_id,
+                status,
+                advisor,
+                ..
+            } => Some((tool_call_id.clone(), status.clone(), advisor.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Turn the advisor on for one chat: the settings triple plus that chat's
+/// flag, so the resolution goes through the settings default path. The mock
+/// provider must exist in the config for `advisor::resolve` to accept it.
+fn enable_advisor(store: &Store, conversation_id: &str) {
+    let mut cfg = store.config.lock().unwrap();
+    if !cfg.providers.iter().any(|p| p.id == "mock") {
+        cfg.providers.push(ProviderConfig {
+            id: "mock".into(),
+            kind: "custom".into(),
+            name: "Mock".into(),
+            base_url: "http://localhost".into(),
+            api_type: crate::config::ApiType::OpenAi,
+            default_model: Some("mock-model".into()),
+            models: vec!["mock-model".into(), "advisor-model".into()],
+            created_at: "t".into(),
+        });
+    }
+    cfg.settings.advisor_provider_id = Some("mock".into());
+    cfg.settings.advisor_model = Some("advisor-model".into());
+    cfg.settings.advisor_effort = Some(EffortLevel::High);
+    if let Some(meta) = cfg
+        .conversations
+        .iter_mut()
+        .find(|c| c.id == conversation_id)
+    {
+        meta.advisor_enabled = true;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn advisor_consult_returns_guidance_to_the_executor() {
+    let _guard = ADVISOR_TESTS.lock().await;
+    clear_captures("ask the advisor");
+    clear_captures(crate::advisor::ADVISOR_ASK);
+    // one script call per key: `script` replaces the whole queue
+    script(
+        "ask the advisor",
+        vec![
+            MockRound::Tools(vec![(ADVISOR.to_string(), serde_json::json!({}))]),
+            MockRound::Text("done".into()),
+        ],
+    );
+    script(
+        crate::advisor::ADVISOR_ASK,
+        vec![MockRound::Text("Split it in two commits.".into())],
+    );
+    let (agent, sink, store, _dir) = test_agent_full("advisor", AgentMode::Default, true);
+    enable_advisor(&store, "advisor");
+    let ct = CancellationToken::new();
+    run(&agent, "advisor", "ask the advisor", &ct).await;
+
+    // the card: running with the advisor identity, then done with the guidance
+    let events = advisor_events(&sink);
+    assert!(events
+        .iter()
+        .any(|(_, s, meta)| s == "running" && meta.is_some()));
+    assert!(
+        events.iter().any(|(_, s, _)| s == "done"),
+        "the card settles as done"
+    );
+
+    // the executor got the guidance as the tool result
+    assert!(tool_results(&store, "advisor")
+        .iter()
+        .any(|t| t.contains("Split it in two commits.")));
+
+    // no approval prompt — including none auto-approved behind the scenes, so
+    // this also fails if the dispatch ever moves below the consent gate
+    assert!(
+        !events.iter().any(|(_, s, _)| s == "pending_approval"),
+        "the consult needs no approval"
+    );
+    // the done card carries the guidance, like every other tool card
+    assert!(tool_cards(&sink).iter().any(|(s, t, r, _)| {
+        s == "done"
+            && t.as_deref() == Some(ADVISOR)
+            && r.as_deref() == Some("Split it in two commits.")
+    }));
+
+    // the advisor request: no tools, the advisor model, the pinned effort
+    let captured = captures_for(crate::advisor::ADVISOR_ASK);
+    assert_eq!(captured.len(), 1);
+    assert!(captured[0].tool_names.is_empty());
+    assert_eq!(captured[0].model, "advisor-model");
+    assert_eq!(captured[0].effort.as_deref(), Some("high"));
+    assert!(captured[0].system.contains("advisor-strategy pattern"));
+    assert!(captured[0].system.contains(ADVISOR));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn advisor_is_not_offered_when_disabled_or_unresolvable() {
+    script("no advisor", vec![MockRound::Text("hi".into())]);
+    let (agent, _sink, _store, _dir) = test_agent_full("plain", AgentMode::Default, true);
+    let ct = CancellationToken::new();
+    run(&agent, "plain", "no advisor", &ct).await;
+    let captured = captures_for("no advisor");
+    assert!(!captured[0].tool_names.iter().any(|n| n == ADVISOR));
+
+    script("stale advisor", vec![MockRound::Text("hi".into())]);
+    let (agent, _sink, store, _dir) = test_agent_full("stale", AgentMode::Default, true);
+    {
+        let mut cfg = store.config.lock().unwrap();
+        cfg.settings.advisor_provider_id = Some("deleted-provider".into());
+        if let Some(meta) = cfg.conversations.iter_mut().find(|c| c.id == "stale") {
+            meta.advisor_enabled = true;
+        }
+    }
+    run(&agent, "stale", "stale advisor", &ct).await;
+    let captured = captures_for("stale advisor");
+    assert!(!captured[0].tool_names.iter().any(|n| n == ADVISOR));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn advisor_appears_once_enabled_mid_conversation() {
+    script("toggle me", vec![MockRound::Text("first".into())]);
+    let (agent, _sink, store, _dir) = test_agent_full("toggle", AgentMode::Default, true);
+    let ct = CancellationToken::new();
+    run(&agent, "toggle", "toggle me", &ct).await;
+    assert!(!captures_for("toggle me")[0]
+        .tool_names
+        .iter()
+        .any(|n| n == ADVISOR));
+
+    enable_advisor(&store, "toggle");
+    script("toggle me again", vec![MockRound::Text("second".into())]);
+    run(&agent, "toggle", "toggle me again", &ct).await;
+    assert!(captures_for("toggle me again")[0]
+        .tool_names
+        .iter()
+        .any(|n| n == ADVISOR));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn advisor_consult_inside_a_subagent_carries_the_persona() {
+    let _guard = ADVISOR_TESTS.lock().await;
+    clear_captures(crate::advisor::ADVISOR_ASK);
+    script(
+        "t15-main",
+        vec![
+            MockRound::Tools(vec![(
+                SUBAGENT.into(),
+                serde_json::json!({"task": "t15-sub"}),
+            )]),
+            MockRound::Text("main done".into()),
+        ],
+    );
+    script(
+        "t15-sub",
+        vec![
+            MockRound::Tools(vec![(ADVISOR.to_string(), serde_json::json!({}))]),
+            MockRound::Text("sub done".into()),
+        ],
+    );
+    script(
+        crate::advisor::ADVISOR_ASK,
+        vec![MockRound::Text("Keep going.".into())],
+    );
+
+    let (agent, sink, store, _dir) = test_agent_full("t15-conv", AgentMode::Default, true);
+    enable_advisor(&store, "t15-conv");
+    run(&agent, "t15-conv", "t15-main", &CancellationToken::new()).await;
+
+    // (a) the subagent's own round offers the advisor (its type has no list)
+    let sub = captures_for("t15-sub");
+    assert_eq!(sub.len(), 2);
+    assert!(sub[0].tool_names.iter().any(|n| n == ADVISOR));
+    // (b) the consult carried the subagent persona into the advisor's prompt
+    let consult = captures_for(crate::advisor::ADVISOR_ASK);
+    assert_eq!(consult.len(), 1);
+    assert!(consult[0]
+        .system
+        .contains(crate::advisor::ADVISOR_SYSTEM_PROMPT));
+    assert!(consult[0].system.contains("You are a subagent"));
+    // the guidance came back onto the subagent's card as the tool result
+    let cards = tool_cards(&sink);
+    assert!(cards
+        .iter()
+        .any(|(s, t, _, parent)| *parent && s == "running" && t.as_deref() == Some(ADVISOR)));
+    assert!(cards.iter().any(|(s, _, r, parent)| {
+        *parent && s == "done" && r.as_deref() == Some("Keep going.")
+    }));
+    assert!(subagent_text(&sink).contains("sub done"));
+
+    // (c) a subagent type whose tool list omits the advisor never sees it
+    script(
+        "t15b-main",
+        vec![
+            MockRound::Tools(vec![(
+                SUBAGENT.into(),
+                serde_json::json!({"task": "t15b-sub", "agent": "Explore"}),
+            )]),
+            MockRound::Text("main done".into()),
+        ],
+    );
+    script("t15b-sub", vec![MockRound::Text("explored".into())]);
+
+    let (agent, _sink, store, _dir) = test_agent_full("t15b-conv", AgentMode::Default, true);
+    enable_advisor(&store, "t15b-conv");
+    run(&agent, "t15b-conv", "t15b-main", &CancellationToken::new()).await;
+
+    let sub = captures_for("t15b-sub");
+    assert_eq!(sub.len(), 1);
+    assert!(!sub[0].tool_names.iter().any(|n| n == ADVISOR));
+    assert!(sub[0].tool_names.contains(&"ducky__fs_read".to_string()));
 }
 
 // ---------------------------------------------------------------------------
