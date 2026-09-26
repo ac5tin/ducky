@@ -97,8 +97,8 @@ export const settingsSet = (settings: {
   /** null clears the default effort; undefined leaves it unchanged. */
   default_effort?: EffortLevel | null;
   advisor_enabled_by_default?: boolean;
-  advisor_provider_id?: string | null;
-  advisor_model?: string | null;
+  advisor_provider_id?: string;
+  advisor_model?: string;
   /** null clears advisor effort; undefined leaves it unchanged. */
   advisor_effort?: EffortLevel | null;
   default_mode?: AgentMode;
