@@ -29,7 +29,7 @@ pub fn build_messages(history: &[Msg], tool_names: &[String], executor_system: &
         tool_names.join(", ")
     };
     let system = format!(
-        "{ADVISOR_SYSTEM_PROMPT}\n\nThe executor is running under this system prompt:\n{executor_system}\n\nTools the executor can call: {joined}"
+        "{ADVISOR_SYSTEM_PROMPT}\n\nThe executor is running under this system prompt:\n<executor-system-prompt>\n{executor_system}\n</executor-system-prompt>\n\nTools the executor can call: {joined}"
     );
 
     let mut transcript = history.to_vec();
@@ -331,6 +331,15 @@ mod tests {
         assert!(system.contains("advisor-strategy pattern"));
         assert!(system.contains("You are the executor."));
         assert!(system.contains("ducky__advisor"));
+        assert!(system.contains("<executor-system-prompt>"));
+        assert!(system.contains("</executor-system-prompt>"));
+        let prompt_start = system.find("<executor-system-prompt>").unwrap();
+        let prompt_end = system.find("</executor-system-prompt>").unwrap();
+        assert!(prompt_start < prompt_end);
+        assert!(
+            system[prompt_start + "<executor-system-prompt>".len()..prompt_end]
+                .contains("You are the executor.")
+        );
     }
 
     #[test]
