@@ -48,6 +48,20 @@ test("unresolved when the provider is gone", () => {
   assert.equal(state.mode, "unresolved");
 });
 
+// the popover writes the returned tuple back verbatim, so the raw override must
+// survive an unresolvable provider instead of being silently cleared
+test("an unresolvable override keeps its raw provider, model and effort", () => {
+  const state = advisorChipState(
+    { ...meta, advisor_provider_id: "gone", advisor_model: "m9", advisor_effort: "low" },
+    settings,
+    providers,
+  );
+  assert.equal(state.mode, "unresolved");
+  assert.equal(state.provider_id, "gone");
+  assert.equal(state.model, "m9");
+  assert.equal(state.effort, "low");
+});
+
 test("unresolved when nothing is configured", () => {
   const state = advisorChipState(meta, { ...settings, advisor_provider_id: null }, providers);
   assert.equal(state.mode, "unresolved");

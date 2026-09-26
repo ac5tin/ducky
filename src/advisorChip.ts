@@ -7,7 +7,10 @@ import type {
 
 export interface AdvisorChipState {
   mode: "off" | "on" | "unresolved";
-  /** The resolved provider, or null when nothing usable is configured. */
+  /**
+   * The raw pick to write back, which can name a provider that is no longer
+   * configured (`mode: "unresolved"`); null when none is selected.
+   */
   provider_id: string | null;
   /** Raw pick; `""` means "the provider's default model". */
   model: string;
@@ -39,7 +42,7 @@ export function advisorChipState(
 
   return {
     mode: modeOf(enabled, resolved),
-    provider_id: resolved ? providerId : null,
+    provider_id: providerId,
     model: who.advisor_model ?? "",
     effort: who.advisor_effort ?? null,
   };

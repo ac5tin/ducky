@@ -40,7 +40,12 @@ export function AdvisorChip({ dropUp = false }: { dropUp?: boolean }) {
   const provider = providers.find((p) => p.id === state?.provider_id);
   // what "provider default" resolves to, so the label and the effort lookup
   // are not blank when no explicit model is stored
-  const model = state?.model || provider?.default_model || provider?.models[0] || "";
+  const model =
+    state?.model ||
+    provider?.default_model ||
+    provider?.models[0] ||
+    provider?.name ||
+    "";
   const efforts = useEffortLevels(provider?.kind, model);
 
   useEffect(() => {
@@ -118,7 +123,7 @@ export function AdvisorChip({ dropUp = false }: { dropUp?: boolean }) {
                 </span>
                 <select
                   className={selectClass}
-                  value={state.provider_id ?? ""}
+                  value={provider?.id ?? ""}
                   disabled={disabled}
                   onChange={(e) =>
                     save({
