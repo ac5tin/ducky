@@ -516,6 +516,10 @@ pub fn conversation_create(
         mcp_ids: None,
         mode,
         auto_readonly: false,
+        advisor_enabled: false,
+        advisor_provider_id: None,
+        advisor_model: None,
+        advisor_effort: None,
         created_at: now(),
         updated_at: now(),
     };

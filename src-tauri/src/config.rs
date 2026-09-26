@@ -287,6 +287,19 @@ pub struct AppSettings {
     /// title provider is set; the chat's effort when title provider is unset.
     #[serde(default)]
     pub title_effort: Option<EffortLevel>,
+    /// Turn the advisor on for new conversations. Off unless the user opts in.
+    #[serde(default)]
+    pub advisor_enabled_by_default: bool,
+    /// Provider for the advisor model. `None` = the advisor is not configured.
+    #[serde(default)]
+    pub advisor_provider_id: Option<String>,
+    /// Advisor model, only honored together with `advisor_provider_id`.
+    /// `None` or empty = that provider's default model.
+    #[serde(default)]
+    pub advisor_model: Option<String>,
+    /// Reasoning effort for advisor calls. `None` = the model's default.
+    #[serde(default)]
+    pub advisor_effort: Option<EffortLevel>,
     /// What Ducky does when it detects a new GitHub release.
     #[serde(default)]
     pub update_mode: UpdateMode,
@@ -321,6 +334,10 @@ impl Default for AppSettings {
             title_provider_id: None,
             title_model: None,
             title_effort: None,
+            advisor_enabled_by_default: false,
+            advisor_provider_id: None,
+            advisor_model: None,
+            advisor_effort: None,
             update_mode: UpdateMode::Prompt,
             update_check_interval_hours: default_update_check_interval_hours(),
             system_prompt: String::new(),
@@ -373,6 +390,20 @@ pub struct ConversationMeta {
     /// this false and is never retractable by the model.
     #[serde(default)]
     pub auto_readonly: bool,
+    /// Whether the advisor is available in this chat. Seeded from
+    /// `settings.advisor_enabled_by_default` at create time.
+    #[serde(default)]
+    pub advisor_enabled: bool,
+    /// Session override for the advisor provider. `Some` makes this triple
+    /// authoritative for this chat; `None` inherits the Settings triple.
+    #[serde(default)]
+    pub advisor_provider_id: Option<String>,
+    /// Advisor model; only read when `advisor_provider_id` is set.
+    #[serde(default)]
+    pub advisor_model: Option<String>,
+    /// Advisor reasoning effort; only read when `advisor_provider_id` is set.
+    #[serde(default)]
+    pub advisor_effort: Option<EffortLevel>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -1426,6 +1457,10 @@ mod tests {
             mcp_ids: None,
             mode: AgentMode::Default,
             auto_readonly: false,
+            advisor_enabled: false,
+            advisor_provider_id: None,
+            advisor_model: None,
+            advisor_effort: None,
             created_at: "t".into(),
             updated_at: "t".into(),
         };
@@ -1472,6 +1507,10 @@ mod tests {
             mcp_ids: None,
             mode: AgentMode::Default,
             auto_readonly: false,
+            advisor_enabled: false,
+            advisor_provider_id: None,
+            advisor_model: None,
+            advisor_effort: None,
             created_at: "t".into(),
             updated_at: "t".into(),
         };
@@ -1501,6 +1540,10 @@ mod tests {
             mcp_ids: None,
             mode: AgentMode::Default,
             auto_readonly: false,
+            advisor_enabled: false,
+            advisor_provider_id: None,
+            advisor_model: None,
+            advisor_effort: None,
             created_at: "t".into(),
             updated_at: "t".into(),
         };
@@ -1529,6 +1572,10 @@ mod tests {
             mcp_ids: None,
             mode: AgentMode::Default,
             auto_readonly: false,
+            advisor_enabled: false,
+            advisor_provider_id: None,
+            advisor_model: None,
+            advisor_effort: None,
             created_at: "t".into(),
             updated_at: "t".into(),
         };
@@ -1565,6 +1612,10 @@ mod tests {
             mcp_ids: None,
             mode: AgentMode::Default,
             auto_readonly: false,
+            advisor_enabled: false,
+            advisor_provider_id: None,
+            advisor_model: None,
+            advisor_effort: None,
             created_at: "t".into(),
             updated_at: "t".into(),
         };

@@ -65,6 +65,10 @@ mod tests {
             mcp_ids: None,
             mode: AgentMode::Default,
             auto_readonly: false,
+            advisor_enabled: false,
+            advisor_provider_id: None,
+            advisor_model: None,
+            advisor_effort: None,
             created_at: "t".into(),
             updated_at: "t".into(),
         }

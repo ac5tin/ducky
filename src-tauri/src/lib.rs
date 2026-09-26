@@ -3,6 +3,7 @@
 pub mod agent;
 #[cfg(test)]
 mod agent_tests;
+pub mod advisor;
 pub mod builtin;
 pub mod catalog;
 pub mod commands;
