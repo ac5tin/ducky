@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use crate::agent::Agent;
-use crate::providers::{ChatOptions, LlmProvider, Msg, ProviderEvent};
+use crate::providers::{ChatOptions, LlmProvider, Msg};
 
 /// Marks the user message that carries a compaction summary. Mirrored as
 /// `COMPACT_SUMMARY_MARKER` in `src/slashCommands.ts`.
@@ -149,41 +149,7 @@ async fn summarize(
     instructions: Option<&str>,
 ) -> Result<String, String> {
     let messages = build_summarizer_messages(history, instructions);
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<ProviderEvent>(64);
-    let call = provider.stream_chat(&messages, &[], &options, tx);
-    let mut text = String::new();
-    let mut call = std::pin::pin!(call);
-    let mut ok = false;
-    loop {
-        tokio::select! {
-            // `biased` with rx polled first is load-bearing: once the call
-            // future completes it must never be polled again (that panics
-            // with "async fn resumed after completion"). By the time it has
-            // returned, its `tx` is dropped, so recv() resolves Ready(None)
-            // and breaks the loop before the call branch is ever considered.
-            biased;
-            ev = rx.recv() => {
-                match ev {
-                    Some(ProviderEvent::TextDelta(t)) => text.push_str(&t),
-                    Some(_) => {}
-                    None => break,
-                }
-            }
-            result = &mut call => {
-                result.map_err(|e| e.to_string())?;
-                ok = true;
-            }
-        }
-    }
-    while let Ok(ev) = rx.try_recv() {
-        if let ProviderEvent::TextDelta(t) = ev {
-            text.push_str(&t);
-        }
-    }
-    if !ok {
-        return Err("The provider stream ended unexpectedly".into());
-    }
-    Ok(text)
+    crate::providers::collect_stream_text(provider, &messages, &[], &options).await
 }
 
 /// Compact a conversation: replace its history with a summary. Undo records
@@ -248,7 +214,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::ToolCall;
+    use crate::providers::{ProviderEvent, ToolCall};
 
     fn user(text: &str) -> Msg {
         Msg::User {
