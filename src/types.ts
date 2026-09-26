@@ -308,6 +308,12 @@ export interface ToolCallState {
                 /** Agent type the spawn resolved to; null = generic. */
                 agent?: string | null;
         };
+        /** Advisor consulted by a `ducky__advisor` call (session-only). */
+        advisor?: {
+                provider_id: string;
+                model: string;
+                effort?: string | null;
+        };
 }
 
 export type ContentBlockValue =

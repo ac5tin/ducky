@@ -5,6 +5,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::AgentMode;
 
+/// Identity of the advisor consulted by a `ducky__advisor` call, shown on its
+/// tool card.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdvisorMeta {
+    pub provider_id: String,
+    pub model: String,
+    /// Effort as a display string ("low"…"max"); absent = provider default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
 /// Identity/config of a `ducky__subagent` run, shown on its tool card.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubagentMeta {
@@ -75,6 +86,9 @@ pub enum BackendEvent {
         parent_tool_call_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         subagent: Option<SubagentMeta>,
+        /// Set when the call consulted the advisor, for the card's badge.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        advisor: Option<AdvisorMeta>,
         server: Option<String>,
         server_title: Option<String>,
         tool: Option<String>,
@@ -224,5 +238,36 @@ mod tests {
         .unwrap();
         assert_eq!(mode["type"], "mode_changed");
         assert_eq!(mode["mode"], "readonly");
+    }
+
+    #[test]
+    fn tool_call_update_carries_advisor_meta() {
+        let event = BackendEvent::ToolCallUpdate {
+            conversation_id: "c1".into(),
+            tool_call_id: "t1".into(),
+            status: "running".into(),
+            parent_tool_call_id: None,
+            subagent: None,
+            advisor: Some(AdvisorMeta {
+                provider_id: "p1".into(),
+                model: "m2".into(),
+                effort: Some("high".into()),
+            }),
+            server: None,
+            server_title: None,
+            tool: Some("ducky__advisor".into()),
+            args: None,
+            result_text: Some("Consulting advisor (m2 · high)…".into()),
+            structured: None,
+            content: None,
+            is_error: None,
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["advisor"]["model"], "m2");
+        let back: BackendEvent = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            back,
+            BackendEvent::ToolCallUpdate { advisor: Some(m), .. } if m.effort.as_deref() == Some("high")
+        ));
     }
 }

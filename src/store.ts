@@ -1715,6 +1715,7 @@ function stripEvent(
     "content",
     "is_error",
     "subagent",
+    "advisor",
   ] as const) {
     const value = event[key];
     if (value !== null && value !== undefined) state[key] = value;
