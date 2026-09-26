@@ -77,6 +77,17 @@ export const ToolCallCard = memo(function ToolCallCard({
         )?.name
       : undefined,
   );
+  const advisorProvider = useStore((s) =>
+    s.config?.providers.find((p) => p.id === state.advisor?.provider_id),
+  );
+  // an empty advisor model means the provider default ran, so resolve it from
+  // the provider the way the header chip does
+  const advisorModel = state.advisor
+    ? state.advisor.model ||
+      advisorProvider?.default_model ||
+      advisorProvider?.models[0] ||
+      ""
+    : "";
   const icon =
     status === "done"
       ? "check"
@@ -196,6 +207,28 @@ export const ToolCallCard = memo(function ToolCallCard({
                 </span>
               )}
             </div>
+          )}
+          {state.advisor && (
+            <div className="mb-3 flex flex-wrap items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400">
+              <span className="rounded-md bg-slate-100 px-2 py-0.5 dark:bg-slate-800">
+                {advisorProvider?.name || state.advisor.provider_id}
+              </span>
+              {advisorModel && (
+                <span className="rounded-md bg-slate-100 px-2 py-0.5 font-mono dark:bg-slate-800">
+                  {advisorModel}
+                </span>
+              )}
+              <span className="rounded-md bg-slate-100 px-2 py-0.5 dark:bg-slate-800">
+                effort: {state.advisor.effort ?? "default"}
+              </span>
+            </div>
+          )}
+          {state.advisor && status === "running" && (
+            <p className="mb-3 truncate font-mono text-[11px] text-slate-400">
+              Consulting advisor (
+              {advisorModel || advisorProvider?.name || state.advisor.provider_id}
+              {state.advisor.effort ? ` · ${state.advisor.effort}` : ""})…
+            </p>
           )}
           {isSubagent && state.subagent_activity && status === "running" && (
             <p className="mb-3 truncate font-mono text-[11px] text-slate-400">
