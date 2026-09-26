@@ -88,7 +88,7 @@ pub enum BackendEvent {
         subagent: Option<SubagentMeta>,
         /// Set when the call consulted the advisor, for the card's badge.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        advisor: Option<AdvisorMeta>,
+        advisor: Option<Box<AdvisorMeta>>,
         server: Option<String>,
         server_title: Option<String>,
         tool: Option<String>,
@@ -248,11 +248,11 @@ mod tests {
             status: "running".into(),
             parent_tool_call_id: None,
             subagent: None,
-            advisor: Some(AdvisorMeta {
+            advisor: Some(Box::new(AdvisorMeta {
                 provider_id: "p1".into(),
                 model: "m2".into(),
                 effort: Some("high".into()),
-            }),
+            })),
             server: None,
             server_title: None,
             tool: Some("ducky__advisor".into()),

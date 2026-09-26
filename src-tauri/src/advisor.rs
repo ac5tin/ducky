@@ -33,22 +33,33 @@ pub fn build_messages(history: &[Msg], tool_names: &[String], executor_system: &
     );
 
     let mut transcript = history.to_vec();
-    let trailing_tool_call = transcript.last().and_then(|message| match message {
-        Msg::Assistant {
-            text, tool_calls, ..
-        } if !tool_calls.is_empty() => Some(text.is_empty()),
-        _ => None,
+    // The consult can be batched with other calls: the assistant message then
+    // still carries the in-flight `ducky__advisor` call while the earlier
+    // calls' results are already in the history. Providers reject an assistant
+    // `tool_use` without a matching `tool_result`, so strip every unanswered
+    // call of the last assistant message that carries any.
+    let last_calls = transcript.iter().rposition(|message| {
+        matches!(message, Msg::Assistant { tool_calls, .. } if !tool_calls.is_empty())
     });
-    match trailing_tool_call {
-        Some(true) => {
-            transcript.pop();
+    if let Some(index) = last_calls {
+        let answered: Vec<String> = transcript[index + 1..]
+            .iter()
+            .filter_map(|message| match message {
+                Msg::ToolResult { call_id, .. } => Some(call_id.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut left_empty = false;
+        if let Msg::Assistant {
+            text, tool_calls, ..
+        } = &mut transcript[index]
+        {
+            tool_calls.retain(|call| answered.contains(&call.id));
+            left_empty = text.is_empty() && tool_calls.is_empty();
         }
-        Some(false) => {
-            if let Some(Msg::Assistant { tool_calls, .. }) = transcript.last_mut() {
-                tool_calls.clear();
-            }
+        if left_empty {
+            transcript.remove(index);
         }
-        None => {}
     }
 
     let mut messages = Vec::with_capacity(transcript.len() + 2);
@@ -121,12 +132,19 @@ pub fn resolve(
     })
 }
 
+/// Validate one advisor pick. A disable is never refused: when `enabled` is
+/// `false` the pick is accepted as passed, so a dangling provider can never
+/// trap the switch on.
 pub fn validate_selection(
+    enabled: bool,
     provider_id: Option<&str>,
     model: Option<&str>,
     effort: Option<EffortLevel>,
     providers: &[ProviderConfig],
 ) -> Result<(), String> {
+    if !enabled {
+        return Ok(());
+    }
     let provider_id = provider_id.filter(|id| !id.trim().is_empty());
     if let Some(provider_id) = provider_id {
         if !providers.iter().any(|provider| provider.id == provider_id) {
@@ -257,30 +275,58 @@ mod tests {
     #[test]
     fn validate_selection_rules() {
         let providers = vec![provider("p1")];
-        assert!(validate_selection(None, None, None, &providers).is_ok());
-        assert!(
-            validate_selection(Some("p1"), Some("m1"), Some(EffortLevel::High), &providers).is_ok()
-        );
-        let err = validate_selection(Some("gone"), None, None, &providers).unwrap_err();
+        assert!(validate_selection(true, None, None, None, &providers).is_ok());
+        assert!(validate_selection(
+            true,
+            Some("p1"),
+            Some("m1"),
+            Some(EffortLevel::High),
+            &providers
+        )
+        .is_ok());
+        let err = validate_selection(true, Some("gone"), None, None, &providers).unwrap_err();
         assert_eq!(err, "That provider is no longer configured");
-        let err = validate_selection(None, Some("m1"), None, &providers).unwrap_err();
+        let err = validate_selection(true, None, Some("m1"), None, &providers).unwrap_err();
         assert_eq!(err, "Pick a provider before setting a model");
-        let err = validate_selection(None, None, Some(EffortLevel::High), &providers).unwrap_err();
+        let err =
+            validate_selection(true, None, None, Some(EffortLevel::High), &providers).unwrap_err();
         assert_eq!(err, "Pick a provider before setting a model");
+    }
+
+    #[test]
+    fn validate_selection_never_blocks_a_disable() {
+        let providers = vec![provider("p1")];
+        // an enable naming a deleted provider is still refused…
+        assert_eq!(
+            validate_selection(true, Some("gone"), Some("m1"), Some(EffortLevel::High), &providers)
+                .unwrap_err(),
+            "That provider is no longer configured"
+        );
+        // …but a disable is always accepted, whatever the stored pick is
+        assert!(validate_selection(false, Some("gone"), None, None, &providers).is_ok());
+        assert!(validate_selection(false, None, Some("m1"), None, &providers).is_ok());
+        assert!(validate_selection(
+            false,
+            Some("gone"),
+            Some("m1"),
+            Some(EffortLevel::High),
+            &providers
+        )
+        .is_ok());
     }
 
     #[test]
     fn selection_validation_treats_blank_as_unset() {
         let providers = vec![provider("p1")];
         // a blank provider id clears the override: nothing else is set → Ok
-        assert!(validate_selection(Some(""), None, None, &providers).is_ok());
+        assert!(validate_selection(true, Some(""), None, None, &providers).is_ok());
         // but a model without a provider is still rejected
         assert_eq!(
-            validate_selection(Some(""), Some("m1"), None, &providers).unwrap_err(),
+            validate_selection(true, Some(""), Some("m1"), None, &providers).unwrap_err(),
             "Pick a provider before setting a model"
         );
         assert_eq!(
-            validate_selection(None, Some("m1"), None, &providers).unwrap_err(),
+            validate_selection(true, None, Some("m1"), None, &providers).unwrap_err(),
             "Pick a provider before setting a model"
         );
     }
@@ -396,6 +442,51 @@ mod tests {
             panic!("ask is a user message")
         };
         assert_eq!(text, ADVISOR_ASK);
+    }
+
+    #[test]
+    fn build_messages_strips_only_the_unanswered_calls_of_a_batch() {
+        // a batch ran in order: `fs_read` has its result in the history while
+        // the in-flight advisor call does not — providers reject that shape
+        let history = vec![
+            user("do the thing"),
+            assistant(
+                "let me look",
+                vec![("c1", "ducky__fs_read"), ("c2", "ducky__advisor")],
+            ),
+            tool_result("c1", "file contents"),
+        ];
+        let msgs = build_messages(&history, &names(), "sys");
+        let Msg::Assistant {
+            text, tool_calls, ..
+        } = &msgs[2]
+        else {
+            panic!("assistant message survives with its text");
+        };
+        assert_eq!(text, "let me look");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "c1");
+        assert!(matches!(msgs.last(), Some(Msg::User { text, .. }) if text == ADVISOR_ASK));
+
+        // the orderings that already worked: in-flight as the only call,
+        // with text and with none
+        for history in [
+            vec![
+                user("do the thing"),
+                assistant("I should ask the advisor", vec![("c1", "ducky__advisor")]),
+            ],
+            vec![
+                user("do the thing"),
+                tool_result("c0", "some result"),
+                assistant("", vec![("c1", "ducky__advisor")]),
+            ],
+        ] {
+            let msgs = build_messages(&history, &names(), "sys");
+            assert!(!msgs.iter().any(
+                |m| matches!(m, Msg::Assistant { tool_calls, .. } if !tool_calls.is_empty())
+            ));
+            assert!(matches!(msgs.last(), Some(Msg::User { text, .. }) if text == ADVISOR_ASK));
+        }
     }
 
     #[test]

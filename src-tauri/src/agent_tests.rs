@@ -1059,7 +1059,7 @@ fn advisor_events(
             } => Some((
                 tool_call_id.clone(),
                 status.clone(),
-                advisor.clone(),
+                advisor.as_deref().cloned(),
                 result_text.clone(),
             )),
             _ => None,

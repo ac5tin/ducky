@@ -285,6 +285,11 @@ pub fn provider_delete(state: State<'_, Arc<AppState>>, id: String) -> Result<()
             c.settings.title_model = None;
             c.settings.title_effort = None;
         }
+        if c.settings.advisor_provider_id.as_deref() == Some(id.as_str()) {
+            c.settings.advisor_provider_id = None;
+            c.settings.advisor_model = None;
+            c.settings.advisor_effort = None;
+        }
     }
     state
         .store
@@ -627,6 +632,9 @@ pub fn conversation_set_effort(
     state.store.save_config().map_err(|e| e.to_string())
 }
 
+/// Set this chat's advisor switch and pick. A disable (`enabled: false`) is
+/// stored exactly as passed, including a pick whose provider was deleted —
+/// validate_selection only guards an enable.
 #[tauri::command]
 pub fn conversation_set_advisor(
     state: State<'_, Arc<AppState>>,
@@ -641,6 +649,7 @@ pub fn conversation_set_advisor(
     {
         let mut c = state.store.config.lock().unwrap();
         crate::advisor::validate_selection(
+            enabled,
             provider_id.as_deref(),
             model.as_deref(),
             effort,

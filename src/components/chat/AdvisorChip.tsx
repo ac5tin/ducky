@@ -38,15 +38,18 @@ export function AdvisorChip({ dropUp = false }: { dropUp?: boolean }) {
   const conversation = config?.conversations.find((c) => c.id === activeId) ?? null;
   const state = config ? advisorChipState(conversation, config.settings, providers) : null;
   const provider = providers.find((p) => p.id === state?.provider_id);
-  // what "provider default" resolves to, so the label and the effort lookup
-  // are not blank when no explicit model is stored
-  const model =
+  // what the label shows when no explicit model is stored; the provider name
+  // is a last-resort label only
+  const labelModel =
     state?.model ||
     provider?.default_model ||
     provider?.models[0] ||
     provider?.name ||
     "";
-  const efforts = useEffortLevels(provider?.kind, model);
+  // the effort pills need a real model id — a provider name is not one
+  const effortModel =
+    state?.model || provider?.default_model || provider?.models[0] || "";
+  const efforts = useEffortLevels(provider?.kind, effortModel);
 
   useEffect(() => {
     if (!open) return;
@@ -75,8 +78,8 @@ export function AdvisorChip({ dropUp = false }: { dropUp?: boolean }) {
   let label: string;
   if (state.mode === "off") label = "Advisor off";
   else if (state.mode === "unresolved") label = "Advisor: pick a model";
-  else if (state.effort) label = `Advisor: ${model} · ${EFFORT_LABELS[state.effort]}`;
-  else label = `Advisor: ${model}`;
+  else if (state.effort) label = `Advisor: ${labelModel} · ${EFFORT_LABELS[state.effort]}`;
+  else label = `Advisor: ${labelModel}`;
 
   return (
     <div className="relative">
@@ -194,7 +197,12 @@ export function AdvisorChip({ dropUp = false }: { dropUp?: boolean }) {
               <button
                 className="w-full border-t border-slate-200 px-3 py-2 text-left text-xs font-medium text-sky-600 transition hover:bg-slate-50 dark:border-slate-700 dark:text-sky-400 dark:hover:bg-slate-800"
                 onClick={() =>
-                  save({ enabled: true, provider_id: null, model: null, effort: null })
+                  save({
+                    enabled: current.enabled,
+                    provider_id: null,
+                    model: null,
+                    effort: null,
+                  })
                 }
               >
                 Reset to default

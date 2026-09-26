@@ -768,10 +768,10 @@ impl Agent {
             spec.model.clone()
         };
 
-        let label = if spec.model.trim().is_empty() {
-            spec.provider_id.clone()
+        let label = if model.trim().is_empty() {
+            "provider default".to_owned()
         } else {
-            spec.model.clone()
+            model.clone()
         };
         let result_text = match spec.effort {
             Some(effort) => format!("Consulting advisor ({label} · {})…", effort.as_str()),
