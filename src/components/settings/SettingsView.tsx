@@ -110,6 +110,13 @@ export function SettingsView() {
           <TitleModelSection />
         </Section>
 
+        <Section
+          title="Advisor"
+          description="Off in each chat unless you turn it on there, or on by default here. Every chat can override the model and effort."
+        >
+          <AdvisorSection />
+        </Section>
+
         {/* Permissions */}
         <Section
           title="Tool permissions"
@@ -828,6 +835,121 @@ function TitleModelSection() {
   );
 }
 
+function AdvisorSection() {
+  const config = useStore((s) => s.config);
+  const refreshConfig = useStore((s) => s.refreshConfig);
+  const toast = useStore((s) => s.toast);
+
+  const enabled = config?.settings.advisor_enabled_by_default ?? false;
+  const providerId = config?.settings.advisor_provider_id ?? null;
+  const modelId = config?.settings.advisor_model ?? null;
+  const provider = providerId
+    ? (config?.providers.find((p) => p.id === providerId) ?? null)
+    : null;
+  const resolvedModel =
+    (provider && modelId) ||
+    provider?.default_model ||
+    provider?.models[0] ||
+    "";
+  const efforts = useEffortLevels(provider?.kind, resolvedModel || undefined);
+  const effort = config?.settings.advisor_effort ?? null;
+
+  if (!config) return null;
+
+  const write = async (p: Parameters<typeof api.settingsSet>[0]) => {
+    try {
+      await api.settingsSet(p);
+      await refreshConfig();
+    } catch (e) {
+      toast("error", `${e}`);
+    }
+  };
+
+  // "" clears provider/model (null would be skipped as "unchanged"); the
+  // effort is the clearable field, so null resets it to the model default.
+  const save = (
+    nextProviderId: string,
+    nextModelId: string,
+    eff: EffortLevel | null,
+  ) =>
+    write({
+      advisor_provider_id: nextProviderId,
+      advisor_model: nextModelId,
+      advisor_effort: eff,
+    });
+
+  return (
+    <div className="space-y-4">
+      <label className="flex items-center gap-2 text-sm">
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={(e) =>
+            write({ advisor_enabled_by_default: e.target.checked })
+          }
+        />
+        On by default in new chats
+      </label>
+      <div className="grid gap-4 sm:grid-cols-2">
+        <div>
+          <div className="mb-1.5 text-sm font-medium">Provider</div>
+          <select
+            className={inputClass}
+            value={providerId ?? ""}
+            onChange={(e) => save(e.target.value, "", null)}
+          >
+            <option value="">Not configured</option>
+            {config.providers.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <div className="mb-1.5 text-sm font-medium">Model</div>
+          <select
+            className={inputClass}
+            value={modelId ?? ""}
+            disabled={!provider}
+            onChange={(e) => save(providerId ?? "", e.target.value, effort)}
+          >
+            <option value="">Provider default</option>
+            {(provider?.models ?? []).map((m) => (
+              <option key={m} value={m}>
+                {m}
+              </option>
+            ))}
+          </select>
+        </div>
+      </div>
+      {provider && efforts.length > 0 && (
+        <div>
+          <div className="mb-1.5 text-sm font-medium">Reasoning effort</div>
+          <div className="flex flex-wrap gap-1">
+            <EffortPill
+              selected={effort === null}
+              label="Default"
+              onClick={() => save(providerId ?? "", modelId ?? "", null)}
+            />
+            {efforts.map((level) => (
+              <EffortPill
+                key={level}
+                selected={effort === level}
+                label={EFFORT_LABELS[level]}
+                onClick={() => save(providerId ?? "", modelId ?? "", level)}
+              />
+            ))}
+          </div>
+          <p className="mt-1.5 text-xs text-slate-400">
+            Applies to {resolvedModel || "the provider's default model"}.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ProviderEditorModal({
   provider,
   onClose,
@@ -962,6 +1084,7 @@ const BUILTIN_TOOL_OPTIONS: [string, string][] = [
   ["ducky__web_fetch", "Fetch URL"],
   ["ducky__web_search", "Web search"],
   ["ducky__subagent", "Spawn subagents"],
+  ["ducky__advisor", "Consult advisor"],
 ];
 
 function chipClass() {
