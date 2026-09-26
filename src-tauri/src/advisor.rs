@@ -102,18 +102,22 @@ mod tests {
 
     #[test]
     fn resolve_off_when_disabled() {
-        let mut settings = AppSettings::default();
-        settings.advisor_provider_id = Some("p1".into());
-        settings.advisor_model = Some("m2".into());
+        let settings = AppSettings {
+            advisor_provider_id: Some("p1".into()),
+            advisor_model: Some("m2".into()),
+            ..Default::default()
+        };
         assert!(resolve(&settings, &meta(), &[provider("p1")]).is_none());
     }
 
     #[test]
     fn resolve_uses_the_session_triple_when_set() {
-        let mut settings = AppSettings::default();
-        settings.advisor_provider_id = Some("p1".into());
-        settings.advisor_model = Some("m1".into());
-        settings.advisor_effort = Some(EffortLevel::Low);
+        let settings = AppSettings {
+            advisor_provider_id: Some("p1".into()),
+            advisor_model: Some("m1".into()),
+            advisor_effort: Some(EffortLevel::Low),
+            ..Default::default()
+        };
         let mut m = meta();
         m.advisor_enabled = true;
         m.advisor_provider_id = Some("p2".into());
@@ -128,8 +132,10 @@ mod tests {
 
     #[test]
     fn resolve_none_when_the_session_provider_is_gone() {
-        let mut settings = AppSettings::default();
-        settings.advisor_provider_id = Some("p1".into());
+        let settings = AppSettings {
+            advisor_provider_id: Some("p1".into()),
+            ..Default::default()
+        };
         let mut m = meta();
         m.advisor_enabled = true;
         m.advisor_provider_id = Some("gone".into());
@@ -138,10 +144,12 @@ mod tests {
 
     #[test]
     fn resolve_falls_back_to_the_settings_triple() {
-        let mut settings = AppSettings::default();
-        settings.advisor_provider_id = Some("p1".into());
-        settings.advisor_model = Some("m2".into());
-        settings.advisor_effort = Some(EffortLevel::Medium);
+        let settings = AppSettings {
+            advisor_provider_id: Some("p1".into()),
+            advisor_model: Some("m2".into()),
+            advisor_effort: Some(EffortLevel::Medium),
+            ..Default::default()
+        };
         let mut m = meta();
         m.advisor_enabled = true;
         m.advisor_effort = Some(EffortLevel::XHigh); // ignored: the triple is atomic
@@ -161,8 +169,10 @@ mod tests {
 
     #[test]
     fn resolve_empty_model_means_the_provider_default() {
-        let mut settings = AppSettings::default();
-        settings.advisor_provider_id = Some("p1".into());
+        let settings = AppSettings {
+            advisor_provider_id: Some("p1".into()),
+            ..Default::default()
+        };
         let mut m = meta();
         m.advisor_enabled = true;
         let spec = resolve(&settings, &m, &[provider("p1")]).unwrap();
