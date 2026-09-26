@@ -1120,6 +1120,13 @@ async fn advisor_consult_returns_guidance_to_the_executor() {
 
     // the card: running with the advisor identity, then done with the guidance
     let events = advisor_events(&sink);
+    assert!(events
+        .iter()
+        .any(|(_, s, meta, _)| s == "running" && meta.is_some()));
+    assert!(
+        events.iter().any(|(_, s, _, _)| s == "done"),
+        "the card settles as done"
+    );
     let running = events
         .iter()
         .position(|(_, s, _, _)| s == "running")
