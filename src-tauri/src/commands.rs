@@ -13,6 +13,7 @@ use crate::config::{
     Store, SubagentConfig, Theme, ToolRule, UndoRecord,
 };
 use crate::mcp::bridge::{ApprovalDecision, PlanDecision};
+use crate::mcp::manager::McpManager;
 use crate::providers::Msg;
 use crate::state::AppState;
 
@@ -830,6 +831,102 @@ pub fn conversation_get(
         .store
         .load_conversation(&id)
         .ok_or_else(|| "Conversation not found".to_string())
+}
+
+/// Build the export payload for one conversation: the raw transcript file
+/// (so undo records and future keys survive), the append-only debug log
+/// (per-turn model/effort/tools/usage/stop + per-tool timings), and a
+/// clearly labelled `runtime_now` snapshot of what shapes requests *right
+/// now* — not a historical record. No secrets: provider config and keys
+/// are never read here.
+pub(crate) fn build_export_payload(
+    store: &Store,
+    manager: &McpManager,
+    id: &str,
+    exported_at: String,
+) -> Result<serde_json::Value, String> {
+    let transcript = std::fs::read_to_string(store.conversation_path(id))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+    let (meta, _) = store
+        .load_conversation(id)
+        .ok_or_else(|| "Conversation not found".to_string())?;
+    let conversation = transcript.unwrap_or_else(|| {
+        serde_json::json!({
+            "meta": serde_json::to_value(&meta).unwrap_or_default(),
+            "messages": [],
+        })
+    });
+    let mode = meta.mode;
+    let (system_prompt, working_dir, max_tool_iterations, show_reasoning) = {
+        let cfg = store.config.lock().unwrap();
+        (
+            cfg.settings.system_prompt.clone(),
+            cfg.settings.effective_working_dir(&store.home_dir),
+            cfg.settings.max_tool_iterations,
+            cfg.settings.show_reasoning,
+        )
+    };
+    let system_message_now = crate::agent::system_message(
+        &working_dir,
+        &crate::agent::RunScope::Main,
+        &system_prompt,
+        mode,
+    );
+    let mut tools_now: Vec<serde_json::Value> = manager
+        .aggregated_tools()
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "name": t.qualified_name,
+                "server": t.server_id,
+                "read_only_hint": t.read_only_hint,
+                "description": t.description,
+            })
+        })
+        .collect();
+    // builtins are part of every request's tool list; without them the
+    // inventory shows 0 tools whenever no MCP server is connected
+    tools_now.extend(crate::builtin::tool_defs().iter().map(|t| {
+        serde_json::json!({
+            "name": t.name,
+            "server": "builtin",
+            "read_only": crate::builtin::lookup(&t.name)
+                .map(|b| b.read_only)
+                .unwrap_or(false),
+            "description": t.description,
+        })
+    }));
+    Ok(serde_json::json!({
+        "app": {
+            "name": env!("CARGO_PKG_NAME"),
+            "version": env!("CARGO_PKG_VERSION"),
+        },
+        "exported_at": exported_at,
+        "conversation": conversation,
+        "debug_log": store.load_debug(id),
+        "runtime_now": {
+            "system_message": system_message_now,
+            "working_dir": working_dir,
+            "settings": {
+                "max_tool_iterations": max_tool_iterations,
+                "show_reasoning": show_reasoning,
+            },
+            "tools": tools_now,
+        },
+    }))
+}
+
+#[tauri::command]
+pub fn conversation_export(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    path: String,
+) -> Result<String, String> {
+    let payload = build_export_payload(&state.store, &state.manager, &id, now())?;
+    let bytes = serde_json::to_vec_pretty(&payload).map_err(|e| e.to_string())?;
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    Ok(path)
 }
 
 fn cancel_title_gen(state: &AppState, id: &str) {
@@ -2074,5 +2171,75 @@ mod tests {
         let mapped = runtimes.lock().unwrap();
         assert_eq!(mapped.len(), 1);
         assert!(Arc::ptr_eq(mapped.get("c1").unwrap(), &follow_up));
+    }
+
+    #[test]
+    fn export_payload_has_transcript_debug_and_no_secrets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::new(tmp.path(), tmp.path().to_path_buf()).unwrap());
+        let meta = ConversationMeta {
+            id: "exp-1".into(),
+            title: "Export test".into(),
+            provider_id: "p".into(),
+            model: "m".into(),
+            effort: None,
+            mcp_ids: None,
+            mode: config::AgentMode::Default,
+            auto_readonly: false,
+            advisor_enabled: false,
+            advisor_provider_id: None,
+            advisor_model: None,
+            advisor_effort: None,
+            created_at: "t".into(),
+            updated_at: "t".into(),
+        };
+        let messages = vec![serde_json::json!({ "kind": "user", "text": "hi" })];
+        store.save_conversation(&meta, &messages, &[]).unwrap();
+        store.append_debug(
+            "exp-1",
+            serde_json::json!({ "type": "turn_start", "model": "m" }),
+        );
+        store.append_debug(
+            "exp-1",
+            serde_json::json!({ "type": "turn_end", "duration_ms": 7 }),
+        );
+
+        let sink = Arc::new(crate::events::CollectingSink::default());
+        let bridge = Arc::new(crate::mcp::bridge::InteractiveBridge::new(
+            sink.clone(),
+            store.clone(),
+        ));
+        let manager = McpManager::new(store.clone(), bridge, sink);
+
+        let payload = build_export_payload(&store, &manager, "exp-1", "now".into()).unwrap();
+
+        // the transcript survives untouched
+        assert_eq!(payload["conversation"]["messages"][0]["text"], "hi");
+        assert_eq!(payload["conversation"]["meta"]["title"], "Export test");
+        // the debug log rides along
+        assert_eq!(payload["debug_log"].as_array().unwrap().len(), 2);
+        // runtime snapshot is present and labelled as current state
+        assert!(payload["runtime_now"]["system_message"].is_object());
+        assert!(payload["runtime_now"]["settings"]["max_tool_iterations"]
+            .as_u64()
+            .is_some());
+        // structural guardrail: no credential-shaped keys anywhere
+        fn has_key(v: &serde_json::Value, key: &str) -> bool {
+            match v {
+                serde_json::Value::Object(m) => {
+                    m.contains_key(key) || m.values().any(|x| has_key(x, key))
+                }
+                serde_json::Value::Array(a) => a.iter().any(|x| has_key(x, key)),
+                _ => false,
+            }
+        }
+        assert!(!has_key(&payload, "api_key"));
+        assert!(!has_key(&payload, "bearer_token"));
+        // the tool inventory includes builtins, not just MCP tools
+        assert!(payload["runtime_now"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"] == "ducky__fs_read"));
     }
 }

@@ -46,7 +46,7 @@ fn stream_idle_timeout() -> std::time::Duration {
 /// snapshot, so config edits mid-run cannot change a running subagent's
 /// persona, overrides or tool allowlist.
 #[derive(Clone)]
-struct SubagentSpec {
+pub(crate) struct SubagentSpec {
     name: String,
     description: String,
     system_prompt: String,
@@ -175,7 +175,7 @@ fn resolve_spec_model(
 /// pipeline and approvals but stream into their parent's tool card instead
 /// of the conversation, and never touch the conversation file.
 #[derive(Clone)]
-enum RunScope {
+pub(crate) enum RunScope {
     Main,
     Subagent {
         tool_call_id: String,
@@ -292,7 +292,7 @@ fn mode_prompt(mode: AgentMode, scope: &RunScope) -> Option<&'static str> {
 /// final answer; spawns via a configured agent type also get that type's
 /// persona. Main runs in a non-default mode get that mode's block; subagent
 /// runs get only a short read-only/plan variant.
-fn system_message(
+pub(crate) fn system_message(
     cwd: &std::path::Path,
     scope: &RunScope,
     main_prompt: &str,
@@ -374,6 +374,58 @@ pub type SteeringQueue = Mutex<VecDeque<PendingSteer>>;
 pub struct ConversationRuntime {
     pub ct: CancellationToken,
     pub steering: Arc<SteeringQueue>,
+}
+
+/// Closes one model-round debug record on every exit path — normal end,
+/// cancel, stall timeout, provider error — so a turn that never finished
+/// still leaves a `turn_end` line with its elapsed time. `end` marks the
+/// clean path; a dropped, unfinished guard logs `completed: false`.
+struct TurnDebug {
+    store: Arc<Store>,
+    conversation_id: String,
+    line: serde_json::Value,
+    started: std::time::Instant,
+    completed: bool,
+}
+
+impl TurnDebug {
+    fn new(
+        store: Arc<Store>,
+        conversation_id: &str,
+        line: serde_json::Value,
+        started: std::time::Instant,
+    ) -> Self {
+        Self {
+            store,
+            conversation_id: conversation_id.to_string(),
+            line,
+            started,
+            completed: false,
+        }
+    }
+
+    fn write(&self, mut fields: serde_json::Value) {
+        let mut record = self.line.clone();
+        if let (Some(dst), Some(src)) = (record.as_object_mut(), fields.as_object_mut()) {
+            dst.extend(src.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        record["type"] = serde_json::json!("turn_end");
+        record["duration_ms"] = serde_json::json!(self.started.elapsed().as_millis() as u64);
+        self.store.append_debug(&self.conversation_id, record);
+    }
+
+    fn end(mut self, fields: serde_json::Value) {
+        self.completed = true;
+        self.write(fields);
+    }
+}
+
+impl Drop for TurnDebug {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.write(serde_json::json!({ "completed": false }));
+        }
+    }
 }
 
 impl Agent {
@@ -1123,6 +1175,34 @@ impl Agent {
                 effort,
                 session_id: Some(conversation_id.to_string()),
             };
+            // debug log: one record per model round — request context at
+            // start, timing/usage/stop at end
+            let scope_line = serde_json::json!({
+                "scope": if scope.is_main() { "main" } else { "subagent" },
+                "depth": scope.depth(),
+                "parent_call_id": scope.parent_tool_call_id(),
+            });
+            let mut turn_start = scope_line.clone();
+            turn_start["type"] = "turn_start".into();
+            turn_start["ts"] = chrono::Utc::now().to_rfc3339().into();
+            turn_start["model"] = model.clone().into();
+            turn_start["effort"] = serde_json::to_value(effort).unwrap_or_default();
+            turn_start["tools_offered"] = serde_json::Value::Array(
+                tools
+                    .iter()
+                    .map(|t| serde_json::Value::String(t.name.clone()))
+                    .collect(),
+            );
+            self.store.append_debug(conversation_id, turn_start);
+            let debug_turn = TurnDebug::new(
+                self.store.clone(),
+                conversation_id,
+                scope_line.clone(),
+                std::time::Instant::now(),
+            );
+            let mut usage_input: Option<u64> = None;
+            let mut usage_output: Option<u64> = None;
+
             let (tx, mut rx) = tokio::sync::mpsc::channel::<ProviderEvent>(256);
             let provider_call = provider.stream_chat(&snapshot, &tools, &options, tx);
 
@@ -1183,6 +1263,14 @@ impl Agent {
                                     .push_str(&fragment);
                             }
                             Some(ProviderEvent::Usage { input, output }) => {
+                                // streams may split usage across events: keep
+                                // the latest value seen per side
+                                if input.is_some() {
+                                    usage_input = input;
+                                }
+                                if output.is_some() {
+                                    usage_output = output;
+                                }
                                 self.sink.emit(BackendEvent::Usage {
                                     conversation_id: conversation_id.to_string(),
                                     input,
@@ -1205,6 +1293,12 @@ impl Agent {
                         self.emit_text_delta(conversation_id, scope, &t);
                     }
                     ProviderEvent::Usage { input, output } => {
+                        if input.is_some() {
+                            usage_input = input;
+                        }
+                        if output.is_some() {
+                            usage_output = output;
+                        }
                         self.sink.emit(BackendEvent::Usage {
                             conversation_id: conversation_id.to_string(),
                             input,
@@ -1215,6 +1309,11 @@ impl Agent {
                 }
             }
             let stop = stop.ok_or("The provider stream ended unexpectedly")?;
+            debug_turn.end(serde_json::json!({
+                "completed": true,
+                "stop_reason": serde_json::to_value(stop).unwrap_or_default(),
+                "usage": { "input": usage_input, "output": usage_output },
+            }));
 
             let calls: Vec<ToolCall> = tool_calls
                 .into_iter()
@@ -1290,7 +1389,20 @@ impl Agent {
                 if ct.is_cancelled() {
                     return Err("cancelled".into());
                 }
-                let tool_result = if let Some(handle) = spawned.remove(&call.id) {
+                // debug log: tool_start is written before execution, so a
+                // hung call leaves a start line with no matching end line
+                let mut tool_start = scope_line.clone();
+                tool_start["type"] = "tool_start".into();
+                tool_start["ts"] = chrono::Utc::now().to_rfc3339().into();
+                tool_start["call_id"] = call.id.clone().into();
+                tool_start["name"] = call.name.clone().into();
+                if !scope.is_main() {
+                    // subagent tool traffic lives in no transcript — record it here
+                    tool_start["arguments"] = call.arguments.clone();
+                }
+                self.store.append_debug(conversation_id, tool_start);
+                let tool_started = std::time::Instant::now();
+                let (tool_result, tool_is_error) = if let Some(handle) = spawned.remove(&call.id) {
                     self.join_subagent(
                         conversation_id,
                         &call.id,
@@ -1319,16 +1431,28 @@ impl Agent {
                                 scope.parent_tool_call_id(),
                             )
                         }
-                        Err(text) => text,
+                        Err(text) => (text, true),
                     }
                 } else {
                     self.execute_tool(conversation_id, &call, scope, ct, history, &tools)
                         .await
                 };
+                let mut tool_end = scope_line.clone();
+                tool_end["type"] = "tool_end".into();
+                tool_end["ts"] = chrono::Utc::now().to_rfc3339().into();
+                tool_end["call_id"] = call.id.clone().into();
+                tool_end["name"] = call.name.clone().into();
+                tool_end["duration_ms"] =
+                    serde_json::json!(tool_started.elapsed().as_millis() as u64);
+                tool_end["is_error"] = tool_is_error.into();
+                if !scope.is_main() {
+                    tool_end["result_text"] = tool_result.clone().into();
+                }
+                self.store.append_debug(conversation_id, tool_end);
                 history.push(Msg::ToolResult {
                     call_id: call.id.clone(),
                     text: tool_result,
-                    is_error: false,
+                    is_error: tool_is_error,
                 });
                 if scope.is_main() {
                     self.persist(conversation_id, history)?;
@@ -1641,9 +1765,9 @@ impl Agent {
         call_id: &str,
         result: Result<String, tokio::task::JoinError>,
         parent: Option<&str>,
-    ) -> String {
+    ) -> (String, bool) {
         match result {
-            Ok(text) => text,
+            Ok(text) => (text, false),
             Err(e) => {
                 let msg = format!("subagent task failed: {e}");
                 self.emit_tool_update(
@@ -1653,7 +1777,7 @@ impl Agent {
                     serde_json::json!({ "result_text": msg, "is_error": true }),
                     parent,
                 );
-                format!("Error: {msg}")
+                (format!("Error: {msg}"), true)
             }
         }
     }
@@ -1764,7 +1888,7 @@ impl Agent {
         ct: &CancellationToken,
         history: &[Msg],
         tools: &[ToolDef],
-    ) -> String {
+    ) -> (String, bool) {
         let parent = scope.parent_tool_call_id();
         let (entry, server_title) = match self.resolve_tool(&call.name) {
             Ok(v) => v,
@@ -1776,7 +1900,7 @@ impl Agent {
                     serde_json::json!({ "tool": call.name, "result_text": e, "is_error": true }),
                     parent,
                 );
-                return format!("Error: {e}");
+                return (format!("Error: {e}"), true);
             }
         };
 
@@ -1795,7 +1919,7 @@ impl Agent {
                     serde_json::json!({ "tool": call.name, "result_text": msg, "is_error": true }),
                     parent,
                 );
-                return format!("Error: {msg}");
+                return (format!("Error: {msg}"), true);
             }
         }
 
@@ -1817,7 +1941,7 @@ impl Agent {
                 serde_json::json!({ "tool": call.name, "result_text": msg, "is_error": true }),
                 parent,
             );
-            return format!("Error: {msg}");
+            return (format!("Error: {msg}"), true);
         }
 
         // control tools are chat flow, not tool calls: no approval prompt, no
@@ -1833,15 +1957,20 @@ impl Agent {
                     serde_json::json!({ "tool": call.name, "result_text": msg, "is_error": true }),
                     parent,
                 );
-                return format!("Error: {msg}");
+                return (msg, true);
             }
             return match call.name.as_str() {
                 crate::builtin::PRESENT_PLAN => {
-                    self.present_plan_tool(conversation_id, call, parent, ct)
-                        .await
+                    let text = self
+                        .present_plan_tool(conversation_id, call, parent, ct)
+                        .await;
+                    (text, false)
                 }
-                crate::builtin::SET_MODE => self.set_mode_tool(conversation_id, call, parent).await,
-                _ => "Error: unknown control tool".to_string(),
+                crate::builtin::SET_MODE => {
+                    let text = self.set_mode_tool(conversation_id, call, parent).await;
+                    (text, false)
+                }
+                _ => ("Error: unknown control tool".to_string(), true),
             };
         }
 
@@ -1849,9 +1978,12 @@ impl Agent {
         // returning here, before the pending_approval card and the gate, is
         // what makes a consult approval-free.
         if call.name == crate::builtin::ADVISOR {
-            return self
+            let text = self
                 .advisor_tool(conversation_id, call, scope, history, tools, ct)
                 .await;
+            // advisor_tool's contract: every failure returns `Error:`-prefixed
+            // text from its single `fail` path, so this is exact, not a guess
+            return (text.clone(), text.starts_with("Error:"));
         }
 
         self.emit_tool_update(
@@ -1881,7 +2013,7 @@ impl Agent {
             )
             .await
         {
-            return denial;
+            return (denial, true);
         }
 
         self.emit_tool_update(
@@ -1921,7 +2053,7 @@ impl Agent {
                         serde_json::json!({ "result_text": text }),
                         parent,
                     );
-                    text
+                    (text, false)
                 }
                 Err(e) => {
                     self.emit_tool_update(
@@ -1931,7 +2063,7 @@ impl Agent {
                         serde_json::json!({ "result_text": e, "is_error": true }),
                         parent,
                     );
-                    format!("Error: {e}")
+                    (format!("Error: {e}"), true)
                 }
             };
         }
@@ -1948,7 +2080,7 @@ impl Agent {
                         serde_json::json!({ "result_text": e, "is_error": true }),
                         parent,
                     );
-                    return format!("Error: {e}");
+                    return (format!("Error: {e}"), true);
                 }
             };
             if !matches!(status, crate::mcp::manager::ServerStatus::Connected) {
@@ -1976,7 +2108,7 @@ impl Agent {
                             serde_json::json!({ "result_text": e, "is_error": true }),
                             parent,
                         );
-                        return format!("Error: {e}");
+                        return (format!("Error: {e}"), true);
                     }
                 }
             }
@@ -2060,9 +2192,9 @@ impl Agent {
                     parent,
                 );
                 if is_error {
-                    format!("The tool reported an error: {text}")
+                    (format!("The tool reported an error: {text}"), true)
                 } else {
-                    text
+                    (text, false)
                 }
             }
             Err(e) => {
@@ -2073,7 +2205,7 @@ impl Agent {
                     serde_json::json!({ "result_text": e, "is_error": true }),
                     parent,
                 );
-                format!("Error: {e}")
+                (format!("Error: {e}"), true)
             }
         }
     }

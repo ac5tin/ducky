@@ -213,6 +213,10 @@ export const conversationGet = (
 ): Promise<[ConversationMeta, RawMessage[]]> =>
   invoke("conversation_get", { id });
 
+/** Write the full debug export (transcript + timings + runtime snapshot). */
+export const conversationExport = (id: string, path: string) =>
+  invoke<string>("conversation_export", { id, path });
+
 export const chatSend = (conversationId: string, text: string) =>
   invoke<void>("chat_send", { conversationId, text });
 

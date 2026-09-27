@@ -204,6 +204,18 @@ const paths: Record<string, ReactElement> = {
       fill="none"
     />
   ),
+  download: (
+    <>
+      <path
+        d="M12 3v12m0 0-5-5m5 5 5-5M5 21h14"
+        stroke="currentColor"
+        strokeWidth="1.8"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        fill="none"
+      />
+    </>
+  ),
   copy: (
     <>
       <rect

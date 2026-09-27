@@ -19,6 +19,8 @@ import {
   type MessageActionKind,
 } from "../../chatMessageActions";
 import { Icon } from "../icons";
+import { save } from "@tauri-apps/plugin-dialog";
+import * as api from "../../api";
 import { Markdown } from "../Markdown";
 import { ToolCallCard } from "./ToolCallCard";
 import { ModelPicker } from "./ModelPicker";
@@ -58,6 +60,10 @@ export function ChatView() {
       s.titleGeneratingIds.has(s.activeConversationId),
   );
   const toggleTerminal = useStore((s) => s.toggleTerminal);
+  const toast = useStore((s) => s.toast);
+  const conversationTitle = useStore((s) =>
+    s.config?.conversations.find((c) => c.id === s.activeConversationId)?.title,
+  );
   const terminalOpen = useStore(
     (s) =>
       !!s.activeConversationId && s.terminalOpenIds.has(s.activeConversationId),
@@ -78,6 +84,32 @@ export function ChatView() {
   const [showJump, setShowJump] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [connectorsOpen, setConnectorsOpen] = useState(false);
+
+  const exportChat = useCallback(async () => {
+    if (!activeId) return;
+    const slug =
+      (conversationTitle ?? "")
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "")
+        .slice(0, 40) || "chat";
+    const stamp = new Date()
+      .toISOString()
+      .replace(/[-:]/g, "")
+      .replace(/\..+/, "")
+      .replace("T", "-");
+    const path = await save({
+      defaultPath: `ducky-chat-${slug}-${stamp}.json`,
+      filters: [{ name: "JSON", extensions: ["json"] }],
+    });
+    if (!path) return;
+    try {
+      const saved = await api.conversationExport(activeId, path);
+      toast("success", `Exported to ${saved}`);
+    } catch (e) {
+      toast("error", `${e}`);
+    }
+  }, [activeId, conversationTitle, toast]);
   const [, setTick] = useState(0);
 
   useEffect(() => {
@@ -175,6 +207,16 @@ export function ChatView() {
                   >
                     <Icon name="refresh" className="h-4 w-4 text-slate-400" />
                     Generate Title
+                  </button>
+                  <button
+                    className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition hover:bg-slate-50 dark:hover:bg-slate-800"
+                    onClick={() => {
+                      setMenuOpen(false);
+                      exportChat().catch((e) => toast("error", `${e}`));
+                    }}
+                  >
+                    <Icon name="download" className="h-4 w-4 text-slate-400" />
+                    Export Chat (JSON)
                   </button>
                   <button
                     className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition hover:bg-slate-50 dark:hover:bg-slate-800"

@@ -95,6 +95,7 @@ pub fn run() {
             commands::conversation_set_mode,
             commands::conversation_set_mcp_ids,
             commands::conversation_get,
+            commands::conversation_export,
             commands::effort_levels,
             commands::context_limit,
             commands::chat_send,

@@ -979,6 +979,9 @@ pub struct Store {
     pub home_dir: PathBuf,
     pub config: Mutex<AppConfig>,
     pub secrets: Mutex<Secrets>,
+    /// Serialises appends to per-conversation debug logs; one write() per
+    /// line keeps concurrent subagent lines from interleaving.
+    debug_lock: Mutex<()>,
 }
 
 fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
@@ -1030,6 +1033,7 @@ impl Store {
             home_dir,
             config: Mutex::new(config),
             secrets: Mutex::new(secrets),
+            debug_lock: Mutex::new(()),
         };
         store.hydrate_empty_titles()?;
         store.seed_default_subagents()?;
@@ -1168,12 +1172,55 @@ impl Store {
     // -- conversations ----------------------------------------------------
 
     pub fn conversation_path(&self, id: &str) -> PathBuf {
+        self.conversations_dir
+            .join(format!("{}.json", Self::safe_id(id)))
+    }
+
+    fn safe_id(id: &str) -> String {
         // ids are uuids; guard against path traversal anyway
-        let safe: String = id
-            .chars()
+        id.chars()
             .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-            .collect();
-        self.conversations_dir.join(format!("{safe}.json"))
+            .collect()
+    }
+
+    /// Append-only debug log beside the transcript: one JSON object per line
+    /// (turn/tool start and end timings, per-turn model/effort/tools/usage).
+    /// Never rewritten by persist/compaction/undo; deleted with the chat.
+    pub fn debug_path(&self, id: &str) -> PathBuf {
+        self.conversations_dir
+            .join(format!("{}.debug.jsonl", Self::safe_id(id)))
+    }
+
+    /// Best-effort append: logging must never break the turn it observes.
+    /// Two syscalls per line (open + write); the private mode is applied
+    /// by the kernel only when the file is first created, not per append.
+    pub fn append_debug(&self, id: &str, record: serde_json::Value) {
+        let line = record.to_string();
+        let _guard = self.debug_lock.lock().unwrap();
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // 0o600 survives any umask that only strips group/other bits
+            opts.mode(0o600);
+        }
+        let Ok(mut f) = opts.open(self.debug_path(id)) else {
+            return;
+        };
+        use std::io::Write;
+        let _ = writeln!(f, "{line}");
+    }
+
+    /// Parsed debug lines; unparsable lines are skipped, missing file is empty.
+    pub fn load_debug(&self, id: &str) -> Vec<serde_json::Value> {
+        let Ok(raw) = std::fs::read_to_string(self.debug_path(id)) else {
+            return Vec::new();
+        };
+        raw.lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
     }
 
     pub fn save_conversation(
@@ -1249,6 +1296,10 @@ impl Store {
         let path = self.conversation_path(id);
         if path.exists() {
             std::fs::remove_file(path)?;
+        }
+        let debug = self.debug_path(id);
+        if debug.exists() {
+            std::fs::remove_file(&debug).ok();
         }
         let mut cfg = self.config.lock().unwrap();
         cfg.conversations.retain(|c| c.id != id);
@@ -2119,5 +2170,38 @@ mod tests {
         let reopened = Store::new(tmp.path(), tmp.path().to_path_buf()).unwrap();
         let cfg = reopened.config.lock().unwrap();
         assert_eq!(cfg.groups[0].conversation_ids, ["c2"]);
+    }
+
+    #[test]
+    fn debug_log_roundtrip_and_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(tmp.path(), tmp.path().to_path_buf()).unwrap();
+        store.append_debug(
+            "dbg-1",
+            serde_json::json!({ "type": "turn_start", "model": "m" }),
+        );
+        store.append_debug(
+            "dbg-1",
+            serde_json::json!({ "type": "turn_end", "duration_ms": 5 }),
+        );
+        let lines = store.load_debug("dbg-1");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["type"], "turn_start");
+        assert_eq!(lines[1]["duration_ms"], 5);
+        // created private: owner read/write only
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(store.debug_path("dbg-1"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // a chat without a log is empty, not an error
+        assert!(store.load_debug("nope").is_empty());
+        // deleting the conversation removes its debug log too
+        store.delete_conversation("dbg-1").unwrap();
+        assert!(!store.debug_path("dbg-1").exists());
     }
 }
