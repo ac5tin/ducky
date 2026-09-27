@@ -40,7 +40,9 @@ pub fn parse_request(args: &Value, active_id: &str) -> Result<(String, String), 
         .map(|id| id.to_string())
         .map_err(|_| format!("`{raw_id}` is not a chat id"))?;
     if id.eq_ignore_ascii_case(active_id) {
-        return Err("That is the current chat; its history is already in this conversation.".into());
+        return Err(
+            "That is the current chat; its history is already in this conversation.".into(),
+        );
     }
     Ok((id, query))
 }
@@ -74,7 +76,10 @@ pub fn extract_references(text: &str) -> Vec<String> {
             continue;
         };
         let candidate = candidate.trim_end_matches(|c: char| {
-            matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '"' | '\'')
+            matches!(
+                c,
+                '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '"' | '\''
+            )
         });
         let Ok(id) = uuid::Uuid::parse_str(candidate) else {
             continue;
@@ -249,7 +254,12 @@ mod tests {
             serde_json::json!({ "kind": "tool_result", "call_id": "c1", "text": "HUGE_TOOL_OUTPUT", "is_error": false }),
             serde_json::json!({ "kind": "assistant", "text": "yes, SQLite it is", "tool_calls": [] }),
         ];
-        store.config.lock().unwrap().conversations.push(meta.clone());
+        store
+            .config
+            .lock()
+            .unwrap()
+            .conversations
+            .push(meta.clone());
         store.save_conversation(&meta, &messages, &[]).unwrap();
         (store, meta)
     }
@@ -261,8 +271,16 @@ mod tests {
             parse_request(&args, "some-other-chat").unwrap().0,
             OTHER.to_string()
         );
-        assert!(parse_request(&serde_json::json!({ "conversation_id": "not-a-uuid", "query": "x" }), "c").is_err());
-        assert!(parse_request(&serde_json::json!({ "conversation_id": "../etc/passwd", "query": "x" }), "c").is_err());
+        assert!(parse_request(
+            &serde_json::json!({ "conversation_id": "not-a-uuid", "query": "x" }),
+            "c"
+        )
+        .is_err());
+        assert!(parse_request(
+            &serde_json::json!({ "conversation_id": "../etc/passwd", "query": "x" }),
+            "c"
+        )
+        .is_err());
         assert!(parse_request(&serde_json::json!({ "conversation_id": OTHER }), "c").is_err());
         assert!(parse_request(&args, OTHER).is_err());
     }
