@@ -88,6 +88,8 @@ pub enum ProviderEvent {
     Usage {
         input: Option<u64>,
         output: Option<u64>,
+        /// Prompt tokens served from a provider-side cache (subset of `input`).
+        cached: Option<u64>,
     },
 }
 

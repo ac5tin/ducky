@@ -1202,6 +1202,7 @@ impl Agent {
             );
             let mut usage_input: Option<u64> = None;
             let mut usage_output: Option<u64> = None;
+            let mut usage_cached: Option<u64> = None;
 
             let (tx, mut rx) = tokio::sync::mpsc::channel::<ProviderEvent>(256);
             let provider_call = provider.stream_chat(&snapshot, &tools, &options, tx);
@@ -1262,7 +1263,7 @@ impl Agent {
                                     .2
                                     .push_str(&fragment);
                             }
-                            Some(ProviderEvent::Usage { input, output }) => {
+                            Some(ProviderEvent::Usage { input, output, cached }) => {
                                 // streams may split usage across events: keep
                                 // the latest value seen per side
                                 if input.is_some() {
@@ -1271,10 +1272,14 @@ impl Agent {
                                 if output.is_some() {
                                     usage_output = output;
                                 }
+                                if cached.is_some() {
+                                    usage_cached = cached;
+                                }
                                 self.sink.emit(BackendEvent::Usage {
                                     conversation_id: conversation_id.to_string(),
                                     input,
                                     output,
+                                    cached,
                                 });
                             }
                             None => break,
@@ -1292,17 +1297,25 @@ impl Agent {
                         text.push_str(&t);
                         self.emit_text_delta(conversation_id, scope, &t);
                     }
-                    ProviderEvent::Usage { input, output } => {
+                    ProviderEvent::Usage {
+                        input,
+                        output,
+                        cached,
+                    } => {
                         if input.is_some() {
                             usage_input = input;
                         }
                         if output.is_some() {
                             usage_output = output;
                         }
+                        if cached.is_some() {
+                            usage_cached = cached;
+                        }
                         self.sink.emit(BackendEvent::Usage {
                             conversation_id: conversation_id.to_string(),
                             input,
                             output,
+                            cached,
                         });
                     }
                     _ => {}
@@ -1312,7 +1325,11 @@ impl Agent {
             debug_turn.end(serde_json::json!({
                 "completed": true,
                 "stop_reason": serde_json::to_value(stop).unwrap_or_default(),
-                "usage": { "input": usage_input, "output": usage_output },
+                "usage": {
+                    "input": usage_input,
+                    "output": usage_output,
+                    "cached": usage_cached,
+                },
             }));
 
             let calls: Vec<ToolCall> = tool_calls

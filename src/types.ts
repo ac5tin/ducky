@@ -380,6 +380,7 @@ export type BackendEvent =
                   conversation_id: string;
                   input?: number | null;
                   output?: number | null;
+                  cached?: number | null;
           }
         | ({
                   type: "tool_call_update";

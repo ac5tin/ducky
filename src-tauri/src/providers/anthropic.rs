@@ -210,6 +210,7 @@ impl LlmProvider for AnthropicProvider {
         let mut stop_reason: Option<String> = None;
         let mut usage_in = None;
         let mut usage_out = None;
+        let mut usage_cached = None;
 
         stream_sse(response, &tx, |data| {
             let v: Value = serde_json::from_str(data)
@@ -225,9 +226,22 @@ impl LlmProvider for AnthropicProvider {
                     Err(anyhow::anyhow!("{} error: {}", self.name, msg))
                 }
                 "message_start" => {
+                    // Anthropic's `input_tokens` excludes cache-served tokens;
+                    // add them back so `input` is the true context size and
+                    // `cached` is a subset of it, matching the other providers.
+                    let read = v
+                        .pointer("/message/usage/cache_read_input_tokens")
+                        .and_then(|u| u.as_u64())
+                        .unwrap_or(0);
+                    let created = v
+                        .pointer("/message/usage/cache_creation_input_tokens")
+                        .and_then(|u| u.as_u64())
+                        .unwrap_or(0);
+                    usage_cached = Some(read + created);
                     usage_in = v
                         .pointer("/message/usage/input_tokens")
-                        .and_then(|u| u.as_u64());
+                        .and_then(|u| u.as_u64())
+                        .map(|i| i + read + created);
                     Ok(None)
                 }
                 "content_block_start" => {
@@ -305,6 +319,7 @@ impl LlmProvider for AnthropicProvider {
             tx.send(ProviderEvent::Usage {
                 input: Some(u),
                 output: usage_out,
+                cached: usage_cached,
             })
             .await
             .ok();

@@ -162,6 +162,7 @@ struct Turn {
     tool_calls: std::collections::BTreeMap<usize, (String, String, String)>,
     usage_in: Option<u64>,
     usage_out: Option<u64>,
+    usage_cached: Option<u64>,
     /// The response stopped early (e.g. `max_output_tokens`).
     incomplete: bool,
     /// A failure reported inside the stream.
@@ -221,12 +222,18 @@ impl Turn {
                 let usage = v.pointer("/response/usage").cloned().unwrap_or(Value::Null);
                 self.usage_in = usage.get("input_tokens").and_then(|u| u.as_u64());
                 self.usage_out = usage.get("output_tokens").and_then(|u| u.as_u64());
+                self.usage_cached = usage
+                    .pointer("/input_tokens_details/cached_tokens")
+                    .and_then(|u| u.as_u64());
                 Ok(None)
             }
             "response.incomplete" => {
                 let usage = v.pointer("/response/usage").cloned().unwrap_or(Value::Null);
                 self.usage_in = usage.get("input_tokens").and_then(|u| u.as_u64());
                 self.usage_out = usage.get("output_tokens").and_then(|u| u.as_u64());
+                self.usage_cached = usage
+                    .pointer("/input_tokens_details/cached_tokens")
+                    .and_then(|u| u.as_u64());
                 self.incomplete = true;
                 Ok(None)
             }
@@ -281,6 +288,7 @@ impl LlmProvider for ResponsesProvider {
             tx.send(ProviderEvent::Usage {
                 input: Some(u),
                 output: turn.usage_out,
+                cached: turn.usage_cached,
             })
             .await
             .ok();
@@ -472,11 +480,18 @@ mod tests {
         let mut turn = Turn::default();
         let done = json!({
             "type": "response.completed",
-            "response": {"usage": {"input_tokens": 12, "output_tokens": 34}}
+            "response": {
+                "usage": {
+                    "input_tokens": 12,
+                    "input_tokens_details": {"cached_tokens": 8},
+                    "output_tokens": 34
+                }
+            }
         });
         assert!(turn.handle_event(&done).unwrap().is_none());
         assert_eq!(turn.usage_in, Some(12));
         assert_eq!(turn.usage_out, Some(34));
+        assert_eq!(turn.usage_cached, Some(8));
 
         let mut turn = Turn::default();
         let failed = json!({

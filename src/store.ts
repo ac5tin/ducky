@@ -182,7 +182,10 @@ interface StoreState {
   steeringQueues: Record<string, SteeringMessage[]>;
   titleGeneratingIds: Set<string>;
   /** Last provider token usage per conversation. */
-  usageByConversation: Record<string, { input?: number; output?: number }>;
+  usageByConversation: Record<
+    string,
+    { input?: number; output?: number; cached?: number }
+  >;
 
   /** Conversations whose terminal panel is open; the PTY lives in the backend. */
   terminalOpenIds: Set<string>;
@@ -1438,6 +1441,7 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
           [event.conversation_id]: {
             input: event.input ?? undefined,
             output: event.output ?? undefined,
+            cached: event.cached ?? undefined,
           },
         },
       }));

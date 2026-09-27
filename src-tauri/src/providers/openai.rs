@@ -152,6 +152,7 @@ struct Turn {
     finish_reason: Option<String>,
     usage_in: Option<u64>,
     usage_out: Option<u64>,
+    usage_cached: Option<u64>,
 }
 
 impl Turn {
@@ -160,6 +161,9 @@ impl Turn {
         if let Some(usage) = v.get("usage") {
             self.usage_in = usage.get("prompt_tokens").and_then(|x| x.as_u64());
             self.usage_out = usage.get("completion_tokens").and_then(|x| x.as_u64());
+            self.usage_cached = usage
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .and_then(|x| x.as_u64());
         }
         if let Some(err) = v.get("error") {
             let msg = err
@@ -272,6 +276,7 @@ impl LlmProvider for OpenAiProvider {
             tx.send(ProviderEvent::Usage {
                 input: Some(u),
                 output: turn.usage_out,
+                cached: turn.usage_cached,
             })
             .await
             .ok();
