@@ -38,9 +38,9 @@ pub fn build_messages(history: &[Msg], tool_names: &[String], executor_system: &
     // calls' results are already in the history. Providers reject an assistant
     // `tool_use` without a matching `tool_result`, so strip every unanswered
     // call of the last assistant message that carries any.
-    let last_calls = transcript.iter().rposition(|message| {
-        matches!(message, Msg::Assistant { tool_calls, .. } if !tool_calls.is_empty())
-    });
+    let last_calls = transcript.iter().rposition(
+        |message| matches!(message, Msg::Assistant { tool_calls, .. } if !tool_calls.is_empty()),
+    );
     if let Some(index) = last_calls {
         let answered: Vec<String> = transcript[index + 1..]
             .iter()
@@ -298,8 +298,14 @@ mod tests {
         let providers = vec![provider("p1")];
         // an enable naming a deleted provider is still refused…
         assert_eq!(
-            validate_selection(true, Some("gone"), Some("m1"), Some(EffortLevel::High), &providers)
-                .unwrap_err(),
+            validate_selection(
+                true,
+                Some("gone"),
+                Some("m1"),
+                Some(EffortLevel::High),
+                &providers
+            )
+            .unwrap_err(),
             "That provider is no longer configured"
         );
         // …but a disable is always accepted, whatever the stored pick is
@@ -482,9 +488,9 @@ mod tests {
             ],
         ] {
             let msgs = build_messages(&history, &names(), "sys");
-            assert!(!msgs.iter().any(
-                |m| matches!(m, Msg::Assistant { tool_calls, .. } if !tool_calls.is_empty())
-            ));
+            assert!(!msgs
+                .iter()
+                .any(|m| matches!(m, Msg::Assistant { tool_calls, .. } if !tool_calls.is_empty())));
             assert!(matches!(msgs.last(), Some(Msg::User { text, .. }) if text == ADVISOR_ASK));
         }
     }
