@@ -347,12 +347,32 @@ impl Default for AppSettings {
 }
 
 impl AppSettings {
-    /// The directory chats and stdio servers operate in: the configured
-    /// override when present, otherwise the machine's home directory.
+    /// The app-wide default directory: stdio servers always spawn here,
+    /// and a chat operates here unless it has its own `working_dir`
+    /// override (see [`AppConfig::chat_working_dir`]).
     pub fn effective_working_dir(&self, home: &Path) -> PathBuf {
         match self.working_dir.as_deref() {
             Some(dir) if !dir.trim().is_empty() => expand_tilde(dir, home).into_owned().into(),
             _ => home.to_path_buf(),
+        }
+    }
+}
+
+impl AppConfig {
+    /// The cwd for one chat: its own `working_dir` override when set,
+    /// otherwise the app-wide default. A blank/whitespace override is
+    /// ignored.
+    pub fn chat_working_dir(&self, conversation_id: &str, home: &Path) -> PathBuf {
+        let conv = self
+            .conversations
+            .iter()
+            .find(|c| c.id == conversation_id)
+            .and_then(|c| c.working_dir.as_deref())
+            .map(str::trim)
+            .filter(|dir| !dir.is_empty());
+        match conv {
+            Some(dir) => expand_tilde(dir, home).into_owned().into(),
+            None => self.settings.effective_working_dir(home),
         }
     }
 }
@@ -404,6 +424,10 @@ pub struct ConversationMeta {
     /// Advisor reasoning effort; only read when `advisor_provider_id` is set.
     #[serde(default)]
     pub advisor_effort: Option<EffortLevel>,
+    /// Working directory override for this chat. `None` inherits the
+    /// app-wide default. Stdio MCP servers always spawn at the app default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -1512,6 +1536,7 @@ mod tests {
             advisor_provider_id: None,
             advisor_model: None,
             advisor_effort: None,
+            working_dir: None,
             created_at: "t".into(),
             updated_at: "t".into(),
         };
@@ -1562,6 +1587,7 @@ mod tests {
             advisor_provider_id: None,
             advisor_model: None,
             advisor_effort: None,
+            working_dir: None,
             created_at: "t".into(),
             updated_at: "t".into(),
         };
@@ -1595,6 +1621,7 @@ mod tests {
             advisor_provider_id: None,
             advisor_model: None,
             advisor_effort: None,
+            working_dir: None,
             created_at: "t".into(),
             updated_at: "t".into(),
         };
@@ -1627,6 +1654,7 @@ mod tests {
             advisor_provider_id: None,
             advisor_model: None,
             advisor_effort: None,
+            working_dir: None,
             created_at: "t".into(),
             updated_at: "t".into(),
         };
@@ -1667,6 +1695,7 @@ mod tests {
             advisor_provider_id: None,
             advisor_model: None,
             advisor_effort: None,
+            working_dir: None,
             created_at: "t".into(),
             updated_at: "t".into(),
         };
@@ -1703,6 +1732,63 @@ mod tests {
         assert_eq!(
             settings.effective_working_dir(home),
             Path::new("/tmp/project")
+        );
+    }
+
+    #[test]
+    fn chat_working_dir_prefers_conversation_override() {
+        let home = Path::new("/home/duck");
+        let mut cfg = AppConfig::default();
+        cfg.settings.working_dir = Some("/tmp/app-default".into());
+        cfg.conversations.push(ConversationMeta {
+            id: "c1".into(),
+            title: String::new(),
+            provider_id: "p".into(),
+            model: "m".into(),
+            effort: None,
+            mcp_ids: None,
+            mode: AgentMode::Default,
+            auto_readonly: false,
+            advisor_enabled: false,
+            advisor_provider_id: None,
+            advisor_model: None,
+            advisor_effort: None,
+            working_dir: Some("~/proj".into()),
+            created_at: "t".into(),
+            updated_at: "t".into(),
+        });
+        cfg.conversations.push(ConversationMeta {
+            id: "c2".into(),
+            title: String::new(),
+            provider_id: "p".into(),
+            model: "m".into(),
+            effort: None,
+            mcp_ids: None,
+            mode: AgentMode::Default,
+            auto_readonly: false,
+            advisor_enabled: false,
+            advisor_provider_id: None,
+            advisor_model: None,
+            advisor_effort: None,
+            working_dir: Some("   ".into()),
+            created_at: "t".into(),
+            updated_at: "t".into(),
+        });
+
+        // override wins and expands ~
+        assert_eq!(
+            cfg.chat_working_dir("c1", home),
+            Path::new("/home/duck/proj")
+        );
+        // blank override falls through to the app default
+        assert_eq!(
+            cfg.chat_working_dir("c2", home),
+            Path::new("/tmp/app-default")
+        );
+        // no override / unknown chat falls through to the app default
+        assert_eq!(
+            cfg.chat_working_dir("missing", home),
+            Path::new("/tmp/app-default")
         );
     }
 

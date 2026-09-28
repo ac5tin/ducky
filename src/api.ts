@@ -180,6 +180,9 @@ export const conversationSetAdvisor = (
 export const conversationSetMode = (id: string, mode: AgentMode) =>
   invoke<void>("conversation_set_mode", { id, mode });
 
+export const conversationSetWorkingDir = (id: string, workingDir: string | null) =>
+  invoke<void>("conversation_set_working_dir", { id, workingDir });
+
 export const conversationSetMcpIds = (id: string, mcpIds: string[] | null) =>
   invoke<void>("conversation_set_mcp_ids", { id, mcpIds });
 

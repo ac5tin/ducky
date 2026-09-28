@@ -246,6 +246,7 @@ mod tests {
             advisor_provider_id: None,
             advisor_model: None,
             advisor_effort: None,
+            working_dir: None,
             created_at: now.clone(),
             updated_at: now,
         };

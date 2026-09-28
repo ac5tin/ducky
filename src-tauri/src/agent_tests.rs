@@ -280,6 +280,7 @@ fn test_agent_full(
             advisor_provider_id: None,
             advisor_model: None,
             advisor_effort: None,
+            working_dir: None,
             created_at: now.clone(),
             updated_at: now,
         });
@@ -1569,6 +1570,7 @@ async fn read_session_context_runs_through_the_engine() {
         advisor_provider_id: None,
         advisor_model: None,
         advisor_effort: None,
+        working_dir: None,
         created_at: now.clone(),
         updated_at: now,
     };

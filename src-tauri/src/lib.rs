@@ -1,9 +1,9 @@
 //! Ducky — a friendly cross-platform MCP client.
 
+pub mod advisor;
 pub mod agent;
 #[cfg(test)]
 mod agent_tests;
-pub mod advisor;
 pub mod builtin;
 pub mod catalog;
 pub mod commands;
@@ -91,6 +91,7 @@ pub fn run() {
             commands::conversation_cancel_title,
             commands::conversation_set_model,
             commands::conversation_set_effort,
+            commands::conversation_set_working_dir,
             commands::conversation_set_advisor,
             commands::conversation_set_mode,
             commands::conversation_set_mcp_ids,

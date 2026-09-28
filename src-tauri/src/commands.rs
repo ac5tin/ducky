@@ -554,6 +554,7 @@ pub fn conversation_create(
         advisor_provider_id: None,
         advisor_model: None,
         advisor_effort: None,
+        working_dir: None,
         created_at: now(),
         updated_at: now(),
     };
@@ -629,6 +630,26 @@ pub fn conversation_set_effort(
             return Err("Unknown conversation".into());
         };
         meta.effort = effort;
+    }
+    state.store.save_config().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn conversation_set_working_dir(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    working_dir: Option<String>,
+) -> Result<(), String> {
+    let working_dir = working_dir
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty());
+    {
+        let mut c = state.store.config.lock().unwrap();
+        let Some(meta) = c.conversations.iter_mut().find(|c| c.id == id) else {
+            return Err("Unknown conversation".into());
+        };
+        meta.working_dir = working_dir;
+        meta.updated_at = now();
     }
     state.store.save_config().map_err(|e| e.to_string())
 }
@@ -862,7 +883,7 @@ pub(crate) fn build_export_payload(
         let cfg = store.config.lock().unwrap();
         (
             cfg.settings.system_prompt.clone(),
-            cfg.settings.effective_working_dir(&store.home_dir),
+            cfg.chat_working_dir(id, &store.home_dir),
             cfg.settings.max_tool_iterations,
             cfg.settings.show_reasoning,
         )
@@ -1014,7 +1035,7 @@ pub async fn chat_send(
         let snap_root = state.store.snapshots_dir.clone();
         let wd = {
             let cfg = state.store.config.lock().unwrap();
-            cfg.settings.effective_working_dir(&state.store.home_dir)
+            cfg.chat_working_dir(&conversation_id, &state.store.home_dir)
         };
         match tokio::task::spawn_blocking(move || crate::snapshot::capture(&snap_root, &wd)).await {
             Ok(Ok((tree, root))) => {
@@ -1439,7 +1460,7 @@ pub fn terminal_create(
 ) -> Result<TerminalCreated, String> {
     let cwd = {
         let c = state.store.config.lock().unwrap();
-        c.settings.effective_working_dir(&state.store.home_dir)
+        c.chat_working_dir(&conversation_id, &state.store.home_dir)
     };
     let session = crate::terminal::get_or_spawn(
         &conversation_id,
@@ -2190,6 +2211,7 @@ mod tests {
             advisor_provider_id: None,
             advisor_model: None,
             advisor_effort: None,
+            working_dir: None,
             created_at: "t".into(),
             updated_at: "t".into(),
         };

@@ -98,6 +98,19 @@ export interface SamplingRequest {
 
 export type View = "chat" | "connectors" | "settings" | "onboarding";
 
+/** Resolved working directory for the open chat (or the draft page's staged
+ * pick): the chat's own override, else the app-wide default. Null = home. */
+export function resolvedChatWorkingDir(s: {
+  activeConversationId: string | null;
+  draftWorkingDir: string | null;
+  config: AppConfig | null;
+}): string | null {
+  const override = s.activeConversationId
+    ? s.config?.conversations.find((c) => c.id === s.activeConversationId)
+        ?.working_dir
+    : s.draftWorkingDir;
+  return override ?? s.config?.settings.working_dir ?? null;
+}
 export interface UpdateState {
   status: "idle" | "checking" | "available" | "downloading" | "ready";
   version: string;
@@ -170,6 +183,8 @@ interface StoreState {
   draftEffort: EffortLevel | null | undefined;
   /** Mode staged on the draft page; null = the app default applies. */
   draftMode: AgentMode | null;
+  /** Working directory staged on the draft page; null = the app default applies. */
+  draftWorkingDir: string | null;
   items: ChatItem[];
   streaming: boolean;
   busyConversationIds: Set<string>;
@@ -243,6 +258,9 @@ interface StoreState {
   }) => Promise<void>;
   /** Set the mode for the active chat, or stage it on the draft page. */
   setMode: (mode: AgentMode) => Promise<void>;
+  /** Set the working directory for the active chat, or stage it on the
+   * draft page. The app-wide default is changed in Settings only. */
+  setWorkingDir: (path: string | null) => Promise<void>;
   setActiveMcpIds: (mcpIds: string[] | null) => Promise<void>;
 
   send: (text: string) => Promise<boolean>;
@@ -357,6 +375,7 @@ export const useStore = create<StoreState>((set, get) => ({
   draftProviderId: null,
   draftEffort: undefined,
   draftMode: null,
+  draftWorkingDir: null,
   items: [],
   streaming: false,
   busyConversationIds: new Set(),
@@ -492,6 +511,7 @@ export const useStore = create<StoreState>((set, get) => ({
       draftProviderId: null,
       draftEffort: undefined,
       draftMode: null,
+      draftWorkingDir: null,
       draftGroupId: null,
       items: [],
       view: "chat",
@@ -694,6 +714,17 @@ export const useStore = create<StoreState>((set, get) => ({
     await get().refreshConfig();
   },
 
+  async setWorkingDir(path) {
+    const id = get().activeConversationId;
+    if (!id) {
+      // the draft page stages the pick; the chat is created with it
+      set({ draftWorkingDir: path });
+      return;
+    }
+    await api.conversationSetWorkingDir(id, path);
+    await get().refreshConfig();
+  },
+
   async setActiveMcpIds(mcpIds) {
     const id = get().activeConversationId;
     if (!id) return;
@@ -725,7 +756,7 @@ export const useStore = create<StoreState>((set, get) => ({
       }
       switch (command.name) {
         case "init": {
-          const workingDir = get().config?.settings.working_dir?.trim() || "~";
+          const workingDir = resolvedChatWorkingDir(get())?.trim() || "~";
           return get().send(expandInitPrompt(workingDir, command.args));
         }
         case "compact": {
@@ -827,11 +858,17 @@ export const useStore = create<StoreState>((set, get) => ({
           // non-fatal: the chat keeps the app default if this fails
           await api.conversationSetMode(meta.id, draftMode).catch(() => {});
         }
+        const { draftWorkingDir } = get();
+        if (draftWorkingDir) {
+          // non-fatal: the chat keeps the app default if this fails
+          await api.conversationSetWorkingDir(meta.id, draftWorkingDir).catch(() => {});
+        }
         set({
           draftModel: null,
           draftProviderId: null,
           draftEffort: undefined,
           draftMode: null,
+          draftWorkingDir: null,
           draftGroupId: null,
         });
         await get().refreshConfig();

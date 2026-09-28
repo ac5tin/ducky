@@ -188,6 +188,7 @@ mod tests {
             advisor_provider_id: None,
             advisor_model: None,
             advisor_effort: None,
+            working_dir: None,
             created_at: "t".into(),
             updated_at: "t".into(),
         }
@@ -209,6 +210,7 @@ mod tests {
             advisor_provider_id: Some("p1".into()),
             advisor_model: Some("m1".into()),
             advisor_effort: Some(EffortLevel::Low),
+            working_dir: None,
             ..Default::default()
         };
         let mut m = meta();
@@ -241,6 +243,7 @@ mod tests {
             advisor_provider_id: Some("p1".into()),
             advisor_model: Some("m2".into()),
             advisor_effort: Some(EffortLevel::Medium),
+            working_dir: None,
             ..Default::default()
         };
         let mut m = meta();

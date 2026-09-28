@@ -786,7 +786,7 @@ impl Agent {
         let (cwd, main_prompt) = {
             let cfg = self.store.config.lock().unwrap();
             (
-                cfg.settings.effective_working_dir(&self.store.home_dir),
+                cfg.chat_working_dir(conversation_id, &self.store.home_dir),
                 cfg.settings.system_prompt.clone(),
             )
         };
@@ -1142,7 +1142,7 @@ impl Agent {
             let (cwd, main_prompt) = {
                 let cfg = self.store.config.lock().unwrap();
                 (
-                    cfg.settings.effective_working_dir(&self.store.home_dir),
+                    cfg.chat_working_dir(conversation_id, &self.store.home_dir),
                     cfg.settings.system_prompt.clone(),
                 )
             };
@@ -2054,7 +2054,7 @@ impl Agent {
             } else {
                 let cwd = {
                     let cfg = self.store.config.lock().unwrap();
-                    cfg.settings.effective_working_dir(&self.store.home_dir)
+                    cfg.chat_working_dir(conversation_id, &self.store.home_dir)
                 };
                 tokio::select! {
                     _ = ct.cancelled() => Err("cancelled by user".to_string()),

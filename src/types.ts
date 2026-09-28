@@ -79,7 +79,8 @@ export interface AppSettings {
         show_reasoning: boolean;
         /** Default open/closed state of MCP tool input and output. */
         tool_details: ToolDetailsMode;
-        /** Working directory for chats and spawned stdio servers; null = home. */
+        /** App-wide default working directory for new chats and spawned stdio
+         * servers; null = home. A chat's own `working_dir` override wins for that chat. */
         working_dir: string | null;
         /** Provider new chats start with; null = keep current behavior. */
         default_provider_id: string | null;
@@ -123,6 +124,8 @@ export interface ConversationMeta {
         advisor_effort: EffortLevel | null;
         mode: AgentMode;
         mcp_ids?: string[] | null;
+        /** Working directory override for this chat; undefined/null = the app-wide default. */
+        working_dir?: string | null;
         created_at: string;
         updated_at: string;
 }

@@ -58,7 +58,13 @@ export function TerminalPanel({ conversationId }: { conversationId: string }) {
   const setTerminalHeight = useStore((s) => s.setTerminalHeight);
   const toggleTerminal = useStore((s) => s.toggleTerminal);
   const theme = useStore((s) => s.config?.settings.theme ?? "system");
-  const workingDir = useStore((s) => s.config?.settings.working_dir ?? null);
+  const workingDir = useStore(
+    (s) =>
+      s.config?.conversations.find((c) => c.id === conversationId)
+        ?.working_dir ??
+      s.config?.settings.working_dir ??
+      null,
+  );
   const homeDir = useStore((s) => s.homeDir);
   const [exited, setExited] = useState(false);
 
