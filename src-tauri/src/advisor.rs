@@ -65,6 +65,18 @@ pub fn err_empty() -> String {
     "Advisor returned no text content.".into()
 }
 
+/// Drop `effort` only when the catalog knows the model and its level list
+/// does not contain it. `None` means unknown — keep the stored effort.
+pub fn effort_for_known_levels(
+    effort: Option<EffortLevel>,
+    known: Option<&[EffortLevel]>,
+) -> Option<EffortLevel> {
+    match known {
+        Some(levels) => effort.filter(|level| levels.contains(level)),
+        None => effort,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdvisorSpec {
     pub provider_id: String,
@@ -494,6 +506,38 @@ mod tests {
     fn build_messages_reports_no_tools() {
         let msgs = build_messages(&[user("hi")], &[], "sys");
         assert!(system_text(&msgs).contains("Tools the executor can call: none"));
+    }
+
+    #[test]
+    fn known_catalog_levels_drop_an_unsupported_effort_only() {
+        // a miss (no index, unknown model) must keep the stored effort:
+        // default low/medium/high would drop max on a custom model that accepts it
+        assert_eq!(
+            effort_for_known_levels(Some(EffortLevel::Max), None),
+            Some(EffortLevel::Max)
+        );
+        assert_eq!(
+            effort_for_known_levels(Some(EffortLevel::High), Some(&[])),
+            None
+        );
+        assert_eq!(
+            effort_for_known_levels(
+                Some(EffortLevel::High),
+                Some(&[EffortLevel::Low, EffortLevel::High])
+            ),
+            Some(EffortLevel::High)
+        );
+        assert_eq!(
+            effort_for_known_levels(
+                Some(EffortLevel::Max),
+                Some(&[EffortLevel::Low, EffortLevel::High])
+            ),
+            None
+        );
+        assert_eq!(
+            effort_for_known_levels(None, Some(&[EffortLevel::Low])),
+            None
+        );
     }
 
     #[test]

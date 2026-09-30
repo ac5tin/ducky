@@ -61,6 +61,15 @@ impl Catalog {
         }
     }
 
+    /// Cached catalog hit only. `None` means no index, an empty model id, or
+    /// an unknown model — not "this model has no effort options".
+    /// Does not refresh: a consult must not wait on the network, and a cold
+    /// cache must not invent the default trio.
+    pub fn cached_known_effort_levels(&self, kind: &str, model: &str) -> Option<Vec<EffortLevel>> {
+        let st = self.state.lock().unwrap();
+        lookup_known(st.index.as_ref()?, kind, model)
+    }
+
     /// Effort levels for a Ducky provider kind + model id. Empty = hide the
     /// effort selector; unknown models fall back to the default trio.
     pub async fn effort_levels(&self, kind: &str, model: &str) -> Vec<EffortLevel> {
@@ -250,15 +259,18 @@ fn effort_values(model: &serde_json::Value) -> Vec<EffortLevel> {
     out
 }
 
-pub fn lookup(index: &Index, kind: &str, model: &str) -> Vec<EffortLevel> {
+/// `None` when the model id is empty or not in the catalog.
+/// `Some([])` when the model is known and has no effort options.
+/// Does not invent the default trio — that fallback stays in `lookup`.
+pub fn lookup_known(index: &Index, kind: &str, model: &str) -> Option<Vec<EffortLevel>> {
     let model = model.trim();
     if model.is_empty() {
-        return EffortLevel::default_levels();
+        return None;
     }
     let aliases = provider_aliases(kind);
     for pid in &aliases {
         if let Some(levels) = index.get(*pid).and_then(|m| m.get(model)) {
-            return levels.clone();
+            return Some(levels.clone());
         }
     }
     // normalized fallback: strip vendor prefix / local tag ("openai/gpt-5",
@@ -266,7 +278,7 @@ pub fn lookup(index: &Index, kind: &str, model: &str) -> Vec<EffortLevel> {
     let bare = bare_model_id(model);
     for pid in &aliases {
         if let Some(levels) = index.get(*pid).and_then(|m| m.get(&bare)) {
-            return levels.clone();
+            return Some(levels.clone());
         }
     }
     // last resort: bare-id scan across the whole catalog (aggregators and
@@ -283,10 +295,11 @@ pub fn lookup(index: &Index, kind: &str, model: &str) -> Vec<EffortLevel> {
     hits.sort_by(|(a, _), (b, _)| {
         (provider_rank(a), a.as_str()).cmp(&(provider_rank(b), b.as_str()))
     });
-    if let Some((_, levels)) = hits.first() {
-        return (*levels).clone();
-    }
-    EffortLevel::default_levels()
+    hits.first().map(|(_, levels)| (*levels).clone())
+}
+
+pub fn lookup(index: &Index, kind: &str, model: &str) -> Vec<EffortLevel> {
+    lookup_known(index, kind, model).unwrap_or_else(EffortLevel::default_levels)
 }
 
 pub fn lookup_context(index: &ContextIndex, kind: &str, model: &str) -> Option<u64> {
@@ -567,6 +580,19 @@ mod tests {
             EffortLevel::default_levels()
         );
         assert_eq!(lookup(&index, "openai", ""), EffortLevel::default_levels());
+        // a miss is not a known empty list: callers that must not invent
+        // levels use lookup_known and keep the stored effort
+        assert_eq!(lookup_known(&index, "custom", "mystery-model"), None);
+        assert_eq!(lookup_known(&index, "openai", ""), None);
+        assert_eq!(lookup_known(&index, "zai", "glm-4.8"), Some(vec![]));
+        assert_eq!(
+            lookup_known(&index, "anthropic", "claude-opus-4.7"),
+            Some(vec![
+                EffortLevel::Low,
+                EffortLevel::Medium,
+                EffortLevel::High
+            ])
+        );
     }
 
     #[test]

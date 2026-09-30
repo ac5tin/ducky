@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useStore } from "../../store";
 import * as api from "../../api";
@@ -13,6 +13,8 @@ import { Icon } from "../icons";
 import {
   EFFORT_LABELS,
   EffortPill,
+  keptEffortForModel,
+  useEffortLevelLoad,
   useEffortLevels,
 } from "../chat/effortLevels";
 
@@ -851,8 +853,14 @@ function AdvisorSection() {
     provider?.default_model ||
     provider?.models[0] ||
     "";
-  const efforts = useEffortLevels(provider?.kind, resolvedModel || undefined);
+  const { levels: efforts, status: effortStatus } = useEffortLevelLoad(
+    provider?.kind,
+    resolvedModel || undefined,
+  );
   const effort = config?.settings.advisor_effort ?? null;
+  const modelPick = useRef(0);
+  const effortOutsideList =
+    effortStatus === "ready" && effort !== null && !efforts.includes(effort);
 
   if (!config) return null;
 
@@ -912,7 +920,22 @@ function AdvisorSection() {
             className={inputClass}
             value={modelId ?? ""}
             disabled={!provider}
-            onChange={(e) => save(providerId ?? "", e.target.value, effort)}
+            onChange={(e) => {
+              const model = e.target.value;
+              const resolved =
+                model || provider?.default_model || provider?.models[0] || "";
+              const gen = ++modelPick.current;
+              const kept = effort;
+              void keptEffortForModel(provider?.kind, resolved, kept)
+                .then((next) => {
+                  if (gen !== modelPick.current) return;
+                  save(providerId ?? "", model, next);
+                })
+                .catch(() => {
+                  if (gen !== modelPick.current) return;
+                  save(providerId ?? "", model, kept);
+                });
+            }}
           >
             <option value="">Provider default</option>
             {(provider?.models ?? []).map((m) => (
@@ -923,7 +946,7 @@ function AdvisorSection() {
           </select>
         </div>
       </div>
-      {provider && efforts.length > 0 && (
+      {provider && (efforts.length > 0 || effortOutsideList) && (
         <div>
           <div className="mb-1.5 text-sm font-medium">Reasoning effort</div>
           <div className="flex flex-wrap gap-1">

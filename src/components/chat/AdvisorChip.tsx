@@ -1,9 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { advisorChipState, type AdvisorChipState } from "../../advisorChip";
 import { useStore } from "../../store";
 import type { EffortLevel } from "../../types";
 import { Icon } from "../icons";
-import { EFFORT_LABELS, EffortPill, useEffortLevels } from "./effortLevels";
+import { EFFORT_LABELS, EffortPill, keptEffortForModel, useEffortLevelLoad } from "./effortLevels";
 
 type Selection = {
   enabled: boolean;
@@ -33,6 +33,7 @@ export function AdvisorChip({ dropUp = false }: { dropUp?: boolean }) {
   const setActiveAdvisor = useStore((s) => s.setActiveAdvisor);
   const toast = useStore((s) => s.toast);
   const [open, setOpen] = useState(false);
+  const modelPick = useRef(0);
 
   const providers = config?.providers ?? [];
   const conversation = config?.conversations.find((c) => c.id === activeId) ?? null;
@@ -49,7 +50,17 @@ export function AdvisorChip({ dropUp = false }: { dropUp?: boolean }) {
   // the effort pills need a real model id — a provider name is not one
   const effortModel =
     state?.model || provider?.default_model || provider?.models[0] || "";
-  const efforts = useEffortLevels(provider?.kind, effortModel);
+  const { levels: efforts, status: effortStatus } = useEffortLevelLoad(
+    provider?.kind,
+    effortModel || undefined,
+  );
+  // a stored effort the loaded list does not contain has no selected pill,
+  // and an empty list hides the row — show Default so the user can clear it.
+  // loading and error also yield [], so do not treat those as a real empty list
+  const effortOutsideList =
+    effortStatus === "ready" &&
+    !!state?.effort &&
+    !efforts.includes(state.effort);
 
   useEffect(() => {
     if (!open) return;
@@ -153,9 +164,22 @@ export function AdvisorChip({ dropUp = false }: { dropUp?: boolean }) {
                   className={selectClass}
                   value={state.model}
                   disabled={disabled || !provider}
-                  onChange={(e) =>
-                    save({ ...current, model: e.target.value || null })
-                  }
+                  onChange={(e) => {
+                    const model = e.target.value || null;
+                    const resolved =
+                      model || provider?.default_model || provider?.models[0] || "";
+                    const gen = ++modelPick.current;
+                    const kept = current.effort;
+                    void keptEffortForModel(provider?.kind, resolved, kept)
+                      .then((effort) => {
+                        if (gen !== modelPick.current) return;
+                        save({ ...current, model, effort });
+                      })
+                      .catch(() => {
+                        if (gen !== modelPick.current) return;
+                        save({ ...current, model, effort: kept });
+                      });
+                  }}
                 >
                   <option value="">
                     Provider default
@@ -168,7 +192,7 @@ export function AdvisorChip({ dropUp = false }: { dropUp?: boolean }) {
                   ))}
                 </select>
               </label>
-              {efforts.length > 0 && (
+              {(efforts.length > 0 || effortOutsideList) && (
                 <div>
                   <p className="mb-1 text-xs font-medium text-slate-400">
                     Reasoning effort

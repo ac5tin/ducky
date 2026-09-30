@@ -825,7 +825,24 @@ impl Agent {
         } else {
             model.clone()
         };
-        let result_text = match spec.effort {
+        // A known catalog miss drops an effort the model rejects (HTTP 400).
+        // An unknown model keeps the stored effort: the default trio would
+        // drop max/xhigh on a custom model that accepts them.
+        let effort = {
+            let kind = self
+                .store
+                .config
+                .lock()
+                .unwrap()
+                .providers
+                .iter()
+                .find(|p| p.id == spec.provider_id)
+                .map(|p| p.kind.clone());
+            let known =
+                kind.and_then(|kind| self.catalog.cached_known_effort_levels(&kind, &model));
+            crate::advisor::effort_for_known_levels(spec.effort, known.as_deref())
+        };
+        let result_text = match effort {
             Some(effort) => format!("Consulting advisor ({label} · {})…", effort.as_str()),
             None => format!("Consulting advisor ({label})…"),
         };
@@ -838,7 +855,7 @@ impl Agent {
                 "advisor": crate::events::AdvisorMeta {
                     provider_id: spec.provider_id.clone(),
                     model: model.clone(),
-                    effort: spec.effort.map(|e| e.as_str().to_string()),
+                    effort: effort.map(|e| e.as_str().to_string()),
                 },
                 "result_text": result_text,
             }),
@@ -849,7 +866,7 @@ impl Agent {
             model,
             max_tokens: Some(crate::advisor::ADVISOR_MAX_TOKENS),
             temperature: None,
-            effort: spec.effort,
+            effort,
             session_id: Some(conversation_id.to_string()),
         };
 

@@ -17,6 +17,15 @@ export interface AdvisorChipState {
   effort: EffortLevel | null;
 }
 
+/** Keep `effort` only when the newly picked model's level list contains it. */
+export function supportedEffort(
+  effort: EffortLevel | null,
+  levels: readonly EffortLevel[],
+): EffortLevel | null {
+  if (effort === null) return null;
+  return levels.includes(effort) ? effort : null;
+}
+
 function modeOf(enabled: boolean, resolved: boolean): AdvisorChipState["mode"] {
   if (!enabled) return "off";
   return resolved ? "on" : "unresolved";

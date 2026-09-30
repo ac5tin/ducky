@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { advisorChipState } from "./advisorChip.ts";
+import { advisorChipState, supportedEffort } from "./advisorChip.ts";
 
 const providers = [{ id: "p1", kind: "custom", name: "One" }];
 const settings = {
@@ -70,4 +70,20 @@ test("unresolved when nothing is configured", () => {
 test("the draft state follows the settings default", () => {
   const state = advisorChipState(null, { ...settings, advisor_enabled_by_default: true }, providers);
   assert.equal(state.mode, "on");
+});
+
+test("supported effort stays when the new model lists it", () => {
+  assert.equal(supportedEffort("high", ["low", "high"]), "high");
+});
+
+test("supported effort clears when the new model does not list it", () => {
+  assert.equal(supportedEffort("max", ["low", "high"]), null);
+});
+
+test("supported effort keeps null", () => {
+  assert.equal(supportedEffort(null, ["low", "high"]), null);
+});
+
+test("an empty level list clears a stored effort", () => {
+  assert.equal(supportedEffort("high", []), null);
 });
