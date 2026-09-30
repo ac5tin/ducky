@@ -36,31 +36,8 @@ pub fn build_messages(history: &[Msg], tool_names: &[String], executor_system: &
     // The consult can be batched with other calls: the assistant message then
     // still carries the in-flight `ducky__advisor` call while the earlier
     // calls' results are already in the history. Providers reject an assistant
-    // `tool_use` without a matching `tool_result`, so strip every unanswered
-    // call of the last assistant message that carries any.
-    let last_calls = transcript.iter().rposition(
-        |message| matches!(message, Msg::Assistant { tool_calls, .. } if !tool_calls.is_empty()),
-    );
-    if let Some(index) = last_calls {
-        let answered: Vec<String> = transcript[index + 1..]
-            .iter()
-            .filter_map(|message| match message {
-                Msg::ToolResult { call_id, .. } => Some(call_id.clone()),
-                _ => None,
-            })
-            .collect();
-        let mut left_empty = false;
-        if let Msg::Assistant {
-            text, tool_calls, ..
-        } = &mut transcript[index]
-        {
-            tool_calls.retain(|call| answered.contains(&call.id));
-            left_empty = text.is_empty() && tool_calls.is_empty();
-        }
-        if left_empty {
-            transcript.remove(index);
-        }
-    }
+    // `tool_use` without a matching `tool_result`, so drop every unanswered call.
+    crate::providers::strip_unanswered_tool_calls(&mut transcript);
 
     let mut messages = Vec::with_capacity(transcript.len() + 2);
     messages.push(Msg::System { text: system });

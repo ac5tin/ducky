@@ -53,6 +53,33 @@ impl Msg {
     }
 }
 
+/// Drop every assistant `tool_call` that no `ToolResult` answers, and any
+/// assistant message left with neither text nor calls.
+///
+/// Providers reject an assistant `tool_use` without a matching `tool_result`,
+/// and a turn cancelled mid-batch — or a crash between a call and its result —
+/// leaves one behind in the persisted history. Strip the whole history, not
+/// just the tail: a dangling call from an earlier turn still 400s every later
+/// request that carries it.
+/// ponytail: O(n) pass per request; memoise if histories ever get huge.
+pub fn strip_unanswered_tool_calls(messages: &mut Vec<Msg>) {
+    let answered: std::collections::HashSet<String> = messages
+        .iter()
+        .filter_map(|m| match m {
+            Msg::ToolResult { call_id, .. } => Some(call_id.clone()),
+            _ => None,
+        })
+        .collect();
+    for message in messages.iter_mut() {
+        if let Msg::Assistant { tool_calls, .. } = message {
+            tool_calls.retain(|call| answered.contains(&call.id));
+        }
+    }
+    messages.retain(|m| {
+        !matches!(m, Msg::Assistant { text, tool_calls, .. } if text.is_empty() && tool_calls.is_empty())
+    });
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolCall {
     pub id: String,
@@ -526,5 +553,88 @@ mod tests {
         let v = serde_json::json!({"kind": "user", "text": "hi"});
         let m = Msg::from_json(&v).expect("legacy user msg");
         assert!(m.as_json().get("ts").is_none());
+    }
+
+    fn assistant(text: &str, calls: &[(&str, &str)]) -> Msg {
+        Msg::Assistant {
+            text: text.into(),
+            tool_calls: calls
+                .iter()
+                .map(|(id, name)| ToolCall {
+                    id: (*id).into(),
+                    name: (*name).into(),
+                    arguments: serde_json::json!({}),
+                })
+                .collect(),
+            ts: None,
+        }
+    }
+
+    fn result(call_id: &str) -> Msg {
+        Msg::ToolResult {
+            call_id: call_id.into(),
+            text: "ok".into(),
+            is_error: false,
+        }
+    }
+
+    #[test]
+    fn strip_unanswered_tool_calls_heals_a_dangling_earlier_turn() {
+        // Turn 1 was cancelled mid-batch: its second call never ran. Turn 2
+        // ran and answered its own call. A tail-only strip would leave turn
+        // 1's dangling call in the request and the provider would reject it.
+        let mut messages = vec![
+            Msg::User {
+                text: "one".into(),
+                ts: None,
+            },
+            assistant("", &[("c0", "fs_list"), ("c1", "fs_read")]),
+            result("c0"),
+            Msg::User {
+                text: "two".into(),
+                ts: None,
+            },
+            assistant("done", &[("c2", "fs_list")]),
+            result("c2"),
+        ];
+        strip_unanswered_tool_calls(&mut messages);
+        assert_eq!(
+            messages,
+            vec![
+                Msg::User {
+                    text: "one".into(),
+                    ts: None,
+                },
+                assistant("", &[("c0", "fs_list")]),
+                result("c0"),
+                Msg::User {
+                    text: "two".into(),
+                    ts: None,
+                },
+                assistant("done", &[("c2", "fs_list")]),
+                result("c2"),
+            ]
+        );
+    }
+
+    #[test]
+    fn strip_unanswered_tool_calls_drops_an_empty_abandoned_message() {
+        // nothing ran at all: the assistant message is left with no text and
+        // no calls, so it must go — an empty assistant turn is its own 400
+        let mut messages = vec![
+            Msg::User {
+                text: "hi".into(),
+                ts: None,
+            },
+            assistant("", &[("c0", "fs_list")]),
+        ];
+        strip_unanswered_tool_calls(&mut messages);
+        assert_eq!(
+            messages,
+            vec![Msg::User {
+                text: "hi".into(),
+                ts: None,
+            }]
+        );
     }
 }

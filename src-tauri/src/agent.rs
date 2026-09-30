@@ -1147,6 +1147,11 @@ impl Agent {
                 )
             };
             let mut snapshot = history.clone();
+            // A cancelled turn (or a crash between a call and its result)
+            // leaves an assistant `tool_call` with no result, which every
+            // provider rejects. Strip the snapshot, never `history` —
+            // `run_turn` persists that copy as the transcript's record.
+            crate::providers::strip_unanswered_tool_calls(&mut snapshot);
             snapshot.insert(0, system_message(&cwd, scope, &main_prompt, mode));
             // A message that references an earlier chat carries an id token;
             // the model only sees the token, so remind it that the history is

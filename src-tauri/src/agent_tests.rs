@@ -3,7 +3,7 @@
 //! by the last user message text — the subagent task or the main prompt —
 //! with unique keys per test since the script store is process-global.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use async_trait::async_trait;
@@ -59,6 +59,29 @@ struct CapturedRound {
     model: String,
     effort: Option<String>,
     users: Vec<String>,
+    /// Assistant `tool_call` ids this request never paired with a
+    /// `ToolResult` — providers reject those.
+    unanswered_calls: Vec<String>,
+}
+
+/// Assistant `tool_call` ids in `messages` that no `ToolResult` answers.
+fn unanswered_call_ids(messages: &[Msg]) -> Vec<String> {
+    let answered: HashSet<&str> = messages
+        .iter()
+        .filter_map(|m| match m {
+            Msg::ToolResult { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    messages
+        .iter()
+        .flat_map(|m| match m {
+            Msg::Assistant { tool_calls, .. } => tool_calls.as_slice(),
+            _ => &[],
+        })
+        .filter(|call| !answered.contains(call.id.as_str()))
+        .map(|call| call.id.clone())
+        .collect()
 }
 
 static CAPTURES: LazyLock<Mutex<HashMap<String, Vec<CapturedRound>>>> =
@@ -134,6 +157,7 @@ impl LlmProvider for MockProvider {
                         _ => None,
                     })
                     .collect(),
+                unanswered_calls: unanswered_call_ids(messages),
             });
         let mut round = SCRIPTS
             .lock()
@@ -2285,5 +2309,69 @@ async fn steering_is_not_delivered_when_the_run_is_cancelled() {
         steering.lock().unwrap().len(),
         1,
         "the steer stays queued so the frontend can resend it"
+    );
+}
+
+/// A turn cancelled mid-batch leaves the calls it never ran with no result.
+/// Providers reject an assistant `tool_use` without a matching `tool_result`,
+/// so the *next* request must not carry one — including a dangling call left
+/// by an earlier turn.
+#[tokio::test]
+async fn a_cancelled_batch_never_answers_the_next_turn_with_a_dangling_call() {
+    let ct = CancellationToken::new();
+    // Call 0 is a subagent that cancels the shared token while the parent
+    // awaits its result, so call 1 is never executed. The pre-pass spawns the
+    // subagent before the ordered pass, so the cancel lands while the parent
+    // is joining it — after call 0's result is already in the history.
+    script(
+        "cancel-batch",
+        vec![MockRound::Tools(vec![
+            (
+                SUBAGENT.into(),
+                serde_json::json!({"task": "cancel-batch-sub"}),
+            ),
+            ("ducky__fs_list".into(), serde_json::json!({})),
+        ])],
+    );
+    script(
+        "cancel-batch-sub",
+        vec![MockRound::Cancel(
+            ct.clone(),
+            Box::new(MockRound::Text("done".into())),
+        )],
+    );
+
+    let (agent, _sink, store) = test_agent("cancel-batch");
+    run(&agent, "cancel-batch", "cancel-batch", &ct).await;
+
+    // reproduction precondition: the persisted history keeps the call the
+    // cancelled batch never ran
+    let (_, raw) = store.load_conversation("cancel-batch").unwrap();
+    let history: Vec<Msg> = raw.iter().filter_map(Msg::from_json).collect();
+    assert_eq!(
+        unanswered_call_ids(&history),
+        vec!["call_1_ducky__fs_list".to_string()],
+        "precondition: the cancelled batch leaves its second call unanswered"
+    );
+
+    // the next user turn must not send that call to the provider
+    script("cancel-batch-2", vec![MockRound::Text("ok".into())]);
+    agent
+        .run_turn(
+            "cancel-batch".into(),
+            "mock".into(),
+            "mock-model".into(),
+            history,
+            "cancel-batch-2".into(),
+            CancellationToken::new(),
+            Arc::new(Mutex::new(VecDeque::new())),
+        )
+        .await;
+    let captured = captures_for("cancel-batch-2");
+    assert_eq!(captured.len(), 1, "the second turn must reach the model");
+    assert!(
+        captured[0].unanswered_calls.is_empty(),
+        "the request carried unanswered tool calls: {:?}",
+        captured[0].unanswered_calls
     );
 }
