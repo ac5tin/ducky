@@ -20,6 +20,9 @@ pub struct OpenAiProvider {
     /// Z.ai-style gateways need `thinking` enabled for `reasoning_effort`
     /// to take effect.
     pub thinking_toggle: bool,
+    /// The official OpenAI endpoint rejects `max_tokens` on reasoning models
+    /// and wants `max_completion_tokens`; other gateways keep the legacy name.
+    pub max_completion_tokens: bool,
 }
 
 impl OpenAiProvider {
@@ -41,6 +44,7 @@ impl OpenAiProvider {
         tools: &[ToolDef],
         opts: &ChatOptions,
         thinking_toggle: bool,
+        max_completion_tokens: bool,
     ) -> Value {
         let mut body = json!({
             "model": opts.model,
@@ -53,7 +57,11 @@ impl OpenAiProvider {
             body["tool_choice"] = json!("auto");
         }
         if let Some(max) = opts.max_tokens {
-            body["max_tokens"] = json!(max);
+            if max_completion_tokens {
+                body["max_completion_tokens"] = json!(max);
+            } else {
+                body["max_tokens"] = json!(max);
+            }
         }
         if let Some(t) = opts.temperature {
             body["temperature"] = json!(t);
@@ -232,7 +240,13 @@ impl LlmProvider for OpenAiProvider {
         opts: &ChatOptions,
         tx: mpsc::Sender<ProviderEvent>,
     ) -> anyhow::Result<StopReason> {
-        let body = Self::build_body(messages, tools, opts, self.thinking_toggle);
+        let body = Self::build_body(
+            messages,
+            tools,
+            opts,
+            self.thinking_toggle,
+            self.max_completion_tokens,
+        );
 
         let mut request = self.auth_headers(http_client().post(self.endpoint("/chat/completions")));
         for (name, value) in super::gateway_headers(&self.base_url, opts.session_id.as_deref()) {
@@ -411,12 +425,12 @@ mod tests {
             effort: Some(EffortLevel::High),
             session_id: None,
         };
-        let body = OpenAiProvider::build_body(&[], &[], &opts, true);
+        let body = OpenAiProvider::build_body(&[], &[], &opts, true, false);
         assert_eq!(body["reasoning_effort"], "high");
         assert_eq!(body["thinking"]["type"], "enabled");
 
         // non-Z.ai gateways get no thinking toggle
-        let body = OpenAiProvider::build_body(&[], &[], &opts, false);
+        let body = OpenAiProvider::build_body(&[], &[], &opts, false, false);
         assert_eq!(body["reasoning_effort"], "high");
         assert!(body.get("thinking").is_none());
 
@@ -424,8 +438,26 @@ mod tests {
             effort: None,
             ..opts
         };
-        let body = OpenAiProvider::build_body(&[], &[], &unset, true);
+        let body = OpenAiProvider::build_body(&[], &[], &unset, true, false);
         assert!(body.get("reasoning_effort").is_none());
         assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn official_openai_uses_max_completion_tokens() {
+        let opts = ChatOptions {
+            model: "gpt-5".into(),
+            max_tokens: Some(2048),
+            ..Default::default()
+        };
+        // the official endpoint rejects `max_tokens` on reasoning models
+        let body = OpenAiProvider::build_body(&[], &[], &opts, false, true);
+        assert_eq!(body["max_completion_tokens"], 2048);
+        assert!(body.get("max_tokens").is_none());
+
+        // OpenAI-compatible gateways keep the legacy parameter
+        let body = OpenAiProvider::build_body(&[], &[], &opts, false, false);
+        assert_eq!(body["max_tokens"], 2048);
+        assert!(body.get("max_completion_tokens").is_none());
     }
 }

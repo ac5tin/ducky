@@ -405,6 +405,9 @@ pub fn build_wired_provider(
             name: cfg.name.clone(),
             // Z.ai needs `thinking` enabled for `reasoning_effort` to apply
             thinking_toggle: matches!(cfg.kind.as_str(), "zai" | "zai-coding"),
+            // OpenAI rejects `max_tokens` on reasoning models; every other
+            // compatible gateway keeps the legacy name
+            max_completion_tokens: cfg.kind == "openai",
         }),
         Wire::Messages => std::sync::Arc::new(anthropic::AnthropicProvider {
             base_url: cfg.base_url.clone(),
