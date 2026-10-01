@@ -355,20 +355,68 @@ fn push_collapsed(lines: &mut Vec<String>, line: String) {
     lines.push(line);
 }
 
-/// Index of the newest real user message. The cut drops everything before it
-/// and keeps it plus everything after, so the request the user just made
-/// never disappears into a summary. `None` = nothing worth compacting.
-pub fn cut_index(history: &[Msg]) -> Option<usize> {
+/// Share of the context window kept verbatim after a compaction. The rest is
+/// summarised, so a compacted request stays far below the trigger.
+const TAIL_BUDGET_RATIO: f64 = 0.25;
+
+/// Index where the kept tail starts: the cut drops everything before it.
+///
+/// The tail is bounded by `tail_budget` tokens and may only start on a user or
+/// assistant message — starting on a tool result would orphan it for the
+/// provider. Whole turns are kept while they fit, so the request the user is
+/// waiting on survives; only a turn that is itself bigger than the budget is
+/// cut mid-turn. `None` = nothing worth compacting.
+pub fn cut_index(history: &[Msg], tail_budget: u64) -> Option<usize> {
+    let is_carrier = |m: &Msg| matches!(m, Msg::User { text, .. } if text.starts_with(COMPACT_MARKER));
+    let newest = history.iter().rposition(
+        |m| matches!(m, Msg::User { text, .. } if !text.starts_with(COMPACT_MARKER)),
+    )?;
+    // earliest index whose whole tail fits the budget
+    let chars: Vec<usize> = history.iter().map(msg_chars).collect();
+    let mut running: usize = chars.iter().sum();
+    let mut fit = history.len();
+    for i in 0..history.len() {
+        if i > 0 {
+            running -= chars[i - 1];
+        }
+        if (running / CHARS_PER_TOKEN) as u64 <= tail_budget {
+            fit = i;
+            break;
+        }
+    }
+    // the largest tail that fits, starting where the provider expects
     let cut = history
         .iter()
-        .rposition(|m| matches!(m, Msg::User { text, .. } if !text.starts_with(COMPACT_MARKER)))?;
+        .enumerate()
+        .skip(fit)
+        .find(|(_, m)| !is_carrier(m) && !matches!(m, Msg::ToolResult { .. }))
+        .map_or(newest, |(i, _)| i);
     (cut > 0).then_some(cut)
 }
 
+/// Tokens kept verbatim after a compaction. `None` or a zero window means only
+/// the newest message is kept: there is nothing to bound against.
+pub fn tail_budget(limit: Option<u64>) -> u64 {
+    limit
+        .filter(|l| *l > 0)
+        .map_or(0, |l| (l as f64 * TAIL_BUDGET_RATIO) as u64)
+}
+
+/// Is `used` at or above the trigger `ratio` of the known window? Also the
+/// stall check after a compaction: if the kept tail alone is still over the
+/// trigger, another pass would land at the same cut and change nothing.
+pub fn over_threshold(ratio: f64, limit: Option<u64>, used: u64) -> bool {
+    limit
+        .filter(|l| *l > 0)
+        .is_some_and(|limit| used as f64 >= limit as f64 * ratio)
+}
+
 /// The replacement history: the carrier plus the kept tail.
-pub fn apply_with_tail(history: &[Msg], summary: &str) -> Vec<Msg> {
+pub fn apply_with_tail(history: &[Msg], summary: &str, tail_budget: u64) -> Vec<Msg> {
     let mut out = history.to_vec();
-    install(&mut out, summary);
+    if let Some(cut) = cut_index(history, tail_budget) {
+        install(&mut out, cut, summary);
+    }
     out
 }
 
@@ -432,10 +480,10 @@ pub struct Window {
     pub brief: String,
 }
 
-/// Split a history for compaction. `None` when everything is newer than the
-/// newest user turn, so there is nothing to drop.
-pub fn window(history: &[Msg]) -> Option<Window> {
-    let cut = cut_index(history)?;
+/// Split a history for compaction. `None` when everything fits the tail
+/// budget, so there is nothing to drop.
+pub fn window(history: &[Msg], tail_budget: u64) -> Option<Window> {
+    let cut = cut_index(history, tail_budget)?;
     let dropped = &history[..cut];
     let prior = prior_summary(dropped);
     let mut extracted = extract(dropped);
@@ -450,14 +498,11 @@ pub fn window(history: &[Msg]) -> Option<Window> {
     })
 }
 
-/// Install a finished summary: the carrier plus everything from the newest
-/// user turn on. No-op when there is nothing to compact.
-pub fn install(history: &mut Vec<Msg>, summary: &str) {
-    if let Some(cut) = cut_index(history) {
-        let mut next = apply(summary);
-        next.extend_from_slice(&history[cut..]);
-        *history = next;
-    }
+/// Install a finished summary: the carrier plus everything from `cut` on.
+pub fn install(history: &mut Vec<Msg>, cut: usize, summary: &str) {
+    let mut next = apply(summary);
+    next.extend_from_slice(&history[cut..]);
+    *history = next;
 }
 
 /// Whether the loop should compact before the next model call. Pure, so every
@@ -467,41 +512,31 @@ pub fn auto_compact_due(
     ratio: f64,
     limit: Option<u64>,
     used: Option<u64>,
-    already_compacted_this_turn: bool,
 ) -> bool {
-    if !enabled || already_compacted_this_turn {
-        return false;
+    enabled && used.is_some_and(|used| over_threshold(ratio, limit, used))
+}
+
+/// Characters in one message, the basis for every token estimate here.
+fn msg_chars(m: &Msg) -> usize {
+    match m {
+        Msg::System { text } | Msg::User { text, .. } => text.chars().count(),
+        Msg::Assistant {
+            text, tool_calls, ..
+        } => {
+            text.chars().count()
+                + tool_calls
+                    .iter()
+                    .map(|c| c.name.chars().count() + c.arguments.to_string().len())
+                    .sum::<usize>()
+        }
+        Msg::ToolResult { text, .. } => text.chars().count(),
     }
-    // no known window: never guess one
-    let Some(limit) = limit.filter(|l| *l > 0) else {
-        return false;
-    };
-    let Some(used) = used else {
-        return false;
-    };
-    used as f64 >= limit as f64 * ratio
 }
 
 /// Rough token count for a history, about four characters per token. Used
 /// until the provider reports real usage for a conversation.
 pub fn estimate_tokens(history: &[Msg]) -> u64 {
-    let chars: usize = history
-        .iter()
-        .map(|m| match m {
-            Msg::System { text } | Msg::User { text, .. } => text.chars().count(),
-            Msg::Assistant {
-                text, tool_calls, ..
-            } => {
-                text.chars().count()
-                    + tool_calls
-                        .iter()
-                        .map(|c| c.name.chars().count() + c.arguments.to_string().len())
-                        .sum::<usize>()
-            }
-            Msg::ToolResult { text, .. } => text.chars().count(),
-        })
-        .sum();
-    (chars / CHARS_PER_TOKEN) as u64
+    (history.iter().map(msg_chars).sum::<usize>() / CHARS_PER_TOKEN) as u64
 }
 
 /// The summary carried by the latest compaction, if the history has one.
@@ -638,9 +673,15 @@ pub async fn run(
     if history.is_empty() {
         return Err("Nothing to compact — the conversation is empty.".into());
     }
-    let window = window(&history).ok_or("Nothing to compact yet — send another message first.")?;
+    let limit = match agent.conversation_model(conversation_id) {
+        Some((kind, model)) => agent.context_limit(conversation_id, &kind, &model).await,
+        None => None,
+    };
+    let budget = tail_budget(limit);
+    let window = window(&history, budget)
+        .ok_or("Nothing to compact yet — send another message first.")?;
     let summary = summarize_window(agent, conversation_id, &window, instructions).await?;
-    let messages: Vec<serde_json::Value> = apply_with_tail(&history, &summary)
+    let messages: Vec<serde_json::Value> = apply_with_tail(&history, &summary, budget)
         .iter()
         .map(|m| m.as_json())
         .collect();
@@ -710,7 +751,7 @@ mod tests {
             session_id: None,
         };
         let history = vec![user("hello"), user("and goodbye")];
-        let w = window(&history).unwrap();
+        let w = window(&history, 0).unwrap();
         let summary = summarize(provider, options, &w, None).await.unwrap();
         let expected: String = (0..64).map(|i| format!("chunk{i} ")).collect();
         assert_eq!(summary, expected);
@@ -827,8 +868,8 @@ mod tests {
             user("second ask"),
             assistant("second answer"),
         ];
-        assert_eq!(cut_index(&history), Some(2));
-        let applied = apply_with_tail(&history, "SUMMARY");
+        assert_eq!(cut_index(&history, 0), Some(2));
+        let applied = apply_with_tail(&history, "SUMMARY", 0);
         assert_eq!(applied.len(), 3);
         assert!(matches!(&applied[0], Msg::User { text, .. } if text.starts_with(COMPACT_MARKER)));
         assert!(matches!(&applied[1], Msg::User { text, .. } if text == "second ask"));
@@ -837,14 +878,20 @@ mod tests {
 
     #[test]
     fn cut_is_none_without_a_second_user_turn() {
-        assert_eq!(cut_index(&[user("only ask")]), None);
-        assert_eq!(cut_index(&[user("only ask"), assistant("answer")]), None);
+        assert_eq!(cut_index(&[user("only ask")], 0), None);
         assert_eq!(
-            cut_index(&[
-                user("only ask"),
-                assistant("answer"),
-                tool_result("c1", "out", false)
-            ]),
+            cut_index(&[user("only ask"), assistant("answer")], 0),
+            None
+        );
+        assert_eq!(
+            cut_index(
+                &[
+                    user("only ask"),
+                    assistant("answer"),
+                    tool_result("c1", "out", false)
+                ],
+                0
+            ),
             None
         );
     }
@@ -854,8 +901,8 @@ mod tests {
         let mut history = apply("older summary");
         history.push(user("new ask"));
         history.push(assistant("new answer"));
-        assert_eq!(cut_index(&history), Some(1));
-        let applied = apply_with_tail(&history, "NEW");
+        assert_eq!(cut_index(&history, 0), Some(1));
+        let applied = apply_with_tail(&history, "NEW", 0);
         assert_eq!(applied.len(), 3);
         assert!(matches!(&applied[1], Msg::User { text, .. } if text == "new ask"));
         assert!(matches!(&applied[2], Msg::Assistant { text, .. } if text == "new answer"));
@@ -863,7 +910,7 @@ mod tests {
 
     #[test]
     fn cut_is_none_when_the_carrier_is_the_newest_user_message() {
-        assert_eq!(cut_index(&apply("older summary")), None);
+        assert_eq!(cut_index(&apply("older summary"), 0), None);
     }
 
     #[test]
@@ -1072,7 +1119,7 @@ mod tests {
         history.push(user("new ask"));
         history.push(assistant("new answer"));
         history.push(user("newest ask"));
-        let w = window(&history).expect("compactable");
+        let w = window(&history, 0).expect("compactable");
         assert_eq!(w.cut, 3);
         assert_eq!(
             w.prior.as_deref(),
@@ -1084,14 +1131,15 @@ mod tests {
 
     #[test]
     fn window_is_none_when_there_is_nothing_older() {
-        assert!(window(&[user("only ask")]).is_none());
-        assert!(window(&apply("older summary")).is_none());
+        assert!(window(&[user("only ask")], 0).is_none());
+        assert!(window(&apply("older summary"), 0).is_none());
     }
 
     #[test]
     fn install_replaces_the_dropped_window_and_keeps_the_tail() {
         let mut next = vec![user("old ask"), assistant("old answer"), user("newest ask")];
-        install(&mut next, "SUMMARY");
+        let cut = cut_index(&next, 0).expect("compactable");
+        install(&mut next, cut, "SUMMARY");
         assert_eq!(next.len(), 2);
         assert!(matches!(&next[0], Msg::User { text, .. } if text.starts_with(COMPACT_MARKER)));
         assert!(matches!(&next[1], Msg::User { text, .. } if text == "newest ask"));
@@ -1103,49 +1151,97 @@ mod tests {
             true,
             0.8,
             Some(100_000),
-            Some(80_000),
-            false
-        ));
+            Some(80_000)));
         assert!(auto_compact_due(
             true,
             0.8,
             Some(100_000),
-            Some(95_000),
-            false
-        ));
+            Some(95_000)));
         assert!(!auto_compact_due(
             true,
             0.8,
             Some(100_000),
-            Some(79_999),
-            false
-        ));
+            Some(79_999)));
     }
 
     #[test]
-    fn auto_compact_stays_off_when_disabled_unknown_or_already_done() {
+    fn auto_compact_stays_off_when_disabled_or_the_window_is_unknown() {
         // switched off in Settings
-        assert!(!auto_compact_due(
-            false,
-            0.8,
-            Some(100_000),
-            Some(95_000),
-            false
-        ));
+        assert!(!auto_compact_due(false, 0.8, Some(100_000), Some(95_000)));
         // the model is not in the catalog, so its window is unknown
-        assert!(!auto_compact_due(true, 0.8, None, Some(95_000), false));
+        assert!(!auto_compact_due(true, 0.8, None, Some(95_000)));
         // a zero window would otherwise fire on every round trip
-        assert!(!auto_compact_due(true, 0.8, Some(0), Some(95_000), false));
+        assert!(!auto_compact_due(true, 0.8, Some(0), Some(95_000)));
         // nothing reported yet and no history to estimate from
-        assert!(!auto_compact_due(true, 0.8, Some(100_000), None, false));
-        // one compaction per user turn
-        assert!(!auto_compact_due(
-            true,
-            0.8,
-            Some(100_000),
-            Some(95_000),
-            true
-        ));
+        assert!(!auto_compact_due(true, 0.8, Some(100_000), None));
+    }
+
+    #[test]
+    fn tail_budget_scales_with_the_window() {
+        assert_eq!(tail_budget(None), 0);
+        assert_eq!(tail_budget(Some(0)), 0);
+        assert_eq!(tail_budget(Some(200_000)), 50_000);
+    }
+
+    #[test]
+    fn over_threshold_needs_a_known_window() {
+        assert!(!over_threshold(0.8, None, 999_999));
+        assert!(!over_threshold(0.8, Some(0), 999_999));
+    }
+
+    #[test]
+    fn over_threshold_is_the_stall_check_after_a_compaction() {
+        // the kept tail alone is still at the trigger
+        assert!(over_threshold(0.8, Some(100), 80));
+        assert!(over_threshold(0.8, Some(100), 95));
+        // the tail is back under the trigger, so another pass could help
+        assert!(!over_threshold(0.8, Some(100), 79));
+    }
+
+    #[test]
+    fn cut_keeps_whole_turns_that_fit_the_tail_budget() {
+        let history = vec![
+            user(&"a".repeat(400)),
+            assistant(&"b".repeat(400)),
+            user(&"c".repeat(400)),
+            assistant(&"d".repeat(400)),
+            user("last"),
+        ];
+        // 300 tokens only reaches back to the second turn
+        assert_eq!(cut_index(&history, 300), Some(2));
+        // nothing fits: keep only the newest message
+        assert_eq!(cut_index(&history, 0), Some(4));
+        // everything fits: nothing to drop
+        assert_eq!(cut_index(&history, 500), None);
+    }
+
+    #[test]
+    fn cut_bounds_a_turn_that_is_bigger_than_the_tail_budget() {
+        let history = vec![
+            user("old ask"),
+            assistant("old answer"),
+            user("current ask"),
+            tool_call(
+                "c1",
+                "ducky__fs_read",
+                serde_json::json!({ "path": "a.ts" }),
+            ),
+            tool_result("c1", &"x".repeat(20_000), false),
+            tool_call(
+                "c2",
+                "ducky__fs_read",
+                serde_json::json!({ "path": "b.ts" }),
+            ),
+            tool_result("c2", &"y".repeat(20_000), false),
+        ];
+        // only the last round fits, so the cut lands mid-turn on the assistant
+        // message that owns the newest tool result — never on the result
+        // itself, which the provider would see as orphaned
+        assert_eq!(cut_index(&history, 6_000), Some(5));
+        assert!(matches!(history[5], Msg::Assistant { .. }));
+        // with no window known there is nothing to bound against, so the
+        // user's request is kept
+        assert_eq!(cut_index(&history, 0), Some(2));
     }
 
     #[test]
@@ -1167,7 +1263,7 @@ mod tests {
         ));
         history.push(user("continue the work"));
         history.push(user("what is next?"));
-        let w = window(&history).unwrap();
+        let w = window(&history, 0).unwrap();
         let msgs = build_summarizer_messages(&w, Some("focus on auth"));
         assert_eq!(msgs.len(), 2);
         assert!(matches!(msgs[0], Msg::System { .. }));

@@ -39,8 +39,12 @@ summary and both keep the newest user turn.
 `agent_loop` checks the window at the top of each iteration, before the history
 is sent, main scope only (subagents never auto-compact). This covers both a new
 user message on a full chat and a long tool loop inside one turn — the case that
-actually overflows a window. The check runs at most once per turn: a second pass
-that is only re-summarising a summary is wasted work, and risks a loop.
+actually overflows a window. The check runs before the model call on every
+round. The loop keeps trying while each pass makes room, and stops for the turn
+once a pass leaves the context at or above the trigger (`over_threshold`): the
+kept tail is then too big and another pass would land at the same cut. A failed
+summary stops the turn's attempts too, so a broken provider is not retried on
+every round.
 
 The window comes from the models.dev catalog (`kind` + model). When the model is
 absent from the catalog the window is unknown and the trigger stays off — Ducky
@@ -51,20 +55,32 @@ kept in memory on `Agent`, and never less than a characters/4 estimate of the
 current history. The estimate covers a fresh app start, where no usage has been
 reported yet, and it also covers messages added since that call.
 
-### Cut: keep the newest user turn
+### Cut: a bounded tail, starting where the provider expects
 
-Compaction summarises everything *before* the newest user message and keeps that
-message plus everything after it as real messages. Manual `/compact` behaves the
-same way, so the transcript after either path is:
+Compaction summarises everything before the cut and keeps the rest as real
+messages. The cut is chosen so the kept tail stays bounded:
 
-```
+1. Find the earliest index whose whole tail is within `TAIL_BUDGET_RATIO`
+   (25%) of the context window.
+2. Cut at the smallest user or assistant message at or after that index, so
+   whole turns survive while they fit.
+3. If nothing fits, cut at the newest user message — there is no window to
+   bound against, so the request the user is waiting on is kept.
+
+The tail can never start on a tool result (the provider would see it as
+orphaned), and never after the newest user message unless that whole turn is
+bigger than the budget. Manual `/compact` behaves the same way. So the
+transcript after either path is normally:
+
+```text
 [Conversation compacted]  <- summary carrier
 user: <the newest request>
 assistant: <its answer>
 ```
 
-The cut is why the trigger is safe mid-turn: the request the user is waiting on
-is never summarised away.
+with one exception: inside a long tool loop, a turn that outgrows the tail
+budget is cut mid-turn, and the older rounds of that turn are summarised with
+the rest.
 
 ### Summary: deterministic blocks the model cannot touch
 
@@ -126,9 +142,13 @@ recall system Ducky does not have.
 - **Successful tool output is dropped from the summary.** Only errors survive in
   the brief, matching pi-blackhole. The files section names what was touched, so
   the agent can re-read a file, but it cannot see the old contents.
-- **A single very long turn is only protected once.** After the first
-  compaction, mid-turn growth is not compacted again (one per turn). A 25-round
-  turn that doubles the window is not saved by this feature.
+- **The newest request can be summarised.** When a single turn grows past the
+  tail budget, the cut lands mid-turn and the user's request survives only in
+  the summary. That is the price of bounding the tail; the alternative is a
+  request that overflows the window and fails outright.
+- **The 25% tail budget is a judgement call.** Too small and context that a
+  later turn needed is summarised away; too large and a compacted turn can
+  reach the trigger again almost immediately.
 - **Usage is not persisted.** After a restart the first check uses the
   characters/4 estimate, which undercounts the system prompt and tool
   definitions. The trigger fires a little late, never early.
@@ -146,8 +166,6 @@ recall system Ducky does not have.
 
 ## Revisit when
 
-- Mid-turn overflow after the first compaction matters enough to want a
-  token-bounded tail (`keepRecentTokens`) instead of a user-turn cut.
 - A dedicated compaction model is wanted (provider/model/effort override like
   the title generator), or the window-scaled threshold curve (90% at ≤32k down
   to 40% at 1M) replaces the flat percentage.

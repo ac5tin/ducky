@@ -101,12 +101,39 @@ pub(crate) fn provider_override() -> Option<Arc<dyn LlmProvider>> {
     Some(Arc::new(MockProvider))
 }
 
-/// What `Agent::context_limit` answers in test builds. `Some(None)` means
-/// "no window known", so no test reaches the network for the models.dev
-/// catalog. The auto-compaction decision itself is unit-tested in
-/// `compact::tests`.
-pub(crate) fn context_limit_override() -> Option<Option<u64>> {
-    Some(None)
+/// Context windows `Agent::context_limit` reports in test builds, keyed by
+/// conversation id. Conversations that are not listed answer "no window
+/// known", so no test reaches the network for the models.dev catalog, and one
+/// test cannot change what another one sees.
+static CONTEXT_LIMITS: LazyLock<Mutex<HashMap<String, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub(crate) fn context_limit_override(conversation_id: &str) -> Option<Option<u64>> {
+    Some(
+        CONTEXT_LIMITS
+            .lock()
+            .unwrap()
+            .get(conversation_id)
+            .copied(),
+    )
+}
+
+/// Report `limit` as the context window of `conversation_id` until the guard
+/// is dropped.
+fn context_limit_of(conversation_id: &str, limit: u64) -> ContextLimitGuard {
+    CONTEXT_LIMITS
+        .lock()
+        .unwrap()
+        .insert(conversation_id.to_string(), limit);
+    ContextLimitGuard(conversation_id.to_string())
+}
+
+struct ContextLimitGuard(String);
+
+impl Drop for ContextLimitGuard {
+    fn drop(&mut self) {
+        CONTEXT_LIMITS.lock().unwrap().remove(&self.0);
+    }
 }
 
 struct MockProvider;
@@ -2417,7 +2444,7 @@ async fn a_cancelled_batch_never_answers_the_next_turn_with_a_dangling_call() {
 /// The summariser request is keyed in the script store by its last user
 /// message, so the test builds the same prompt the agent will.
 fn summarizer_key(history: &[Msg]) -> String {
-    let w = crate::compact::window(history).expect("history must be compactable");
+    let w = crate::compact::window(history, 0).expect("history must be compactable");
     let prompt = crate::compact::build_summarizer_messages(&w, None);
     match prompt.last().expect("summariser prompt") {
         Msg::User { text, .. } => text.clone(),
@@ -2500,4 +2527,92 @@ async fn auto_compact_leaves_the_history_alone_when_the_summary_is_empty() {
     // nothing was written, so a reload still shows the full transcript
     let (_, saved) = store.load_conversation("autocompact-fail").unwrap();
     assert_eq!(saved.len(), 0);
+}
+
+/// The point of the feature: the loop compacts by itself, before the model
+/// sees the history, and the turn still finishes.
+#[tokio::test]
+async fn the_loop_auto_compacts_before_the_model_call() {
+    let (agent, sink, store) = test_agent_in_mode("autoloop-1", AgentMode::Default);
+    // the window lookup needs the provider's kind, so the conversation's
+    // provider must exist in the config
+    {
+        let mut cfg = store.config.lock().unwrap();
+        cfg.providers.push(ProviderConfig {
+            id: "mock".into(),
+            kind: "custom".into(),
+            name: "Mock".into(),
+            base_url: "http://localhost".into(),
+            api_type: crate::config::ApiType::OpenAi,
+            default_model: None,
+            models: vec!["mock-model".into()],
+            created_at: "t".into(),
+        });
+    }
+    let _limit = context_limit_of("autoloop-1", 1_000);
+
+    // ~1300 tokens of history against a 1000-token window: over the 80% trigger
+    let history = vec![
+        Msg::User {
+            text: format!("old ask {}", "x".repeat(4000)),
+            ts: None,
+        },
+        Msg::Assistant {
+            text: format!("old answer {}", "y".repeat(1200)),
+            tool_calls: Vec::new(),
+            ts: None,
+        },
+    ];
+    let mut with_new = history.clone();
+    with_new.push(Msg::User {
+        text: "new ask".into(),
+        ts: None,
+    });
+    script(
+        &summarizer_key(&with_new),
+        vec![MockRound::Text("## Objective\nfinish the task".into())],
+    );
+    script("new ask", vec![MockRound::Text("done".into())]);
+
+    agent
+        .run_turn(
+            "autoloop-1".into(),
+            "mock".into(),
+            "mock-model".into(),
+            history,
+            "new ask".into(),
+            CancellationToken::new(),
+            Arc::new(Mutex::new(VecDeque::new())),
+        )
+        .await;
+
+    let compacted = sink
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| matches!(e, BackendEvent::AutoCompacted { .. }))
+        .count();
+    assert_eq!(compacted, 1, "the loop must compact exactly once");
+
+    let (_, saved) = store.load_conversation("autoloop-1").unwrap();
+    let texts: Vec<String> = saved
+        .iter()
+        .filter_map(Msg::from_json)
+        .map(|m| match m {
+            Msg::System { text }
+            | Msg::User { text, .. }
+            | Msg::Assistant { text, .. }
+            | Msg::ToolResult { text, .. } => text,
+        })
+        .collect();
+    assert!(
+        texts[0].starts_with(crate::compact::COMPACT_MARKER),
+        "the transcript must start with the summary: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|t| t == "new ask"),
+        "the request the user is waiting on must survive: {texts:?}"
+    );
+    assert!(texts.iter().any(|t| t == "done"), "the turn must finish: {texts:?}");
 }

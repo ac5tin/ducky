@@ -375,6 +375,18 @@ pub struct PendingSteer {
 pub type SteeringQueue = Mutex<VecDeque<PendingSteer>>;
 
 /// Runtime state for a conversation that is currently generating.
+/// What one automatic compaction attempt did, for the loop's bookkeeping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactOutcome {
+    /// Not due, or nothing worth compacting: try again on a later round.
+    Retry,
+    /// A compaction landed and made room.
+    Compacted,
+    /// Stop for this turn: the summary failed, or the kept tail is still over
+    /// the trigger so another pass would land at the same cut.
+    Done,
+}
+
 pub struct ConversationRuntime {
     pub ct: CancellationToken,
     pub steering: Arc<SteeringQueue>,
@@ -1044,9 +1056,9 @@ impl Agent {
         scope: &RunScope,
         steering: Option<&SteeringQueue>,
     ) -> Result<Option<String>, String> {
-        // One compaction per user turn: a second pass at the same cut would
-        // only re-summarise the summary.
-        let mut auto_compacted = false;
+        // Set when compaction has stopped helping this turn, so the loop does
+        // not call the summariser again on every remaining round.
+        let mut stop_compacting = false;
         for _ in 0..max_iterations {
             // A cancelled run must not consume a pending steer: the frontend
             // resends it as a normal turn (spec: cancelled pending steers).
@@ -1070,12 +1082,11 @@ impl Agent {
             }
             // Auto-compaction runs before the model sees the history, so a
             // long tool loop is covered and not just a new user message.
-            if scope.is_main()
-                && self
-                    .maybe_auto_compact(conversation_id, history, auto_compacted)
-                    .await
-            {
-                auto_compacted = true;
+            if scope.is_main() && !stop_compacting {
+                match self.compact_if_full(conversation_id, history).await {
+                    CompactOutcome::Retry | CompactOutcome::Compacted => {}
+                    CompactOutcome::Done => stop_compacting = true,
+                }
             }
             let (provider, default_model, _provider_name) =
                 self.provider_for(provider_id, model).await?;
@@ -2377,71 +2388,80 @@ ProviderEvent::Usage {
         last.map_or(estimated, |l| l.max(estimated))
     }
 
-    /// The model's context window from the catalog. Test builds answer
-    /// "unknown" so the suite never reaches the network for it.
-    async fn context_limit(&self, kind: &str, model: &str) -> Option<u64> {
+    /// The model's context window from the catalog. Test builds answer from a
+    /// per-conversation table so the suite never reaches the network.
+    pub(crate) async fn context_limit(
+        &self,
+        conversation_id: &str,
+        kind: &str,
+        model: &str,
+    ) -> Option<u64> {
+        let _ = conversation_id;
         #[cfg(test)]
-        if let Some(overridden) = crate::agent_tests::context_limit_override() {
+        if let Some(overridden) = crate::agent_tests::context_limit_override(conversation_id) {
             return overridden;
         }
         self.catalog.context_limit(kind, model).await
     }
 
-    /// Auto-compaction settings plus the model they apply to.
-    fn compaction_prefs(&self, conversation_id: &str) -> (bool, f64, String, String) {
+    /// The provider kind and model this conversation talks to.
+    pub(crate) fn conversation_model(&self, conversation_id: &str) -> Option<(String, String)> {
         let cfg = self.store.config.lock().unwrap();
+        let meta = cfg.conversations.iter().find(|c| c.id == conversation_id)?;
         let kind = cfg
-            .conversations
+            .providers
             .iter()
-            .find(|c| c.id == conversation_id)
-            .and_then(|meta| {
-                cfg.providers
-                    .iter()
-                    .find(|p| p.id == meta.provider_id)
-                    .map(|p| (p.kind.clone(), meta.model.clone()))
-            });
-        let (kind, model) = kind.unwrap_or_default();
-        (
-            cfg.settings.auto_compact,
-            cfg.settings.auto_compact_ratio(),
-            kind,
-            model,
-        )
+            .find(|p| p.id == meta.provider_id)?
+            .kind
+            .clone();
+        Some((kind, meta.model.clone()))
     }
 
-    /// Compact before the next model call when the window is nearly full.
-    /// Returns true when a compaction happened.
-    async fn maybe_auto_compact(
-        &self,
-        conversation_id: &str,
-        history: &mut Vec<Msg>,
-        already_compacted: bool,
-    ) -> bool {
-        let (enabled, ratio, kind, model) = self.compaction_prefs(conversation_id);
+    /// Auto-compaction settings, as `(enabled, trigger ratio)`.
+    fn compaction_settings(&self) -> (bool, f64) {
+        let cfg = self.store.config.lock().unwrap();
+        (cfg.settings.auto_compact, cfg.settings.auto_compact_ratio())
+    }
+
+    /// The context window of the model this conversation uses.
+    pub(crate) async fn conversation_context_limit(&self, conversation_id: &str) -> Option<u64> {
+        let (kind, model) = self.conversation_model(conversation_id)?;
+        self.context_limit(conversation_id, &kind, &model).await
+    }
+
+    /// Compact before the next model call when the window is nearly full, so a
+    /// long tool loop is bounded and not just a new user message.
+    async fn compact_if_full(&self, conversation_id: &str, history: &mut Vec<Msg>) -> CompactOutcome {
+        let (enabled, ratio) = self.compaction_settings();
         let limit = if enabled {
-            self.context_limit(&kind, &model).await
+            self.conversation_context_limit(conversation_id).await
         } else {
             None
         };
-        let used = Some(self.context_used(conversation_id, history));
-        if !compact::auto_compact_due(enabled, ratio, limit, used, already_compacted) {
-            return false;
+        let used = self.context_used(conversation_id, history);
+        if !compact::auto_compact_due(enabled, ratio, limit, Some(used)) {
+            return CompactOutcome::Retry;
         }
         match self.auto_compact(conversation_id, history).await {
             Ok(()) => {
-                let percent = used
-                    .zip(limit)
-                    .map_or(0, |(u, l)| (u * 100 / l).min(100) as u8);
+                let percent = limit.map_or(0, |l| (used * 100 / l.max(1)).min(100) as u8);
                 self.sink.emit(BackendEvent::AutoCompacted {
                     conversation_id: conversation_id.to_string(),
                     percent,
                 });
-                true
+                // the kept tail alone can still be over the trigger on a huge
+                // turn; another pass would land at the same cut and do nothing
+                if compact::over_threshold(ratio, limit, self.context_used(conversation_id, history))
+                {
+                    CompactOutcome::Done
+                } else {
+                    CompactOutcome::Compacted
+                }
             }
-            // never abort the turn: the history just stays as it is
+            // never abort the turn, and never retry a failing summary
             Err(e) => {
                 tracing::warn!("auto-compaction skipped: {e}");
-                false
+                CompactOutcome::Done
             }
         }
     }
@@ -2454,9 +2474,11 @@ ProviderEvent::Usage {
         conversation_id: &str,
         history: &mut Vec<Msg>,
     ) -> Result<(), String> {
-        let window = compact::window(history).ok_or("nothing older than the newest message")?;
+        let budget = compact::tail_budget(self.conversation_context_limit(conversation_id).await);
+        let window =
+            compact::window(history, budget).ok_or("nothing older than the newest message")?;
         let summary = compact::summarize_window(self, conversation_id, &window, None).await?;
-        compact::install(history, &summary);
+        compact::install(history, window.cut, &summary);
         // the message indexes moved, so the /undo records no longer apply
         self.persist_with_undo(conversation_id, history, &[])?;
         // the recorded usage describes the pre-compaction request
