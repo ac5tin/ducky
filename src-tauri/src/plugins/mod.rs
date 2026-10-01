@@ -28,6 +28,7 @@ pub use diagnostics::{DiagLevel, Diagnostic};
 
 pub mod layout;
 pub mod manifest;
+pub mod marketplace;
 pub mod path;
 
 #[cfg(test)]

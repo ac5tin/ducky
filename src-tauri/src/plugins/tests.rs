@@ -1,10 +1,12 @@
-//! Plugin manifest, path containment and layout tests (design §1–§2, §13).
+//! Plugin manifest, path containment, layout and marketplace tests
+//! (design §1–§2, §5, §13).
 
 use std::path::Path;
 
 use super::diagnostics::DiagLevel;
 use super::layout::{discover, PluginTransport, RemoteKind};
 use super::manifest::{load, Layout};
+use super::marketplace::{parse_registry, parse_source, PluginSource};
 
 const SPEC_100: &str = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
 
@@ -699,4 +701,322 @@ fn claude_mcp_json_outside_symlink_skipped() {
             && d.message.contains("outside")
             && !d.message.contains("MCP disabled")
     }));
+}
+
+// ---------------------------------------------------------------------------
+// Marketplace registries (design §5)
+// ---------------------------------------------------------------------------
+
+/// A registry body with `name` and a `plugins` array written from `plugins`.
+fn registry_body(name: &str, plugins: &str) -> String {
+    format!(r#"{{"name": "{name}", "plugins": [{plugins}]}}"#)
+}
+
+#[test]
+fn probes_claude_path_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        ".claude-plugin/marketplace.json",
+        &registry_body("claude", r#"{"name": "a", "source": "./a"}"#),
+    );
+    write(tmp.path(), "marketplace.json", &registry_body("root", ""));
+    write(
+        tmp.path(),
+        ".ducky/marketplace.json",
+        &registry_body("ducky", ""),
+    );
+
+    let registry = parse_registry(tmp.path()).unwrap();
+
+    assert_eq!(registry.name, "claude");
+    assert!(registry
+        .registry_path
+        .ends_with(".claude-plugin/marketplace.json"));
+    assert_eq!(registry.entries.len(), 1);
+}
+
+#[test]
+fn probes_root_marketplace_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "marketplace.json",
+        &registry_body("root", r#"{"name": "a", "source": "./a"}"#),
+    );
+
+    let registry = parse_registry(tmp.path()).unwrap();
+
+    assert_eq!(registry.name, "root");
+    assert!(registry.registry_path.ends_with("marketplace.json"));
+    assert!(!registry
+        .registry_path
+        .ends_with(".claude-plugin/marketplace.json"));
+}
+
+#[test]
+fn probes_ducky_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        ".ducky/marketplace.json",
+        &registry_body("ducky", ""),
+    );
+
+    let registry = parse_registry(tmp.path()).unwrap();
+
+    assert_eq!(registry.name, "ducky");
+    assert!(registry.registry_path.ends_with(".ducky/marketplace.json"));
+}
+
+#[test]
+fn no_registry_is_an_error() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let diagnostics = parse_registry(tmp.path()).unwrap_err();
+
+    assert!(diagnostics.iter().any(
+        |d| d.level == DiagLevel::Error && d.message.contains("no marketplace registry found")
+    ));
+}
+
+#[test]
+fn plugins_not_an_array_is_an_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "marketplace.json",
+        r#"{"name": "m", "plugins": {}}"#,
+    );
+
+    let diagnostics = parse_registry(tmp.path()).unwrap_err();
+
+    assert!(diagnostics
+        .iter()
+        .any(|d| d.level == DiagLevel::Error && d.message.contains("plugins")));
+}
+
+#[test]
+fn entry_without_source_unavailable() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "marketplace.json",
+        &registry_body("m", r#"{"name": "x"}"#),
+    );
+
+    let registry = parse_registry(tmp.path()).unwrap();
+
+    let entry = &registry.entries[0];
+    assert_eq!(entry.name, "x");
+    assert!(!entry.available);
+    assert!(entry
+        .reason
+        .as_deref()
+        .unwrap_or_default()
+        .contains("source"));
+    assert!(matches!(&entry.source, PluginSource::Unsupported { .. }));
+}
+
+#[test]
+fn github_source_without_repo_unavailable() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "marketplace.json",
+        &registry_body("m", r#"{"name": "x", "source": {"source": "github"}}"#),
+    );
+
+    let registry = parse_registry(tmp.path()).unwrap();
+
+    let entry = &registry.entries[0];
+    assert!(!entry.available);
+    assert!(entry.reason.as_deref().unwrap_or_default().contains("repo"));
+}
+
+#[test]
+fn all_source_discriminators_parse() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plugins = r#"
+        {"name": "path", "source": "./p"},
+        {"name": "github", "source": {"source": "github", "repo": "o/r", "path": "sub", "ref": "main", "sha": "abc123"}},
+        {"name": "git", "source": {"source": "git", "url": "https://example.com/r.git"}},
+        {"name": "subdir", "source": {"source": "git-subdir", "url": "https://example.com/r.git", "path": "sub/dir"}},
+        {"name": "directory", "source": {"source": "directory", "path": "dir"}},
+        {"name": "file", "source": {"source": "file", "path": "f.json"}},
+        {"name": "url", "source": {"source": "url", "url": "https://example.com/registry.json"}}
+    "#;
+    write(tmp.path(), "marketplace.json", &registry_body("m", plugins));
+
+    let registry = parse_registry(tmp.path()).unwrap();
+
+    assert_eq!(registry.entries.len(), 7);
+    assert!(registry.entries.iter().all(|entry| entry.available));
+    let sources: Vec<PluginSource> = registry
+        .entries
+        .iter()
+        .map(|entry| entry.source.clone())
+        .collect();
+    assert_eq!(
+        sources,
+        vec![
+            PluginSource::Path {
+                path: "./p".to_string()
+            },
+            PluginSource::Github {
+                repo: "o/r".to_string(),
+                path: Some("sub".to_string()),
+                git_ref: Some("main".to_string()),
+                sha: Some("abc123".to_string()),
+            },
+            PluginSource::Git {
+                url: "https://example.com/r.git".to_string(),
+                path: None,
+                git_ref: None,
+                sha: None,
+            },
+            PluginSource::GitSubdir {
+                url: "https://example.com/r.git".to_string(),
+                path: "sub/dir".to_string(),
+                git_ref: None,
+                sha: None,
+            },
+            PluginSource::Path {
+                path: "dir".to_string()
+            },
+            PluginSource::Path {
+                path: "f.json".to_string()
+            },
+            PluginSource::Url {
+                url: "https://example.com/registry.json".to_string()
+            },
+        ]
+    );
+}
+
+#[test]
+fn unsupported_source_kinds_are_unavailable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plugins = r#"
+        {"name": "a", "source": {"source": "npm", "package": "x"}},
+        {"name": "b", "source": {"source": "archive", "url": "https://example.com/a.tar.gz"}},
+        {"name": "c", "source": {"source": "command", "command": "install-me"}}
+    "#;
+    write(tmp.path(), "marketplace.json", &registry_body("m", plugins));
+
+    let registry = parse_registry(tmp.path()).unwrap();
+
+    assert_eq!(registry.entries.len(), 3);
+    for (entry, kind) in registry.entries.iter().zip(["npm", "archive", "command"]) {
+        assert!(!entry.available, "{kind} must be unavailable");
+        let reason = entry.reason.as_deref().unwrap_or_default();
+        assert!(reason.contains(kind), "reason {reason:?} must name {kind}");
+        assert!(
+            matches!(&entry.source, PluginSource::Unsupported { kind: found, .. } if found.as_str() == kind)
+        );
+    }
+}
+
+#[test]
+fn unknown_entry_fields_ignored() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "marketplace.json",
+        r#"{"name": "m", "futureTop": true, "plugins": [
+            {"name": "x", "source": "./p", "futureField": {"nested": [1, 2, 3]}}
+        ]}"#,
+    );
+
+    let registry = parse_registry(tmp.path()).unwrap();
+
+    assert_eq!(registry.entries.len(), 1);
+    let entry = &registry.entries[0];
+    assert_eq!(entry.name, "x");
+    assert!(entry.available);
+    assert_eq!(
+        entry.source,
+        PluginSource::Path {
+            path: "./p".to_string()
+        }
+    );
+}
+
+#[test]
+fn shorthand_owner_repo_marketplace_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "marketplace.json",
+        &registry_body("m", r#"{"name": "x", "source": "owner/repo"}"#),
+    );
+
+    let registry = parse_registry(tmp.path()).unwrap();
+
+    let entry = &registry.entries[0];
+    assert!(!entry.available, "owner/repo is not a plugin source form");
+
+    let shorthand = parse_source(&serde_json::json!("owner/repo"), true).unwrap();
+    assert_eq!(
+        shorthand,
+        PluginSource::Github {
+            repo: "owner/repo".to_string(),
+            path: None,
+            git_ref: None,
+            sha: None,
+        }
+    );
+    let bare_url = parse_source(&serde_json::json!("https://example.com/o/r.git"), true).unwrap();
+    assert_eq!(
+        bare_url,
+        PluginSource::Git {
+            url: "https://example.com/o/r.git".to_string(),
+            path: None,
+            git_ref: None,
+            sha: None,
+        }
+    );
+}
+
+#[test]
+fn plugin_source_round_trips_for_persistence() {
+    let github = PluginSource::Github {
+        repo: "o/r".to_string(),
+        path: Some("sub".to_string()),
+        git_ref: Some("main".to_string()),
+        sha: Some("abc123".to_string()),
+    };
+    let json = serde_json::to_value(&github).unwrap();
+    assert_eq!(json["kind"], "github");
+    assert_eq!(json["ref"], "main");
+    assert!(json.get("git_ref").is_none());
+    assert_eq!(
+        serde_json::from_value::<PluginSource>(json).unwrap(),
+        github
+    );
+
+    let subdir = PluginSource::GitSubdir {
+        url: "https://example.com/r.git".to_string(),
+        path: "sub/dir".to_string(),
+        git_ref: None,
+        sha: None,
+    };
+    let json = serde_json::to_value(&subdir).unwrap();
+    assert_eq!(json["kind"], "git-subdir");
+    assert_eq!(
+        serde_json::from_value::<PluginSource>(json).unwrap(),
+        subdir
+    );
+
+    let unsupported = PluginSource::Unsupported {
+        kind: "npm".to_string(),
+        detail: "unsupported source kind: npm".to_string(),
+    };
+    let json = serde_json::to_value(&unsupported).unwrap();
+    assert_eq!(json["kind"], "unsupported");
+    assert_eq!(json["sourceKind"], "npm");
+    assert_eq!(
+        serde_json::from_value::<PluginSource>(json).unwrap(),
+        unsupported
+    );
 }
