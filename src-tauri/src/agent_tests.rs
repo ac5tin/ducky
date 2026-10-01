@@ -101,6 +101,14 @@ pub(crate) fn provider_override() -> Option<Arc<dyn LlmProvider>> {
     Some(Arc::new(MockProvider))
 }
 
+/// What `Agent::context_limit` answers in test builds. `Some(None)` means
+/// "no window known", so no test reaches the network for the models.dev
+/// catalog. The auto-compaction decision itself is unit-tested in
+/// `compact::tests`.
+pub(crate) fn context_limit_override() -> Option<Option<u64>> {
+    Some(None)
+}
+
 struct MockProvider;
 
 fn script(key: &str, rounds: Vec<MockRound>) {
@@ -318,6 +326,7 @@ fn test_agent_full(
         bridge,
         sink: sink.clone(),
         catalog: Arc::new(crate::catalog::Catalog::new(&dir.join("models-dev.json"))),
+        last_input: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
     (agent, sink, store, dir)
 }
@@ -2399,4 +2408,96 @@ async fn a_cancelled_batch_never_answers_the_next_turn_with_a_dangling_call() {
         "the request carried unanswered tool calls: {:?}",
         captured[0].unanswered_calls
     );
+}
+
+// ---------------------------------------------------------------------------
+// Auto-compaction
+// ---------------------------------------------------------------------------
+
+/// The summariser request is keyed in the script store by its last user
+/// message, so the test builds the same prompt the agent will.
+fn summarizer_key(history: &[Msg]) -> String {
+    let w = crate::compact::window(history).expect("history must be compactable");
+    let prompt = crate::compact::build_summarizer_messages(&w, None);
+    match prompt.last().expect("summariser prompt") {
+        Msg::User { text, .. } => text.clone(),
+        other => panic!("expected a user message, got {other:?}"),
+    }
+}
+
+/// The newest user turn must survive; everything older becomes the carrier.
+#[tokio::test]
+async fn auto_compact_keeps_the_newest_user_turn_verbatim() {
+    let (agent, _sink, store) = test_agent_in_mode("autocompact-ok", AgentMode::Default);
+    let mut history = vec![
+        Msg::User {
+            text: "first ask".into(),
+            ts: None,
+        },
+        Msg::Assistant {
+            text: "first answer".into(),
+            tool_calls: Vec::new(),
+            ts: None,
+        },
+        Msg::User {
+            text: "newest ask".into(),
+            ts: None,
+        },
+    ];
+    script(
+        &summarizer_key(&history),
+        vec![MockRound::Text("## Objective\nfinish the task".into())],
+    );
+
+    agent
+        .auto_compact("autocompact-ok", &mut history)
+        .await
+        .expect("the summary lands");
+
+    assert_eq!(history.len(), 2);
+    let Msg::User { text, .. } = &history[0] else {
+        panic!("first message must be the carrier");
+    };
+    assert!(text.starts_with(crate::compact::COMPACT_MARKER));
+    assert!(text.contains("finish the task"));
+    assert!(matches!(&history[1], Msg::User { text, .. } if text == "newest ask"));
+    // the rewrite reached the disk too, so a reload shows the same thing
+    let (_, saved) = store.load_conversation("autocompact-ok").unwrap();
+    assert_eq!(saved.len(), 2);
+}
+
+/// A failed summary must leave the turn's history exactly as it was.
+#[tokio::test]
+async fn auto_compact_leaves_the_history_alone_when_the_summary_is_empty() {
+    let (agent, _sink, store) = test_agent_in_mode("autocompact-fail", AgentMode::Default);
+    let mut history = vec![
+        Msg::User {
+            text: "fail first ask".into(),
+            ts: None,
+        },
+        Msg::Assistant {
+            text: "fail first answer".into(),
+            tool_calls: Vec::new(),
+            ts: None,
+        },
+        Msg::User {
+            text: "fail newest ask".into(),
+            ts: None,
+        },
+    ];
+    script(
+        &summarizer_key(&history),
+        vec![MockRound::Text(String::new())],
+    );
+
+    let err = agent
+        .auto_compact("autocompact-fail", &mut history)
+        .await
+        .expect_err("an empty summary is not a compaction");
+    assert!(err.contains("empty summary"), "got: {err}");
+    assert_eq!(history.len(), 3, "the history must be untouched");
+    assert!(matches!(&history[0], Msg::User { text, .. } if text == "fail first ask"));
+    // nothing was written, so a reload still shows the full transcript
+    let (_, saved) = store.load_conversation("autocompact-fail").unwrap();
+    assert_eq!(saved.len(), 0);
 }

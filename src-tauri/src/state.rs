@@ -59,6 +59,7 @@ impl AppState {
             bridge: bridge.clone(),
             sink: sink.clone(),
             catalog: catalog.clone(),
+            last_input: Mutex::new(HashMap::new()),
         });
         Arc::new(Self {
             store,

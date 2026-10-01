@@ -76,6 +76,14 @@ pub enum BackendEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cached: Option<u64>,
     },
+    /// Auto-compaction replaced the older part of a conversation with a
+    /// summary while a turn was running. The webview holds the old transcript
+    /// and must reload it.
+    AutoCompacted {
+        conversation_id: String,
+        /// Context-window percentage that triggered it, for the notice.
+        percent: u8,
+    },
     /// Tool call lifecycle updates. `status` is one of
     /// `pending_approval | running | awaiting_input | done | denied | error`.
     /// `parent_tool_call_id` is set when the call belongs to a subagent run:

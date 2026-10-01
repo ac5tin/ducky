@@ -1484,6 +1484,24 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
       }));
       break;
     }
+    case "auto_compacted": {
+      // the backend replaced the older part of this transcript; the usage
+      // figure on screen describes the request that has just been dropped
+      const id = event.conversation_id;
+      set((s) => {
+        const usage = { ...s.usageByConversation };
+        delete usage[id];
+        return { usageByConversation: usage };
+      });
+      if (id === get().activeConversationId) {
+        void get().reloadItems(id);
+        get().toast(
+          "info",
+          `Context was ${event.percent}% full — older messages became a summary.`,
+        );
+      }
+      break;
+    }
     case "chat_error": {
       const active = event.conversation_id === get().activeConversationId;
       if (!active) get().toast("error", event.error);

@@ -109,6 +109,8 @@ export const settingsSet = (settings: {
   update_mode?: "prompt" | "auto";
   update_check_interval_hours?: number;
   system_prompt?: string;
+  auto_compact?: boolean;
+  auto_compact_threshold?: number;
 }) => invoke<void>("settings_set", { settings });
 
 export const toolRuleSet = (key: string, rule: ToolRule | null) =>

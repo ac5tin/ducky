@@ -445,6 +445,12 @@ pub async fn settings_set(
         if let Some(v) = settings.default_mode {
             c.settings.default_mode = v;
         }
+        if let Some(v) = settings.auto_compact {
+            c.settings.auto_compact = v;
+        }
+        if let Some(v) = settings.auto_compact_threshold {
+            c.settings.auto_compact_threshold = v.clamp(1, 99);
+        }
     }
     state.store.save_config().map_err(|e| e.to_string())?;
 
@@ -500,6 +506,8 @@ pub struct AppSettingsPatch {
     pub update_check_interval_hours: Option<u32>,
     pub system_prompt: Option<String>,
     pub default_mode: Option<config::AgentMode>,
+    pub auto_compact: Option<bool>,
+    pub auto_compact_threshold: Option<u8>,
 }
 
 #[tauri::command]

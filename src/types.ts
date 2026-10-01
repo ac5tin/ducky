@@ -110,6 +110,10 @@ export interface AppSettings {
         update_check_interval_hours: number;
         /** Custom prompt appended to the main agent's system message; empty = none. */
         system_prompt: string;
+        /** Compact a chat automatically when its context window fills up. */
+        auto_compact: boolean;
+        /** Percentage of the context window that triggers auto-compaction. */
+        auto_compact_threshold: number;
 }
 
 export interface ConversationMeta {
@@ -384,6 +388,11 @@ export type BackendEvent =
                   input?: number | null;
                   output?: number | null;
                   cached?: number | null;
+          }
+        | {
+                  type: "auto_compacted";
+                  conversation_id: string;
+                  percent: number;
           }
         | ({
                   type: "tool_call_update";

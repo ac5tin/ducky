@@ -265,6 +265,50 @@ export function SettingsView() {
           </p>
         </Section>
 
+        {/* Auto-compaction */}
+        <Section
+          title="Auto-compaction"
+          description="Ducky summarises the older part of a long chat before it fills the model's context window, so the conversation can keep going."
+        >
+          <div className="space-y-4">
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={settings.auto_compact}
+                onChange={(e) =>
+                  patch({ auto_compact: e.target.checked }).catch((err) =>
+                    toast("error", `${err}`),
+                  )
+                }
+              />
+              Compact automatically when the context window fills up
+            </label>
+            <div>
+              <div className="mb-1.5 text-sm font-medium">Compact at</div>
+              <div className="flex items-center gap-2">
+                <input
+                  className={inputClass + " w-20"}
+                  type="number"
+                  min={1}
+                  max={99}
+                  disabled={!settings.auto_compact}
+                  value={settings.auto_compact_threshold}
+                  onChange={(e) =>
+                    patch({
+                      auto_compact_threshold: Number(e.target.value) || 80,
+                    }).catch((err) => toast("error", `${err}`))
+                  }
+                />
+                <span className="text-sm text-slate-400">% of the context window</span>
+              </div>
+              <p className="mt-1 text-xs text-slate-400">
+                The newest exchange stays as real messages; only older ones become a
+                summary. /compact does the same thing when you ask for it.
+              </p>
+            </div>
+          </div>
+        </Section>
+
         {/* System prompt */}
         <Section
           title="System prompt"

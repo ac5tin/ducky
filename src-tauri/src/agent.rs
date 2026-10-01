@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio_util::sync::CancellationToken;
 
+use crate::compact;
 use crate::config::{AgentMode, Store};
 use crate::events::{BackendEvent, EventSink};
 use crate::mcp::bridge::{ApprovalDecision, SamplingBackend};
@@ -230,6 +231,9 @@ pub struct Agent {
     /// catalogue over `/responses` or `/messages`, and that map decides which
     /// adapter a model needs.
     pub catalog: Arc<crate::catalog::Catalog>,
+    /// Input tokens the provider reported for the last call of each
+    /// conversation. Empty after a restart; `estimate_tokens` covers that gap.
+    pub last_input: Mutex<HashMap<String, u64>>,
 }
 
 /// The mode block for the system prompt. `Default` returns `None` so default
@@ -1040,6 +1044,9 @@ impl Agent {
         scope: &RunScope,
         steering: Option<&SteeringQueue>,
     ) -> Result<Option<String>, String> {
+        // One compaction per user turn: a second pass at the same cut would
+        // only re-summarise the summary.
+        let mut auto_compacted = false;
         for _ in 0..max_iterations {
             // A cancelled run must not consume a pending steer: the frontend
             // resends it as a normal turn (spec: cancelled pending steers).
@@ -1060,6 +1067,15 @@ impl Agent {
                     text: steer.text,
                     ts: steer.ts,
                 });
+            }
+            // Auto-compaction runs before the model sees the history, so a
+            // long tool loop is covered and not just a new user message.
+            if scope.is_main()
+                && self
+                    .maybe_auto_compact(conversation_id, history, auto_compacted)
+                    .await
+            {
+                auto_compacted = true;
             }
             let (provider, default_model, _provider_name) =
                 self.provider_for(provider_id, model).await?;
@@ -1289,11 +1305,16 @@ impl Agent {
                                     .2
                                     .push_str(&fragment);
                             }
-                            Some(ProviderEvent::Usage { input, output, cached }) => {
+Some(ProviderEvent::Usage {
+                                input,
+                                output,
+                                cached,
+                            }) => {
                                 // streams may split usage across events: keep
                                 // the latest value seen per side
                                 if input.is_some() {
                                     usage_input = input;
+                                    self.set_last_input(conversation_id, input);
                                 }
                                 if output.is_some() {
                                     usage_output = output;
@@ -1323,13 +1344,14 @@ impl Agent {
                         text.push_str(&t);
                         self.emit_text_delta(conversation_id, scope, &t);
                     }
-                    ProviderEvent::Usage {
+ProviderEvent::Usage {
                         input,
                         output,
                         cached,
                     } => {
                         if input.is_some() {
                             usage_input = input;
+                            self.set_last_input(conversation_id, input);
                         }
                         if output.is_some() {
                             usage_output = output;
@@ -1790,6 +1812,7 @@ impl Agent {
             bridge: self.bridge.clone(),
             sink: self.sink.clone(),
             catalog: self.catalog.clone(),
+            last_input: Mutex::new(HashMap::new()),
         };
         let conversation = conversation_id.to_string();
         let ct = ct.clone();
@@ -2302,6 +2325,19 @@ impl Agent {
     }
 
     fn persist(&self, conversation_id: &str, history: &[Msg]) -> Result<(), String> {
+        // keep the /undo records `chat_send` captured for this conversation
+        let undo = self.store.load_undo_records(conversation_id);
+        self.persist_with_undo(conversation_id, history, &undo)
+    }
+
+    /// Persist with the undo records the caller names. Compaction passes an
+    /// empty slice: the message indexes those records point at are gone.
+    fn persist_with_undo(
+        &self,
+        conversation_id: &str,
+        history: &[Msg],
+        undo: &[crate::config::UndoRecord],
+    ) -> Result<(), String> {
         let meta = {
             let mut cfg = self.store.config.lock().unwrap();
             let meta = cfg
@@ -2313,11 +2349,119 @@ impl Agent {
             meta.clone()
         };
         let payload: Vec<serde_json::Value> = history.iter().map(|m| m.as_json()).collect();
-        // keep the /undo records `chat_send` captured for this conversation
-        let undo = self.store.load_undo_records(conversation_id);
         self.store
-            .save_conversation(&meta, &payload, &undo)
+            .save_conversation(&meta, &payload, undo)
             .map_err(|e| e.to_string())
+    }
+
+    /// Remember what the provider reported for this conversation's last call.
+    fn set_last_input(&self, conversation_id: &str, input: Option<u64>) {
+        if let Some(input) = input {
+            self.last_input
+                .lock()
+                .unwrap()
+                .insert(conversation_id.to_string(), input);
+        }
+    }
+
+    /// Tokens the next request will carry: the provider's own count when we
+    /// have one, never less than the text of the history itself.
+    fn context_used(&self, conversation_id: &str, history: &[Msg]) -> u64 {
+        let estimated = compact::estimate_tokens(history);
+        let last = self
+            .last_input
+            .lock()
+            .unwrap()
+            .get(conversation_id)
+            .copied();
+        last.map_or(estimated, |l| l.max(estimated))
+    }
+
+    /// The model's context window from the catalog. Test builds answer
+    /// "unknown" so the suite never reaches the network for it.
+    async fn context_limit(&self, kind: &str, model: &str) -> Option<u64> {
+        #[cfg(test)]
+        if let Some(overridden) = crate::agent_tests::context_limit_override() {
+            return overridden;
+        }
+        self.catalog.context_limit(kind, model).await
+    }
+
+    /// Auto-compaction settings plus the model they apply to.
+    fn compaction_prefs(&self, conversation_id: &str) -> (bool, f64, String, String) {
+        let cfg = self.store.config.lock().unwrap();
+        let kind = cfg
+            .conversations
+            .iter()
+            .find(|c| c.id == conversation_id)
+            .and_then(|meta| {
+                cfg.providers
+                    .iter()
+                    .find(|p| p.id == meta.provider_id)
+                    .map(|p| (p.kind.clone(), meta.model.clone()))
+            });
+        let (kind, model) = kind.unwrap_or_default();
+        (
+            cfg.settings.auto_compact,
+            cfg.settings.auto_compact_ratio(),
+            kind,
+            model,
+        )
+    }
+
+    /// Compact before the next model call when the window is nearly full.
+    /// Returns true when a compaction happened.
+    async fn maybe_auto_compact(
+        &self,
+        conversation_id: &str,
+        history: &mut Vec<Msg>,
+        already_compacted: bool,
+    ) -> bool {
+        let (enabled, ratio, kind, model) = self.compaction_prefs(conversation_id);
+        let limit = if enabled {
+            self.context_limit(&kind, &model).await
+        } else {
+            None
+        };
+        let used = Some(self.context_used(conversation_id, history));
+        if !compact::auto_compact_due(enabled, ratio, limit, used, already_compacted) {
+            return false;
+        }
+        match self.auto_compact(conversation_id, history).await {
+            Ok(()) => {
+                let percent = used
+                    .zip(limit)
+                    .map_or(0, |(u, l)| (u * 100 / l).min(100) as u8);
+                self.sink.emit(BackendEvent::AutoCompacted {
+                    conversation_id: conversation_id.to_string(),
+                    percent,
+                });
+                true
+            }
+            // never abort the turn: the history just stays as it is
+            Err(e) => {
+                tracing::warn!("auto-compaction skipped: {e}");
+                false
+            }
+        }
+    }
+
+    /// Replace the loop's own history with a summary. This deliberately does
+    /// not call `compact::run`: that loads and saves its own copy from disk,
+    /// and this loop's next `persist()` would then overwrite the summary.
+    pub(crate) async fn auto_compact(
+        &self,
+        conversation_id: &str,
+        history: &mut Vec<Msg>,
+    ) -> Result<(), String> {
+        let window = compact::window(history).ok_or("nothing older than the newest message")?;
+        let summary = compact::summarize_window(self, conversation_id, &window, None).await?;
+        compact::install(history, &summary);
+        // the message indexes moved, so the /undo records no longer apply
+        self.persist_with_undo(conversation_id, history, &[])?;
+        // the recorded usage describes the pre-compaction request
+        self.last_input.lock().unwrap().remove(conversation_id);
+        Ok(())
     }
 
     fn current_title(&self, conversation_id: &str) -> String {

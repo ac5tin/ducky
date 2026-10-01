@@ -245,6 +245,11 @@ fn default_update_check_interval_hours() -> u32 {
     6
 }
 
+/// Default auto-compaction fire point, as a percentage of the context window.
+fn default_auto_compact_threshold() -> u8 {
+    80
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     pub theme: Theme,
@@ -314,6 +319,14 @@ pub struct AppSettings {
     /// conversation, so changing it never affects existing chats.
     #[serde(default)]
     pub default_mode: AgentMode,
+    /// Compact a conversation automatically when its context window fills up.
+    /// `default_true`, not a bare `#[serde(default)]`: old configs must load
+    /// with auto-compaction on.
+    #[serde(default = "default_true")]
+    pub auto_compact: bool,
+    /// Percentage of the context window that triggers auto-compaction.
+    #[serde(default = "default_auto_compact_threshold")]
+    pub auto_compact_threshold: u8,
 }
 
 impl Default for AppSettings {
@@ -342,11 +355,19 @@ impl Default for AppSettings {
             update_check_interval_hours: default_update_check_interval_hours(),
             system_prompt: String::new(),
             default_mode: AgentMode::Default,
+            auto_compact: true,
+            auto_compact_threshold: default_auto_compact_threshold(),
         }
     }
 }
 
 impl AppSettings {
+    /// The auto-compaction fire point, clamped so a hand-edited config cannot
+    /// compact on every round trip (0) or never (255).
+    pub fn auto_compact_ratio(&self) -> f64 {
+        f64::from(self.auto_compact_threshold.clamp(1, 99)) / 100.0
+    }
+
     /// The app-wide default directory: stdio servers always spawn here,
     /// and a chat operates here unless it has its own `working_dir`
     /// override (see [`AppConfig::chat_working_dir`]).
@@ -1816,6 +1837,41 @@ mod tests {
         assert_eq!(cfg.settings.title_provider_id, None);
         assert_eq!(cfg.settings.title_model, None);
         assert_eq!(cfg.settings.title_effort, None);
+    }
+
+    #[test]
+    fn config_without_auto_compaction_prefs_keeps_it_on() {
+        // old config.json files predate auto-compaction
+        let json = r#"{
+            "version": 1,
+            "settings": {
+                "theme": "dark",
+                "tool_approval": "always_ask",
+                "sampling": "ask",
+                "tool_rules": {},
+                "roots": [],
+                "max_tool_iterations": 25,
+                "show_reasoning": false
+            }
+        }"#;
+        let cfg: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.settings.auto_compact, "auto-compaction is on by default");
+        assert_eq!(cfg.settings.auto_compact_threshold, 80);
+    }
+
+    #[test]
+    fn auto_compact_ratio_clamps_a_hand_edited_threshold() {
+        assert_eq!(AppSettings::default().auto_compact_ratio(), 0.8);
+        let low = AppSettings {
+            auto_compact_threshold: 0,
+            ..Default::default()
+        };
+        assert_eq!(low.auto_compact_ratio(), 0.01);
+        let high = AppSettings {
+            auto_compact_threshold: 255,
+            ..Default::default()
+        };
+        assert_eq!(high.auto_compact_ratio(), 0.99);
     }
 
     #[test]

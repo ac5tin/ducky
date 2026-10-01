@@ -11,3 +11,4 @@ Files use the format `NNNN-kebab-case-title.md`. Review the relevant ADR before 
 - [0004: Trust the MCP `readOnlyHint` annotation inside read-only agent modes](0004-trust-mcp-readonly-hint-for-readonly-modes.md)
 - [0005: Group membership and order live inside the group record](0005-chat-group-layout-model.md)
 - [0006: New providers ship with API-key sign-in; provider OAuth is deferred](0006-provider-api-keys-and-deferred-oauth.md)
+- [0007: Auto-compaction at a context-window threshold](0007-auto-compaction.md)
