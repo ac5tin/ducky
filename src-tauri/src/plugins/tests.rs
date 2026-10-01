@@ -1088,12 +1088,18 @@ fn git(cwd: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// A real repository at `dir` with one commit holding `marketplace.json`.
-fn git_registry_repo(dir: &Path, plugins: &str) -> String {
+/// `git init` a throwaway repo that does not use the developer's signing config.
+fn git_init(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
     git(dir, &["init", "-b", "main"]);
     git(dir, &["config", "user.email", "ducky-test@example.com"]);
     git(dir, &["config", "user.name", "Ducky Test"]);
     git(dir, &["config", "commit.gpgsign", "false"]);
+}
+
+/// A real repository at `dir` with one commit holding `marketplace.json`.
+fn git_registry_repo(dir: &Path, plugins: &str) -> String {
+    git_init(dir);
     write(
         dir,
         "marketplace.json",
@@ -1243,6 +1249,101 @@ async fn git_refresh_failure_sets_error() {
     assert!(
         !dir.join("missing/repo").exists(),
         "a failed clone leaves no half clone"
+    );
+}
+
+#[tokio::test]
+async fn git_refresh_bad_commit_keeps_previous_registry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let body = registry_body("git-marketplace", &one_entry());
+    git_registry_repo(&source, &one_entry());
+    let dir = tmp.path().join("marketplaces");
+    let mut rec = marketplace_record("git-marketplace", git_source(&source));
+    let http = FakeHttp::new(Vec::new());
+    refresh(&mut rec, &dir, &http).await.unwrap();
+    let sha = rec.resolved_sha.clone().expect("first sha");
+    let refreshed_at = rec.last_refreshed_at.clone();
+
+    write(&source, "marketplace.json", "{not json");
+    git(&source, &["add", "-A"]);
+    git(&source, &["commit", "-m", "broken registry"]);
+
+    let err = refresh(&mut rec, &dir, &http).await.unwrap_err();
+
+    assert!(err.contains("invalid JSON"), "{err}");
+    assert_eq!(rec.resolved_sha.as_deref(), Some(sha.as_str()));
+    assert_eq!(rec.last_refreshed_at, refreshed_at);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("git-marketplace/repo/marketplace.json")).unwrap(),
+        body
+    );
+    assert_eq!(
+        git(&dir.join("git-marketplace/repo"), &["rev-parse", "HEAD"]),
+        sha
+    );
+}
+
+#[tokio::test]
+async fn git_refresh_missing_subdir_keeps_previous_registry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let body = registry_body("sub-market", &one_entry());
+    git_init(&source);
+    write(&source, "sub/marketplace.json", &body);
+    git(&source, &["add", "-A"]);
+    git(&source, &["commit", "-m", "registry"]);
+    let dir = tmp.path().join("marketplaces");
+    let mut rec = marketplace_record(
+        "sub-market",
+        PluginSource::GitSubdir {
+            url: file_url(&source),
+            path: "sub".to_string(),
+            git_ref: None,
+            sha: None,
+        },
+    );
+    let http = FakeHttp::new(Vec::new());
+    refresh(&mut rec, &dir, &http).await.unwrap();
+    let sha = rec.resolved_sha.clone().expect("first sha");
+
+    std::fs::remove_dir_all(source.join("sub")).unwrap();
+    git(&source, &["add", "-A"]);
+    git(&source, &["commit", "-m", "drop sub"]);
+
+    let err = refresh(&mut rec, &dir, &http).await.unwrap_err();
+
+    assert!(err.contains("missing in this revision"), "{err}");
+    assert!(!err.contains("escapes"), "{err}");
+    assert!(!err.contains("outside"), "{err}");
+    assert_eq!(rec.resolved_sha.as_deref(), Some(sha.as_str()));
+    assert_eq!(
+        std::fs::read_to_string(dir.join("sub-market/repo/sub/marketplace.json")).unwrap(),
+        body
+    );
+}
+
+#[tokio::test]
+async fn git_refresh_first_clone_uses_blob_none_filter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    git_registry_repo(&source, &one_entry());
+    let dir = tmp.path().join("marketplaces");
+    let mut rec = marketplace_record("filtered", git_source(&source));
+    let http = FakeHttp::new(Vec::new());
+
+    refresh(&mut rec, &dir, &http).await.unwrap();
+
+    let out = std::process::Command::new("git")
+        .current_dir(dir.join("filtered/repo"))
+        .args(["config", "--get", "remote.origin.partialclonefilter"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "blob:none",
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr).trim()
     );
 }
 
@@ -1463,6 +1564,35 @@ fn records_survive_unknown_fields() {
     assert_eq!(saved["marketplaces"][0]["futureField"]["x"][2], 3);
     assert_eq!(saved["marketplaces"][0]["source"]["kind"], "url");
     assert_eq!(saved["marketplaces"][0]["registryPath"], "marketplace.json");
+}
+
+#[test]
+fn records_missing_refresh_fields_still_load() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("marketplaces.json"),
+        r#"{
+          "version": 1,
+          "marketplaces": [{
+            "id": "acme",
+            "name": "Acme",
+            "source": {"kind": "url", "url": "https://example.com/marketplace.json"}
+          }]
+        }"#,
+    )
+    .unwrap();
+
+    let store = MarketplaceStore::load(tmp.path());
+
+    assert_eq!(
+        store.records.len(),
+        1,
+        "missing refresh fields must not drop the store"
+    );
+    assert_eq!(store.records[0].id, "acme");
+    assert_eq!(store.records[0].last_refreshed_at, None);
+    assert_eq!(store.records[0].resolved_sha, None);
+    assert_eq!(store.records[0].error, None);
 }
 
 #[test]

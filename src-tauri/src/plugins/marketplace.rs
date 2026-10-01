@@ -444,12 +444,15 @@ pub struct MarketplaceRecord {
     /// in the background.
     #[serde(default)]
     pub auto_refresh: bool,
+    #[serde(default)]
     pub last_refreshed_at: Option<String>,
+    #[serde(default)]
     pub resolved_sha: Option<String>,
     #[serde(default)]
     pub bundled: bool,
     #[serde(default)]
     pub hidden: bool,
+    #[serde(default)]
     pub error: Option<String>,
     /// Unknown fields round-trip (design §3).
     #[serde(flatten)]
@@ -806,19 +809,31 @@ fn refresh_git(
 ) -> Result<RefreshOutcome, String> {
     let (url, sub_path, git_ref) = git_target(source)?;
     let repo = dir.join(&record.id).join("repo");
-    if repo.join(".git").is_dir() {
+    // Read HEAD before the fetch so a bad new commit can be checked out back.
+    let prior_sha = if repo.join(".git").is_dir() {
+        Some(git_in(&repo, &["rev-parse", "HEAD"])?)
+    } else {
+        None
+    };
+    if prior_sha.is_some() {
         update_repo(&repo, git_ref.as_deref())?;
     } else {
         clone_repo(&url, git_ref.as_deref(), &repo)?;
     }
-    let sha = git_in(&repo, &["rev-parse", "HEAD"])?;
-    let wanted = match sub_path {
-        Some(path) => repo.join(path),
-        None => repo.clone(),
+    let (registry, registry_root) = match read_git_registry(&repo, sub_path.as_deref()) {
+        Ok(found) => found,
+        Err(err) => {
+            if let Some(prior) = prior_sha.as_deref() {
+                if let Err(restore) = git_in(&repo, &["checkout", "--detach", prior]) {
+                    return Err(format!(
+                        "{err} (failed to restore previous commit {prior}: {restore})"
+                    ));
+                }
+            }
+            return Err(err);
+        }
     };
-    let registry_root = resolve_within(&repo, &wanted)
-        .ok_or_else(|| format!("registry path {} escapes the checkout", wanted.display()))?;
-    let registry = parse_registry(&registry_root).map_err(join_diagnostics)?;
+    let sha = git_in(&repo, &["rev-parse", "HEAD"])?;
     let changed = record.resolved_sha.as_deref() != Some(sha.as_str());
     record.registry_path = display_registry_path(&registry, &registry_root);
     record.resolved_sha = Some(sha.clone());
@@ -867,29 +882,101 @@ fn git_target(source: &PluginSource) -> Result<(String, Option<String>, Option<S
     }
 }
 
+/// Read the registry after a clone or fetch.
+///
+/// A path that does not exist is missing in this revision. A path that
+/// exists but leaves the checkout is an escape. Those are different errors.
+fn read_git_registry(repo: &Path, sub_path: Option<&str>) -> Result<(Registry, PathBuf), String> {
+    let wanted = match sub_path {
+        Some(path) => repo.join(path),
+        None => repo.to_path_buf(),
+    };
+    if !wanted.exists() {
+        return Err(format!(
+            "registry path {} is missing in this revision",
+            wanted.display()
+        ));
+    }
+    let registry_root = resolve_within(repo, &wanted).ok_or_else(|| {
+        format!(
+            "registry path {} resolves outside the root",
+            wanted.display()
+        )
+    })?;
+    let registry = parse_registry(&registry_root).map_err(join_diagnostics)?;
+    Ok((registry, registry_root))
+}
+
 /// Clone `url` into `repo`, retrying once; a half clone is removed each time.
+///
+/// Spec §5 / R17: try `--filter=blob:none` first. If git rejects that flag,
+/// fall back to a plain `--depth 1` clone.
 fn clone_repo(url: &str, git_ref: Option<&str>, repo: &Path) -> Result<(), String> {
+    match clone_attempts(url, git_ref, repo, true) {
+        Ok(()) => Ok(()),
+        Err(err) if filter_flag_rejected(&err) => {
+            let _ = std::fs::remove_dir_all(repo);
+            clone_attempts(url, git_ref, repo, false)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn clone_attempts(
+    url: &str,
+    git_ref: Option<&str>,
+    repo: &Path,
+    filtered: bool,
+) -> Result<(), String> {
     let mut last_error = String::new();
     for _ in 0..2 {
         if let Some(parent) = repo.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|err| format!("cannot create {}: {err}", parent.display()))?;
         }
+        let _ = std::fs::remove_dir_all(repo);
         let mut command = git_command();
         command.arg("clone").arg("--depth").arg("1");
+        if filtered {
+            command.arg("--filter=blob:none");
+        }
         if let Some(git_ref) = git_ref {
             command.arg("--branch").arg(git_ref);
         }
         command.arg(url).arg(repo);
         match git_output(command) {
-            Ok(_) => return Ok(()),
+            Ok(_) => {
+                note_clone_form(filtered);
+                return Ok(());
+            }
             Err(err) => {
                 last_error = err;
                 let _ = std::fs::remove_dir_all(repo);
+                if filtered && filter_flag_rejected(&last_error) {
+                    return Err(last_error);
+                }
             }
         }
     }
     Err(last_error)
+}
+
+/// Older git prints `unknown option` for `--filter`. A normal clone failure does not.
+fn filter_flag_rejected(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    let unknown = lower.contains("unknown option")
+        || lower.contains("unrecognized option")
+        || lower.contains("unrecognised option");
+    unknown && lower.contains("filter")
+}
+
+/// Name the clone form that ran (spec §5, controller ruling R17).
+fn note_clone_form(filtered: bool) {
+    if filtered {
+        tracing::debug!("marketplace clone form: --depth 1 --filter=blob:none");
+    } else {
+        tracing::warn!("marketplace clone form: --depth 1 (git rejected --filter=blob:none)");
+    }
 }
 
 /// Fetch the wanted ref and detach the work tree onto it.
@@ -953,4 +1040,24 @@ fn display_registry_path(registry: &Registry, root: &Path) -> String {
 
 fn now() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::filter_flag_rejected;
+
+    #[test]
+    fn old_git_filter_flag_rejection_is_distinct_from_clone_failure() {
+        assert!(filter_flag_rejected(
+            "error: unknown option `filter=blob:none'"
+        ));
+        assert!(filter_flag_rejected(
+            "error: unrecognized option '--filter=blob:none'"
+        ));
+        assert!(filter_flag_rejected(
+            "error: unrecognised option '--filter'"
+        ));
+        assert!(!filter_flag_rejected("fatal: repository 'x' not found"));
+        assert!(!filter_flag_rejected("error: unknown option `branch'"));
+    }
 }
