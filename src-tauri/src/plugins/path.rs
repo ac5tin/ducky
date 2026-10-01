@@ -1,6 +1,6 @@
 //! Path containment helpers (design §13).
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 /// Canonicalize `root` and `target` and require the target to stay inside.
 ///
@@ -16,15 +16,26 @@ pub fn resolve_within(root: &Path, target: &Path) -> Option<PathBuf> {
         .then_some(canonical_target)
 }
 
-/// Like [`resolve_within`], but for paths that do not exist yet: canonicalize
-/// the nearest existing ancestor, re-append the missing remainder, and require
-/// containment. Used for `${PLUGIN_DATA}` subdirectories created at spawn.
+/// Like [`resolve_within`], but for paths that do not exist yet.
+///
+/// Canonicalize the nearest existing ancestor — `..` included, so a symlink
+/// in that ancestor is visible to the filesystem — then re-append only the
+/// missing normal components and require `starts_with` again (design §13).
+/// Do not pop `..` before the walk. `std::path::absolute` is also avoided:
+/// on Windows it calls `GetFullPathNameW`, which pops `..` lexically.
 pub fn resolve_within_maybe_missing(root: &Path, target: &Path) -> Option<PathBuf> {
     let canonical_root = std::fs::canonicalize(root).ok()?;
-    let mut path = normalize(&std::path::absolute(target).ok()?);
+    let mut path = absolute_lexical(target)?;
     let mut missing = Vec::new();
     while !path.exists() {
-        missing.push(path.file_name()?.to_os_string());
+        let name = path.file_name()?;
+        // This `..` or `.` was not resolved by the filesystem (its parent
+        // does not exist). Re-appending it would hide an escape from
+        // `starts_with`.
+        if name == ".." || name == "." {
+            return None;
+        }
+        missing.push(name.to_os_string());
         if !path.pop() {
             return None;
         }
@@ -36,18 +47,11 @@ pub fn resolve_within_maybe_missing(root: &Path, target: &Path) -> Option<PathBu
     resolved.starts_with(&canonical_root).then_some(resolved)
 }
 
-/// Lexically resolve `.` and `..` so the walk-up above only ever sees normal
-/// components; real symlink resolution still happens in `canonicalize`.
-fn normalize(absolute: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            component => out.push(component),
-        }
+/// Make `path` absolute without removing `..`.
+fn absolute_lexical(path: &Path) -> Option<PathBuf> {
+    if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else {
+        Some(std::env::current_dir().ok()?.join(path))
     }
-    out
 }

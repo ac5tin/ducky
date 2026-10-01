@@ -93,14 +93,18 @@ fn discover_skills(root: &Path, out: &mut Discovered) {
     let skills = root.join("skills");
     if !skills.is_dir() {
         if skills.exists() {
-            out.diagnostics
-                .push(warning("skills", "`skills` is not a directory; skills disabled for this plugin"));
+            out.diagnostics.push(warning(
+                "skills",
+                "`skills` is not a directory; skills disabled for this plugin",
+            ));
         }
         return;
     }
     let Ok(entries) = std::fs::read_dir(&skills) else {
-        out.diagnostics
-            .push(warning("skills", "cannot read `skills`; skills disabled for this plugin"));
+        out.diagnostics.push(warning(
+            "skills",
+            "cannot read `skills`; skills disabled for this plugin",
+        ));
         return;
     };
     for entry in entries.flatten() {
@@ -130,8 +134,10 @@ fn discover_skills(root: &Path, out: &mut Discovered) {
             continue;
         };
         let Some(frontmatter) = parse_frontmatter(&text) else {
-            out.diagnostics
-                .push(warning(&target, "SKILL.md has no YAML frontmatter; skill skipped"));
+            out.diagnostics.push(warning(
+                &target,
+                "SKILL.md has no YAML frontmatter; skill skipped",
+            ));
             continue;
         };
         let (frontmatter, _body) = frontmatter;
@@ -223,25 +229,30 @@ fn agent_mcp(root: &Path, out: &mut Discovered) {
 
 fn claude_mcp(root: &Path, manifest: &PluginManifest, out: &mut Discovered) {
     // `.mcp.json` plus the manifest's inline `mcpServers`; the manifest wins
-    // on a name collision. No `$schema` requirement in this layout.
+    // on a name collision. No `$schema` requirement. A bad file does not drop
+    // inline servers, so warnings name the file only.
     let mut raw: BTreeMap<String, Value> = BTreeMap::new();
     let path = root.join(".mcp.json");
-    if !path.is_file() && path.exists() {
+    if path.is_file() && resolve_within(root, &path).is_none() {
+        // Same boundary as `mcp.json`: a fixed location outside the root
+        // invalidates that file, not inline servers (§4.1).
         out.diagnostics.push(warning(
             ".mcp.json",
-            "`.mcp.json` is not a file; MCP disabled for this plugin",
+            "`.mcp.json` resolves outside the plugin root",
         ));
     } else if path.is_file() {
         let parsed = std::fs::read_to_string(&path)
             .map_err(|err| err.to_string())
             .and_then(|text| serde_json::from_str::<Value>(&text).map_err(|err| err.to_string()));
         match parsed {
-            Err(err) => out.diagnostics.push(warning(
-                ".mcp.json",
-                format!("invalid `.mcp.json`; MCP disabled for this plugin: {err}"),
-            )),
+            Err(err) => out
+                .diagnostics
+                .push(warning(".mcp.json", format!("invalid `.mcp.json`: {err}"))),
             Ok(value) => {
-                match normalize_value(&value).get("mcpServers").and_then(Value::as_object) {
+                match normalize_value(&value)
+                    .get("mcpServers")
+                    .and_then(Value::as_object)
+                {
                     Some(servers) => {
                         for (name, server) in servers {
                             raw.insert(name.clone(), server.clone());
@@ -249,11 +260,14 @@ fn claude_mcp(root: &Path, manifest: &PluginManifest, out: &mut Discovered) {
                     }
                     None => out.diagnostics.push(warning(
                         ".mcp.json",
-                        "`.mcp.json` must contain an `mcpServers` object; MCP disabled for this plugin",
+                        "`.mcp.json` must contain an `mcpServers` object",
                     )),
                 }
             }
         }
+    } else if path.exists() {
+        out.diagnostics
+            .push(warning(".mcp.json", "`.mcp.json` is not a file"));
     }
     if let Some(Value::Object(inline)) = manifest.inline_servers.as_ref() {
         for (name, value) in inline {
@@ -272,7 +286,9 @@ fn claude_mcp(root: &Path, manifest: &PluginManifest, out: &mut Discovered) {
 /// Validate one server entry against the closed union of §7.2.1. Any failure
 /// invalidates exactly this server.
 fn parse_server(root: &Path, name: &str, value: &Value) -> Result<PluginServer, String> {
-    let object = value.as_object().ok_or("server entry must be a JSON object")?;
+    let object = value
+        .as_object()
+        .ok_or("server entry must be a JSON object")?;
     let kind = object
         .get("type")
         .and_then(Value::as_str)
@@ -285,10 +301,13 @@ fn parse_server(root: &Path, name: &str, value: &Value) -> Result<PluginServer, 
                 .and_then(Value::as_str)
                 .filter(|command| !command.is_empty())
                 .ok_or("stdio server requires a non-empty string `command`")?;
+            // One token: a bare name, or a `./` path inside the plugin root.
+            // Placeholders are not expanded in `command` (§2).
+            validate_command(root, command)?;
             let args = string_list(object.get("args"))
                 .ok_or("field `args` must be an array of strings")?;
-            let env = string_map(object.get("env"))
-                .ok_or("field `env` must be an object of strings")?;
+            let env =
+                string_map(object.get("env")).ok_or("field `env` must be an object of strings")?;
             for key in env.keys() {
                 // Reserved keys are rejected case-insensitively on every
                 // platform so the rule is testable on Linux and correct on
@@ -344,7 +363,10 @@ fn parse_server(root: &Path, name: &str, value: &Value) -> Result<PluginServer, 
     }
 }
 
-fn reject_unknown_fields(object: &serde_json::Map<String, Value>, allowed: &[&str]) -> Result<(), String> {
+fn reject_unknown_fields(
+    object: &serde_json::Map<String, Value>,
+    allowed: &[&str],
+) -> Result<(), String> {
     for key in object.keys() {
         if !allowed.contains(&key.as_str()) {
             return Err(format!("unknown field: {key}"));
@@ -381,8 +403,10 @@ fn string_map(value: Option<&Value>) -> Option<BTreeMap<String, String>> {
 }
 
 /// A `cwd` is valid only as `./…`, `${PLUGIN_ROOT}`/`${PLUGIN_ROOT}/…` or
-/// `${PLUGIN_DATA}`/`${PLUGIN_DATA}/…`, and must stay inside its root after
-/// expansion (§2 stdio launch rules). Validated at parse time, not spawn time.
+/// `${PLUGIN_DATA}`/`${PLUGIN_DATA}/…` (§2). `./` and `${PLUGIN_ROOT}` are
+/// resolved with [`resolve_within_maybe_missing`]. A `${PLUGIN_DATA}` value
+/// is a syntactic check only; the authoritative canonicalised containment
+/// check runs at spawn once the data directory exists.
 fn validate_cwd(root: &Path, cwd: &str) -> Result<(), String> {
     if let Some(rest) = cwd.strip_prefix("./") {
         if rest.is_empty() {
@@ -413,32 +437,98 @@ fn validate_cwd(root: &Path, cwd: &str) -> Result<(), String> {
         let rel = rest
             .strip_prefix('/')
             .ok_or("cwd must be `${PLUGIN_DATA}` or `${PLUGIN_DATA}/…`")?;
-        // PLUGIN_DATA does not exist at parse time; Ducky creates the data
-        // root itself, so containment is structural: no `..` may appear.
-        if rel.split(['/', '\\']).any(|part| part == "..") {
-            return Err("cwd escapes the plugin data root".into());
-        }
-        return Ok(());
+        return validate_data_cwd_syntax(rel);
     }
     Err("cwd must be `./…`, `${PLUGIN_ROOT}/…` or `${PLUGIN_DATA}/…`".into())
+}
+
+/// `command` is one executable token (§2): a bare name, or a `./` path that
+/// stays inside the plugin root. Placeholders are not expanded.
+fn validate_command(root: &Path, command: &str) -> Result<(), String> {
+    if let Some(rest) = command.strip_prefix("./") {
+        if rest.is_empty() {
+            return Err("command must be a bare name or a `./` path inside the plugin root".into());
+        }
+        return resolve_within_maybe_missing(root, &root.join(rest))
+            .map(|_| ())
+            .ok_or_else(|| "command escapes the plugin root".to_string());
+    }
+    if command
+        .chars()
+        .any(|ch| ch == '/' || ch == '\\' || ch.is_whitespace())
+    {
+        return Err("command must be a bare name or a `./` path inside the plugin root".into());
+    }
+    Ok(())
+}
+
+/// Parse-time check for a `${PLUGIN_DATA}/…` cwd. Syntactic check only; the
+/// authoritative canonicalised containment check runs at spawn once the data
+/// directory exists. An `Ok` from here is not that proof.
+fn validate_data_cwd_syntax(rel: &str) -> Result<(), String> {
+    const MSG: &str = "syntactic check only; the authoritative canonicalised containment check runs at spawn once the data directory exists";
+    if rel.is_empty() {
+        return Ok(());
+    }
+    if std::path::Path::new(rel).is_absolute() || is_windows_absolute(rel) {
+        return Err(MSG.into());
+    }
+    if rel
+        .split(['/', '\\'])
+        .any(|part| part.is_empty() || component_is_dotdot(part))
+    {
+        return Err(MSG.into());
+    }
+    Ok(())
+}
+
+/// `C:…` is absolute on Windows and relative on Unix. Reject it here so the
+/// check does not depend on the host.
+fn is_windows_absolute(rel: &str) -> bool {
+    let bytes = rel.as_bytes();
+    (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        || rel.starts_with('/')
+        || rel.starts_with('\\')
+}
+
+/// `..`, or a component that becomes `..` after trailing ASCII spaces and
+/// dots are removed. Win32 path APIs strip those and then yield `..`.
+fn component_is_dotdot(part: &str) -> bool {
+    if part == ".." {
+        return true;
+    }
+    let bytes = part.as_bytes();
+    let mut end = bytes.len();
+    while end > 0 && (bytes[end - 1] == b' ' || bytes[end - 1] == b'.') {
+        end -= 1;
+        if &part[..end] == ".." {
+            return true;
+        }
+    }
+    false
 }
 
 /// Remote URL rules (§2): absolute HTTP(S), no userinfo, no fragment,
 /// non-loopback hosts must use HTTPS.
 fn validate_url(url: &str) -> Result<(), String> {
-    let parsed = url::Url::parse(url)
-        .map_err(|_| "url must be an absolute HTTP(S) URL".to_string())?;
+    let parsed =
+        url::Url::parse(url).map_err(|_| "url must be an absolute HTTP(S) URL".to_string())?;
     if parsed.scheme() != "http" && parsed.scheme() != "https" {
         return Err("url must be an absolute HTTP(S) URL".into());
     }
-    if !parsed.username().is_empty() {
+    // `username()` is empty for `https://:pass@host`. `password()` is `Some` then.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err("url must not contain userinfo".into());
     }
     if parsed.fragment().is_some() {
         return Err("url must not contain a fragment".into());
     }
-    let host = parsed.host_str().unwrap_or_default();
-    let loopback = host == "localhost" || host.starts_with("127.") || host == "[::1]";
+    let loopback = match parsed.host() {
+        Some(url::Host::Domain(host)) => host == "localhost",
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
     if parsed.scheme() != "https" && !loopback {
         return Err("non-loopback hosts require HTTPS".into());
     }
@@ -453,7 +543,10 @@ fn validate_headers(headers: &BTreeMap<String, String>) -> Result<(), String> {
         if !is_token(name) {
             return Err(format!("invalid header name: {name}"));
         }
-        if !value.bytes().all(|byte| byte == b'\t' || (0x20..=0x7e).contains(&byte)) {
+        if !value
+            .bytes()
+            .all(|byte| byte == b'\t' || (0x20..=0x7e).contains(&byte))
+        {
             return Err(format!("invalid header value for `{name}`"));
         }
         let lower = name.to_ascii_lowercase();
@@ -539,8 +632,10 @@ fn subagent_files(root: &Path, manifest: &PluginManifest, out: &mut Discovered) 
             continue;
         }
         let Ok(text) = std::fs::read_to_string(&path) else {
-            out.diagnostics
-                .push(warning(&target, "cannot read subagent file; subagent skipped"));
+            out.diagnostics.push(warning(
+                &target,
+                "cannot read subagent file; subagent skipped",
+            ));
             continue;
         };
         let Some((frontmatter, body)) = parse_frontmatter(&text) else {

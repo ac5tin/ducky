@@ -271,6 +271,46 @@ fn resolve_within_maybe_missing_handles_new_dir() {
     assert!(resolved.is_some());
 }
 
+#[test]
+#[cfg(unix)]
+fn resolve_within_maybe_missing_rejects_symlink_dotdot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    symlink(outside.path(), &root.join("link"));
+
+    // Reviewer input: `root/link` points outside, target `root/link/../secret`.
+    // Lexical `..` removal reports `<root>/secret`. The filesystem parent does not.
+    let target = root.join("link/../secret");
+    let canonical_root = std::fs::canonicalize(&root).unwrap();
+    let filesystem_parent = std::fs::canonicalize(root.join("link/..")).unwrap();
+    assert!(
+        !filesystem_parent.starts_with(&canonical_root),
+        "fixture must escape: {filesystem_parent:?}"
+    );
+    assert!(super::path::resolve_within_maybe_missing(&root, &target).is_none());
+
+    // A real directory's `..` still resolves inside. Refusing every `..`
+    // would hide the symlink bug behind a broader refusal.
+    std::fs::create_dir(root.join("a")).unwrap();
+    let kept = super::path::resolve_within_maybe_missing(&root, &root.join("a/../fresh")).unwrap();
+    assert_eq!(kept, canonical_root.join("fresh"));
+
+    // Symlink ancestor whose resolved parent stays inside, but is not the lexical parent.
+    std::fs::create_dir_all(root.join("inside/nested")).unwrap();
+    symlink(&root.join("inside/nested"), &root.join("nested-link"));
+    let resolved =
+        super::path::resolve_within_maybe_missing(&root, &root.join("nested-link/../back/newfile"))
+            .unwrap();
+    assert_eq!(
+        resolved,
+        std::fs::canonicalize(root.join("inside"))
+            .unwrap()
+            .join("back/newfile")
+    );
+}
+
 // --- Component discovery (design §2) ---
 
 #[test]
@@ -332,7 +372,11 @@ fn invalid_skill_skipped() {
 fn rejecting_manifest_path_rejects_plugin() {
     let tmp = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
-    write(outside.path(), "plugin.json", &agent_manifest("escapee", ""));
+    write(
+        outside.path(),
+        "plugin.json",
+        &agent_manifest("escapee", ""),
+    );
     symlink(
         &outside.path().join("plugin.json"),
         &tmp.path().join("plugin.json"),
@@ -366,10 +410,16 @@ fn mcp_variants_parse() {
             .find(|s| s.name == name)
             .unwrap_or_else(|| panic!("missing server {name}"))
     };
-    assert!(matches!(server("local").transport, PluginTransport::Stdio { .. }));
+    assert!(matches!(
+        server("local").transport,
+        PluginTransport::Stdio { .. }
+    ));
     assert!(matches!(
         server("http").transport,
-        PluginTransport::Remote { kind: RemoteKind::StreamableHttp, .. }
+        PluginTransport::Remote {
+            kind: RemoteKind::StreamableHttp,
+            ..
+        }
     ));
     assert!(found.diagnostics.is_empty());
 }
@@ -397,9 +447,8 @@ fn reserved_env_key_invalidates_server() {
     // R5: reserved keys are rejected case-insensitively on every platform.
     for key in ["PLUGIN_ROOT", "plugin_root", "Plugin_Root"] {
         let tmp = tempfile::tempdir().unwrap();
-        let servers = format!(
-            r#"{{"s": {{"type": "stdio", "command": "node", "env": {{"{key}": "/x"}}}}}}"#
-        );
+        let servers =
+            format!(r#"{{"s": {{"type": "stdio", "command": "node", "env": {{"{key}": "/x"}}}}}}"#);
 
         let found = discover_agent(tmp.path(), Some(&servers));
 
@@ -416,23 +465,47 @@ fn reserved_env_key_invalidates_server() {
 
 #[test]
 fn cwd_escape_invalidates_server() {
+    // These strings reach the containment check. A bare `../outside` fails
+    // the form check first, so deleting the check would still pass.
+    for cwd in [
+        "./../outside",
+        "${PLUGIN_ROOT}/../outside",
+        "${PLUGIN_DATA}/../outside",
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let servers = format!(r#"{{"s": {{"type": "stdio", "command": "node", "cwd": {cwd:?}}}}}"#);
+
+        let found = discover_agent(tmp.path(), Some(&servers));
+
+        assert!(
+            found.servers.is_empty(),
+            "{cwd} must be rejected, got {:?}",
+            found.servers
+        );
+        assert!(found
+            .diagnostics
+            .iter()
+            .any(|d| d.level == DiagLevel::Warning && d.target == "s"));
+    }
+
     let tmp = tempfile::tempdir().unwrap();
-    let servers = r#"{"s": {"type": "stdio", "command": "node", "cwd": "../outside"}}"#;
-
-    let found = discover_agent(tmp.path(), Some(servers));
-
-    assert!(found.servers.is_empty());
-    assert!(found
-        .diagnostics
-        .iter()
-        .any(|d| d.level == DiagLevel::Warning && d.target == "s"));
+    let found = discover_agent(
+        tmp.path(),
+        Some(r#"{"ok": {"type": "stdio", "command": "node", "cwd": "./sub"}}"#),
+    );
+    assert_eq!(found.servers.len(), 1);
+    assert_eq!(found.servers[0].name, "ok");
 }
 
 #[test]
 fn mismatched_mcp_schema_disables_mcp_only() {
     let tmp = tempfile::tempdir().unwrap();
     write_skill(tmp.path(), "skills/a", "a");
-    write(tmp.path(), "plugin.json", &agent_manifest("demo-plugin", ""));
+    write(
+        tmp.path(),
+        "plugin.json",
+        &agent_manifest("demo-plugin", ""),
+    );
     write(
         tmp.path(),
         "mcp.json",
@@ -456,21 +529,37 @@ fn remote_url_rules() {
     let servers = r#"{
         "plain-http": {"type": "streamable-http", "url": "http://example.com/mcp"},
         "with-userinfo": {"type": "sse", "url": "https://u:p@example.com/mcp"},
-        "loopback": {"type": "streamable-http", "url": "http://localhost:3000/mcp"}
+        "empty-user": {"type": "sse", "url": "https://:pass@example.com/mcp"},
+        "fake-loopback": {"type": "streamable-http", "url": "http://127.evil.com/mcp"},
+        "nip": {"type": "streamable-http", "url": "http://127.0.0.1.nip.io/mcp"},
+        "loopback": {"type": "streamable-http", "url": "http://localhost:3000/mcp"},
+        "ipv4-loopback": {"type": "streamable-http", "url": "http://127.0.0.1/mcp"},
+        "ipv6-loopback": {"type": "streamable-http", "url": "http://[::1]/mcp"}
     }"#;
 
     let found = discover_agent(tmp.path(), Some(servers));
 
-    assert_eq!(found.servers.len(), 1);
-    assert_eq!(found.servers[0].name, "loopback");
+    let mut names: Vec<&str> = found.servers.iter().map(|s| s.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["ipv4-loopback", "ipv6-loopback", "loopback"]);
     let warned: Vec<&str> = found
         .diagnostics
         .iter()
         .filter(|d| d.level == DiagLevel::Warning)
         .map(|d| d.target.as_str())
         .collect();
-    assert!(warned.contains(&"plain-http"));
-    assert!(warned.contains(&"with-userinfo"));
+    for name in [
+        "plain-http",
+        "with-userinfo",
+        "empty-user",
+        "fake-loopback",
+        "nip",
+    ] {
+        assert!(
+            warned.contains(&name),
+            "{name} must be rejected, warned={warned:?}"
+        );
+    }
 }
 
 #[test]
@@ -490,7 +579,11 @@ fn duplicate_header_casing_invalidates_server() {
 #[test]
 fn claude_mcp_json_aliases_normalize() {
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), ".claude-plugin/plugin.json", r#"{"name": "legacy"}"#);
+    write(
+        tmp.path(),
+        ".claude-plugin/plugin.json",
+        r#"{"name": "legacy"}"#,
+    );
     write(
         tmp.path(),
         ".mcp.json",
@@ -507,4 +600,103 @@ fn claude_mcp_json_aliases_normalize() {
         }
         other => panic!("expected stdio transport, got {other:?}"),
     }
+}
+
+/// Pinned claim for a `${PLUGIN_DATA}` cwd. Parse time does not prove
+/// file-system containment.
+const DATA_CWD_SYNTACTIC: &str = "syntactic check only; the authoritative canonicalised containment check runs at spawn once the data directory exists";
+
+#[test]
+fn plugin_data_cwd_trailing_space_is_syntactic() {
+    for cwd in [
+        "${PLUGIN_DATA}/.. ",
+        "${PLUGIN_DATA}/foo//bar",
+        "${PLUGIN_DATA}/C:/Windows",
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let servers = format!(r#"{{"s": {{"type": "stdio", "command": "node", "cwd": {cwd:?}}}}}"#);
+
+        let found = discover_agent(tmp.path(), Some(&servers));
+
+        assert!(found.servers.is_empty(), "{cwd:?} must be rejected");
+        let message = found
+            .diagnostics
+            .iter()
+            .find(|d| d.target == "s")
+            .map(|d| d.message.as_str())
+            .unwrap_or("");
+        assert_eq!(message, DATA_CWD_SYNTACTIC, "{cwd:?}");
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let found = discover_agent(
+        tmp.path(),
+        Some(r#"{"s": {"type": "stdio", "command": "node", "cwd": "${PLUGIN_DATA}/sub"}}"#),
+    );
+    assert_eq!(found.servers.len(), 1);
+}
+
+#[test]
+fn command_must_be_one_token() {
+    for (command, ok) in [
+        ("../bin", false),
+        ("/bin/sh", false),
+        ("./../outside", false),
+        ("node -c", false),
+        ("node", true),
+        ("./server.js", true),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let servers = format!(r#"{{"s": {{"type": "stdio", "command": {command:?}}}}}"#);
+
+        let found = discover_agent(tmp.path(), Some(&servers));
+
+        assert_eq!(
+            !found.servers.is_empty(),
+            ok,
+            "{command:?} servers={:?} diags={:?}",
+            found.servers,
+            found.diagnostics
+        );
+        if ok {
+            match &found.servers[0].transport {
+                PluginTransport::Stdio {
+                    command: stored, ..
+                } => assert_eq!(stored, command),
+                other => panic!("expected stdio, got {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn claude_mcp_json_outside_symlink_skipped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        ".claude-plugin/plugin.json",
+        r#"{"name": "legacy", "mcpServers": {"inline": {"type": "stdio", "command": "node"}}}"#,
+    );
+    write(
+        outside.path(),
+        "escaped.json",
+        r#"{"mcpServers": {"escaped": {"type": "stdio", "command": "node"}}}"#,
+    );
+    symlink(
+        &outside.path().join("escaped.json"),
+        &tmp.path().join(".mcp.json"),
+    );
+    let manifest = load(tmp.path()).unwrap();
+
+    let found = discover(tmp.path(), &manifest);
+
+    assert_eq!(found.servers.len(), 1);
+    assert_eq!(found.servers[0].name, "inline");
+    assert!(found.diagnostics.iter().any(|d| {
+        d.target == ".mcp.json"
+            && d.message.contains("outside")
+            && !d.message.contains("MCP disabled")
+    }));
 }
