@@ -760,7 +760,11 @@ impl McpManager {
                     return Ok(self.status(server_id));
                 }
                 let message = self
-                    .capture_failure_output(server_id, describe_init_error(&e), stderr_tail.as_ref())
+                    .capture_failure_output(
+                        server_id,
+                        describe_init_error(&e),
+                        stderr_tail.as_ref(),
+                    )
                     .await;
                 self.set_status(server_id, ServerStatus::Error { message });
                 return Ok(self.status(server_id));
@@ -847,7 +851,13 @@ impl McpManager {
                 entry.pop_front();
             }
         }
-        let quoted: Vec<&str> = lines.iter().rev().take(5).rev().map(|l| l.as_str()).collect();
+        let quoted: Vec<&str> = lines
+            .iter()
+            .rev()
+            .take(5)
+            .rev()
+            .map(|l| l.as_str())
+            .collect();
         format!("{message}\n\nLast server output:\n{}", quoted.join("\n"))
     }
 

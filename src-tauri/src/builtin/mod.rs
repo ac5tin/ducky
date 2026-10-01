@@ -414,7 +414,10 @@ mod tests {
 
         let set = lookup(SET_MODE).expect("mode tool is registered");
         assert!(set.read_only);
-        assert_eq!(set.schema["required"], serde_json::json!(["mode", "reason"]));
+        assert_eq!(
+            set.schema["required"],
+            serde_json::json!(["mode", "reason"])
+        );
         assert_eq!(
             set.schema["properties"]["mode"]["enum"],
             serde_json::json!(["readonly", "plan", "default"])

@@ -71,7 +71,12 @@ fn git_project(wd: &Path, args: &[&str]) -> anyhow::Result<String> {
 
 /// Run git against the snapshot repo with the project as its work tree.
 fn git_repo(repo: &SnapshotRepo, args: &[&str]) -> anyhow::Result<String> {
-    run_git(Some(&repo.git_dir), Some(&repo.work_tree), &repo.work_tree, args)
+    run_git(
+        Some(&repo.git_dir),
+        Some(&repo.work_tree),
+        &repo.work_tree,
+        args,
+    )
 }
 
 /// The root of the git repository containing `wd`, if any.
@@ -98,21 +103,20 @@ fn ensure_repo(snap_root: &Path, root: &Path) -> anyhow::Result<SnapshotRepo> {
             Some(&git_dir),
             Some(root),
             root,
-            &[
-                "config",
-                "core.worktree",
-                &root.to_string_lossy(),
-            ],
+            &["config", "core.worktree", &root.to_string_lossy()],
         )?;
     }
 
     // Borrow the project's object database so unchanged files are never
     // re-hashed, and seed the index from it for the same reason. Only done
     // once; harmless if the project repo is unusual or missing its index.
-    if !git_dir.join("objects").join("info").join("alternates").exists() {
-        if let Ok(project_git_dir) =
-            git_project(root, &["rev-parse", "--absolute-git-dir"])
-        {
+    if !git_dir
+        .join("objects")
+        .join("info")
+        .join("alternates")
+        .exists()
+    {
+        if let Ok(project_git_dir) = git_project(root, &["rev-parse", "--absolute-git-dir"]) {
             let project_objects = PathBuf::from(&project_git_dir).join("objects");
             if project_objects.is_dir() {
                 let info = git_dir.join("objects").join("info");
@@ -197,7 +201,12 @@ pub fn restore(snap_root: &Path, wd: &Path, tree: &str) -> anyhow::Result<Vec<St
         let mut args: Vec<String> = vec!["checkout".into(), tree.into(), "--".into()];
         args.extend(restore_paths.iter().cloned());
         let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        run_git(Some(&repo.git_dir), Some(&repo.work_tree), &repo.work_tree, &refs)?;
+        run_git(
+            Some(&repo.git_dir),
+            Some(&repo.work_tree),
+            &repo.work_tree,
+            &refs,
+        )?;
     }
     for rel in &delete_paths {
         let path = root.join(rel);
@@ -317,7 +326,10 @@ mod tests {
         std::fs::write(proj.join("new.txt"), "turn 2 file").unwrap();
 
         restore(&snaps, &root, &tree2).unwrap();
-        assert_eq!(std::fs::read_to_string(proj.join("a.txt")).unwrap(), "turn 1 edit");
+        assert_eq!(
+            std::fs::read_to_string(proj.join("a.txt")).unwrap(),
+            "turn 1 edit"
+        );
         assert!(!proj.join("new.txt").exists());
 
         restore(&snaps, &root, &tree1).unwrap();
