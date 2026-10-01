@@ -93,6 +93,14 @@ pub fn load(root: &Path) -> Result<PluginManifest, Vec<Diagnostic>> {
         if !path.is_file() {
             continue;
         }
+        // §4.1 boundary 1: the manifest itself must resolve within the
+        // plugin root; anything else rejects the plugin outright.
+        if crate::plugins::path::resolve_within(root, &path).is_none() {
+            return Err(vec![error(
+                rel,
+                "plugin manifest resolves outside the plugin root",
+            )]);
+        }
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(err) => {

@@ -1,4 +1,5 @@
-//! Plugin layer: Agent Plugins 1.0.0 manifests and (later tasks) components.
+//! Plugin layer: Agent Plugins 1.0.0 manifests, path containment and
+//! component discovery.
 
 pub mod diagnostics {
     //! Diagnostics shared across the plugin layer.
@@ -25,7 +26,9 @@ pub mod diagnostics {
 
 pub use diagnostics::{DiagLevel, Diagnostic};
 
+pub mod layout;
 pub mod manifest;
+pub mod path;
 
 #[cfg(test)]
 mod tests;
