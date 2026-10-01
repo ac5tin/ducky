@@ -95,6 +95,7 @@ pub fn run() {
             commands::conversation_get,
             commands::effort_levels,
             commands::context_limit,
+            commands::fs_suggest,
             commands::chat_send,
             commands::chat_steer,
             commands::chat_unsteer,

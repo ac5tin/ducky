@@ -956,8 +956,12 @@ impl Agent {
                 Msg::User { text, .. } => Some(text.as_str()),
                 _ => None,
             });
-            if let Some(reminder) =
-                reference_text.and_then(crate::builtin::session_context::reference_reminder)
+            for reminder in [
+                reference_text.and_then(crate::builtin::session_context::reference_reminder),
+                reference_text.and_then(crate::builtin::fs::reference_reminder),
+            ]
+            .into_iter()
+            .flatten()
             {
                 snapshot.insert(1, Msg::System { text: reminder });
             }

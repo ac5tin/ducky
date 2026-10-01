@@ -751,6 +751,15 @@ pub async fn context_limit(
 }
 
 #[tauri::command]
+pub fn fs_suggest(state: State<'_, Arc<AppState>>) -> Vec<String> {
+    let cwd = {
+        let cfg = state.store.config.lock().unwrap();
+        cfg.settings.effective_working_dir(&state.store.home_dir)
+    };
+    crate::builtin::fs::suggest(&cwd)
+}
+
+#[tauri::command]
 pub fn conversation_get(
     state: State<'_, Arc<AppState>>,
     id: String,

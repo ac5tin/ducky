@@ -26,6 +26,7 @@ import { ModePicker } from "./ModePicker";
 import { WorkingDirChip } from "./WorkingDirChip";
 import { SlashCommandMenu } from "./SlashCommandMenu";
 import { SessionReferenceMenu } from "./SessionReferenceMenu";
+import { FileReferenceMenu } from "./FileReferenceMenu";
 import { TerminalPanel } from "./TerminalPanel";
 import { TokenMeter } from "./tokenUsage";
 import { ChatConnectorsDialog } from "./ChatConnectorsDialog";
@@ -35,6 +36,12 @@ import {
   sessionReferenceMatches,
   sessionReferenceToken,
 } from "../../sessionReferences";
+import {
+  fileReferenceInsertion,
+  fileReferenceToken,
+  matchFileReferences,
+} from "../../fileReferences";
+import { fsSuggest } from "../../api";
 import type { ConversationMeta } from "../../types";
 
 export function ChatView() {
@@ -622,6 +629,10 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
   const [caret, setCaret] = useState(0);
   const [chatIndex, setChatIndex] = useState(0);
   const [chatsDismissed, setChatsDismissed] = useState(false);
+  // `@` file references: same keyboard contract as the other menus
+  const [fileIndex, setFileIndex] = useState(0);
+  const [filesDismissed, setFilesDismissed] = useState(false);
+  const [suggestions, setSuggestions] = useState<string[] | null>(null);
   const ref = useRef<HTMLTextAreaElement>(null);
 
   // /undo puts the removed prompt back into the composer
@@ -668,6 +679,18 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
     !chatsDismissed &&
     !compacting;
   const activeChat = Math.min(chatIndex, chatMatches.length - 1);
+  const fileToken = useMemo(() => fileReferenceToken(text, caret), [text, caret]);
+  const fileMatches = useMemo(
+    () =>
+      fileToken ? matchFileReferences(suggestions ?? [], fileToken.query) : [],
+    [fileToken, suggestions],
+  );
+  const fileMenuOpen =
+    fileToken !== null &&
+    fileMatches.length > 0 &&
+    !filesDismissed &&
+    !compacting;
+  const activeFile = Math.min(fileIndex, fileMatches.length - 1);
   // only one menu can own the keyboard at a time
   const commandMenuOpen = menuOpen && !chatMenuOpen;
   const activeMatch = Math.min(menuIndex, slashMatches.length - 1);
@@ -703,6 +726,46 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
     });
   };
 
+  // fetch the working directory's paths once per `@` menu session; the
+  // cache clears when the token closes so a new `@` sees fresh files
+  useEffect(() => {
+    if (!fileToken) {
+      setSuggestions(null);
+      return;
+    }
+    if (suggestions !== null) return;
+    let cancelled = false;
+    fsSuggest()
+      .then((paths) => {
+        if (!cancelled) setSuggestions(paths);
+      })
+      .catch(() => {
+        if (!cancelled) setSuggestions([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [fileToken, suggestions]);
+
+  const completeFileReference = (path: string) => {
+    const token = fileReferenceToken(text, caret);
+    if (!token) return;
+    const inserted = fileReferenceInsertion(path);
+    setText(`${text.slice(0, token.start)}${inserted}${text.slice(caret)}`);
+    setFilesDismissed(false);
+    setFileIndex(0);
+    const next = token.start + inserted.length;
+    setCaret(next);
+    requestAnimationFrame(() => {
+      const el = ref.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(next, next);
+      el.style.height = "auto";
+      el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+    });
+  };
+
   const submit = () => {
     const t = text.trim();
     if (!t || compacting) return;
@@ -710,6 +773,7 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
     // running turn instead
     setText("");
     setChatsDismissed(false);
+    setFilesDismissed(false);
     send(t).catch((e) => console.error(e));
   };
 
@@ -728,6 +792,14 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
             activeIndex={activeChat}
             onPick={completeChatReference}
             onDismiss={() => setChatsDismissed(true)}
+          />
+        )}
+        {fileMenuOpen && (
+          <FileReferenceMenu
+            paths={fileMatches}
+            activeIndex={activeFile}
+            onPick={completeFileReference}
+            onDismiss={() => setFilesDismissed(true)}
           />
         )}
         {commandMenuOpen && (
@@ -770,6 +842,9 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
                 if (!sessionReferenceToken(next, nextCaret)) {
                   setChatsDismissed(false);
                 }
+                if (!fileReferenceToken(next, nextCaret)) {
+                  setFilesDismissed(false);
+                }
                 e.currentTarget.style.height = "auto";
                 e.currentTarget.style.height = `${Math.min(e.currentTarget.scrollHeight, 160)}px`;
               }}
@@ -801,6 +876,25 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
                 if (chatMenuOpen && e.key === "Escape") {
                   e.preventDefault();
                   setChatsDismissed(true);
+                  return;
+                }
+                if (fileMenuOpen && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+                  e.preventDefault();
+                  const step = e.key === "ArrowDown" ? 1 : fileMatches.length - 1;
+                  setFileIndex((activeFile + step) % fileMatches.length);
+                  return;
+                }
+                if (
+                  fileMenuOpen &&
+                  (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey))
+                ) {
+                  e.preventDefault();
+                  completeFileReference(fileMatches[activeFile]);
+                  return;
+                }
+                if (fileMenuOpen && e.key === "Escape") {
+                  e.preventDefault();
+                  setFilesDismissed(true);
                   return;
                 }
                 if (commandMenuOpen && (e.key === "ArrowDown" || e.key === "ArrowUp")) {

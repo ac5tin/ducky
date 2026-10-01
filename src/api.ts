@@ -188,6 +188,9 @@ export const effortLevels = (kind: string, model: string) =>
 export const contextLimit = (kind: string, model: string) =>
   invoke<number | null>("context_limit", { kind, model });
 
+/** Paths under the working directory for the composer's `@` menu. */
+export const fsSuggest = () => invoke<string[]>("fs_suggest");
+
 export const conversationGet = (
   id: string,
 ): Promise<[ConversationMeta, RawMessage[]]> =>
