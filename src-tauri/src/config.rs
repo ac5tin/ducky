@@ -1855,7 +1855,10 @@ mod tests {
             }
         }"#;
         let cfg: AppConfig = serde_json::from_str(json).unwrap();
-        assert!(cfg.settings.auto_compact, "auto-compaction is on by default");
+        assert!(
+            cfg.settings.auto_compact,
+            "auto-compaction is on by default"
+        );
         assert_eq!(cfg.settings.auto_compact_threshold, 80);
     }
 

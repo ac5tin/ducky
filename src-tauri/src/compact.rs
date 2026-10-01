@@ -84,7 +84,11 @@ const PREFERENCE_MARKERS: [&str; 6] = [
 
 pub fn tool_effect(name: &str) -> Effect {
     // the last `__` segment carries the verb, so MCP names work too
-    let segment = name.rsplit("__").next().unwrap_or(name).to_ascii_lowercase();
+    let segment = name
+        .rsplit("__")
+        .next()
+        .unwrap_or(name)
+        .to_ascii_lowercase();
     if WRITE_VERBS.iter().any(|v| segment.contains(v)) {
         Effect::Write
     } else if READ_VERBS.iter().any(|v| segment.contains(v)) {
@@ -355,9 +359,9 @@ fn push_collapsed(lines: &mut Vec<String>, line: String) {
 /// and keeps it plus everything after, so the request the user just made
 /// never disappears into a summary. `None` = nothing worth compacting.
 pub fn cut_index(history: &[Msg]) -> Option<usize> {
-    let cut = history.iter().rposition(
-        |m| matches!(m, Msg::User { text, .. } if !text.starts_with(COMPACT_MARKER)),
-    )?;
+    let cut = history
+        .iter()
+        .rposition(|m| matches!(m, Msg::User { text, .. } if !text.starts_with(COMPACT_MARKER)))?;
     (cut > 0).then_some(cut)
 }
 
@@ -369,7 +373,11 @@ pub fn apply_with_tail(history: &[Msg], summary: &str) -> Vec<Msg> {
 }
 
 fn file_lines(ex: &Extracted) -> Vec<String> {
-    let mut out: Vec<String> = ex.modified.iter().map(|p| format!("modified: {p}")).collect();
+    let mut out: Vec<String> = ex
+        .modified
+        .iter()
+        .map(|p| format!("modified: {p}"))
+        .collect();
     out.extend(ex.read.iter().map(|p| format!("read: {p}")));
     out
 }
@@ -528,7 +536,9 @@ pub fn build_summarizer_messages(window: &Window, instructions: Option<&str>) ->
     );
     user.push_str(&deterministic_block(&window.extracted));
     if let Some(extra) = instructions.filter(|s| !s.trim().is_empty()) {
-        user.push_str(&format!("\nThe user asked to focus especially on:\n{extra}\n"));
+        user.push_str(&format!(
+            "\nThe user asked to focus especially on:\n{extra}\n"
+        ));
     }
     user.push_str(
         "\nSummarise the conversation as a compact Markdown document with exactly these \
@@ -628,8 +638,7 @@ pub async fn run(
     if history.is_empty() {
         return Err("Nothing to compact — the conversation is empty.".into());
     }
-    let window = window(&history)
-        .ok_or("Nothing to compact yet — send another message first.")?;
+    let window = window(&history).ok_or("Nothing to compact yet — send another message first.")?;
     let summary = summarize_window(agent, conversation_id, &window, instructions).await?;
     let messages: Vec<serde_json::Value> = apply_with_tail(&history, &summary)
         .iter()
@@ -989,7 +998,11 @@ mod tests {
             history.push(user(&format!("line {i}")));
         }
         let brief = render_brief(&history);
-        assert!(brief.lines().count() <= BRIEF_LINES, "{} lines", brief.lines().count());
+        assert!(
+            brief.lines().count() <= BRIEF_LINES,
+            "{} lines",
+            brief.lines().count()
+        );
         assert!(brief.contains("line 199"));
         assert!(!brief.contains("the very first ask"));
     }
@@ -1005,7 +1018,10 @@ mod tests {
         history.push(tool_result("c9", "ENOENT: no such file", true));
         let brief = render_brief(&history);
         assert!(!brief.contains(COMPACT_MARKER));
-        assert!(brief.contains("[tool_error] ducky__fs_write: ENOENT"), "got: {brief}");
+        assert!(
+            brief.contains("[tool_error] ducky__fs_write: ENOENT"),
+            "got: {brief}"
+        );
     }
 
     #[test]
@@ -1058,7 +1074,10 @@ mod tests {
         history.push(user("newest ask"));
         let w = window(&history).expect("compactable");
         assert_eq!(w.cut, 3);
-        assert_eq!(w.prior.as_deref(), Some("## Files And Changes\n- modified: src/old.ts"));
+        assert_eq!(
+            w.prior.as_deref(),
+            Some("## Files And Changes\n- modified: src/old.ts")
+        );
         assert!(w.extracted.modified.contains(&"src/old.ts".to_string()));
         assert!(w.brief.contains("[user] new ask"), "got: {}", w.brief);
     }
@@ -1080,15 +1099,39 @@ mod tests {
 
     #[test]
     fn auto_compact_fires_at_the_threshold() {
-        assert!(auto_compact_due(true, 0.8, Some(100_000), Some(80_000), false));
-        assert!(auto_compact_due(true, 0.8, Some(100_000), Some(95_000), false));
-        assert!(!auto_compact_due(true, 0.8, Some(100_000), Some(79_999), false));
+        assert!(auto_compact_due(
+            true,
+            0.8,
+            Some(100_000),
+            Some(80_000),
+            false
+        ));
+        assert!(auto_compact_due(
+            true,
+            0.8,
+            Some(100_000),
+            Some(95_000),
+            false
+        ));
+        assert!(!auto_compact_due(
+            true,
+            0.8,
+            Some(100_000),
+            Some(79_999),
+            false
+        ));
     }
 
     #[test]
     fn auto_compact_stays_off_when_disabled_unknown_or_already_done() {
         // switched off in Settings
-        assert!(!auto_compact_due(false, 0.8, Some(100_000), Some(95_000), false));
+        assert!(!auto_compact_due(
+            false,
+            0.8,
+            Some(100_000),
+            Some(95_000),
+            false
+        ));
         // the model is not in the catalog, so its window is unknown
         assert!(!auto_compact_due(true, 0.8, None, Some(95_000), false));
         // a zero window would otherwise fire on every round trip
@@ -1096,7 +1139,13 @@ mod tests {
         // nothing reported yet and no history to estimate from
         assert!(!auto_compact_due(true, 0.8, Some(100_000), None, false));
         // one compaction per user turn
-        assert!(!auto_compact_due(true, 0.8, Some(100_000), Some(95_000), true));
+        assert!(!auto_compact_due(
+            true,
+            0.8,
+            Some(100_000),
+            Some(95_000),
+            true
+        ));
     }
 
     #[test]
