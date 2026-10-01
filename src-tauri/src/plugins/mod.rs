@@ -31,5 +31,7 @@ pub mod manifest;
 pub mod marketplace;
 pub mod path;
 
+pub use marketplace::MarketplaceRecord;
+
 #[cfg(test)]
 mod tests;

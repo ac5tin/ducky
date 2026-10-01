@@ -23,7 +23,7 @@ struct SnapshotRepo {
 
 /// Env vars that could redirect git at a different repository; the snapshot
 /// repo must work no matter what the user's shell exported.
-const GIT_ENV_TO_CLEAR: &[&str] = &[
+pub(crate) const GIT_ENV_TO_CLEAR: &[&str] = &[
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_INDEX_FILE",

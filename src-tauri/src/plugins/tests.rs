@@ -2,11 +2,16 @@
 //! (design §1–§2, §5, §13).
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use super::diagnostics::DiagLevel;
 use super::layout::{discover, PluginTransport, RemoteKind};
 use super::manifest::{load, Layout};
-use super::marketplace::{parse_registry, parse_source, PluginSource};
+use super::marketplace::{
+    parse_git_remote, parse_registry, parse_source, refresh, Change, HttpClient, HttpResponse,
+    MarketplaceRecord, MarketplaceStore, PluginSource,
+};
 
 const SPEC_100: &str = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
 
@@ -1019,4 +1024,496 @@ fn plugin_source_round_trips_for_persistence() {
         serde_json::from_value::<PluginSource>(json).unwrap(),
         unsupported
     );
+}
+
+// ---------------------------------------------------------------------------
+// Marketplace fetch, refresh and records (design §5)
+// ---------------------------------------------------------------------------
+
+/// One recorded conditional GET from [`FakeHttp`].
+type HttpCall = (String, Option<String>, Option<String>);
+
+/// A scripted [`HttpClient`]: responses are handed out in order.
+struct FakeHttp {
+    responses: Mutex<Vec<HttpResponse>>,
+    calls: Mutex<Vec<HttpCall>>,
+}
+
+impl FakeHttp {
+    fn new(responses: Vec<HttpResponse>) -> Self {
+        Self {
+            responses: Mutex::new(responses),
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn calls(&self) -> Vec<HttpCall> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl HttpClient for FakeHttp {
+    async fn get_conditional(
+        &self,
+        url: &str,
+        etag: Option<&str>,
+        last_modified: Option<&str>,
+    ) -> Result<HttpResponse, String> {
+        self.calls.lock().unwrap().push((
+            url.to_string(),
+            etag.map(str::to_string),
+            last_modified.map(str::to_string),
+        ));
+        let mut responses = self.responses.lock().unwrap();
+        if responses.is_empty() {
+            return Err("FakeHttp has no response left".to_string());
+        }
+        Ok(responses.remove(0))
+    }
+}
+
+/// Run git in `cwd`, failing the test on a non-zero exit.
+fn git(cwd: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A real repository at `dir` with one commit holding `marketplace.json`.
+fn git_registry_repo(dir: &Path, plugins: &str) -> String {
+    git(dir, &["init", "-b", "main"]);
+    git(dir, &["config", "user.email", "ducky-test@example.com"]);
+    git(dir, &["config", "user.name", "Ducky Test"]);
+    git(dir, &["config", "commit.gpgsign", "false"]);
+    write(
+        dir,
+        "marketplace.json",
+        &registry_body("git-marketplace", plugins),
+    );
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-m", "registry"]);
+    git(dir, &["rev-parse", "HEAD"])
+}
+
+/// A `file://` clone URL for a local repository.
+fn file_url(path: &Path) -> String {
+    url::Url::from_file_path(path).unwrap().to_string()
+}
+
+/// A record with every optional field empty.
+fn marketplace_record(id: &str, source: PluginSource) -> MarketplaceRecord {
+    MarketplaceRecord {
+        id: id.to_string(),
+        name: id.to_string(),
+        source,
+        registry_path: String::new(),
+        auto_refresh: true,
+        last_refreshed_at: None,
+        resolved_sha: None,
+        bundled: false,
+        hidden: false,
+        error: None,
+        extra: Default::default(),
+    }
+}
+
+/// A `Git` source pointing at a real local repository.
+fn git_source(path: &Path) -> PluginSource {
+    PluginSource::Git {
+        url: file_url(path),
+        path: None,
+        git_ref: None,
+        sha: None,
+    }
+}
+
+/// A `Url` source for the fake HTTP client.
+fn url_source(url: &str) -> PluginSource {
+    PluginSource::Url {
+        url: url.to_string(),
+    }
+}
+
+/// A registry fixture with one plugin entry.
+fn one_entry() -> String {
+    r#"{"name": "one", "source": "./one"}"#.to_string()
+}
+
+#[test]
+fn parse_git_remote_splits_ref() {
+    assert_eq!(
+        parse_git_remote("owner/repo"),
+        ("owner/repo".to_string(), None)
+    );
+    assert_eq!(
+        parse_git_remote("owner/repo#main"),
+        ("owner/repo".to_string(), Some("main".to_string()))
+    );
+    assert_eq!(
+        parse_git_remote("https://example.com/r.git#v1"),
+        (
+            "https://example.com/r.git".to_string(),
+            Some("v1".to_string())
+        )
+    );
+    assert_eq!(
+        parse_git_remote("https://example.com/r.git"),
+        ("https://example.com/r.git".to_string(), None)
+    );
+    assert_eq!(
+        parse_git_remote("https://example.com/r.git#"),
+        ("https://example.com/r.git".to_string(), None)
+    );
+}
+
+#[tokio::test]
+async fn git_refresh_records_resolved_sha() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    let sha = git_registry_repo(&source, &one_entry());
+    let dir = tmp.path().join("marketplaces");
+    let mut rec = marketplace_record("git-marketplace", git_source(&source));
+    let http = FakeHttp::new(Vec::new());
+
+    let outcome = refresh(&mut rec, &dir, &http).await.unwrap();
+
+    assert_eq!(outcome.change, Change::Updated);
+    assert_eq!(outcome.entry_count, 1);
+    let resolved = rec.resolved_sha.clone().expect("resolved_sha recorded");
+    assert_eq!(resolved, sha);
+    assert_eq!(resolved.len(), 40);
+    assert!(resolved.chars().all(|c| c.is_ascii_hexdigit()));
+    assert_eq!(rec.error, None);
+    assert!(rec.last_refreshed_at.is_some());
+    assert_eq!(rec.registry_path, "marketplace.json");
+    assert!(dir.join("git-marketplace/repo/marketplace.json").is_file());
+
+    let mut store = MarketplaceStore::default();
+    store.records.push(rec.clone());
+    store.save(&dir).unwrap();
+    let loaded = MarketplaceStore::load(&dir);
+    assert_eq!(loaded.records.len(), 1);
+    assert_eq!(loaded.records[0].resolved_sha, Some(sha));
+}
+
+#[tokio::test]
+async fn git_refresh_second_time_unchanged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    git_registry_repo(&source, &one_entry());
+    let dir = tmp.path().join("marketplaces");
+    let mut rec = marketplace_record("git-marketplace", git_source(&source));
+    let http = FakeHttp::new(Vec::new());
+
+    let first = refresh(&mut rec, &dir, &http).await.unwrap();
+    assert_eq!(first.change, Change::Updated);
+
+    let second = refresh(&mut rec, &dir, &http).await.unwrap();
+
+    assert_eq!(second.change, Change::Unchanged);
+    assert_eq!(second.resolved_sha, first.resolved_sha);
+    assert_eq!(second.entry_count, 1);
+}
+
+#[tokio::test]
+async fn git_refresh_failure_sets_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let missing = tmp.path().join("gone");
+    let dir = tmp.path().join("marketplaces");
+    let mut rec = marketplace_record("missing", git_source(&missing));
+    let http = FakeHttp::new(Vec::new());
+
+    let err = refresh(&mut rec, &dir, &http).await.unwrap_err();
+
+    assert!(!err.is_empty());
+    assert_eq!(rec.error.as_deref(), Some(err.as_str()));
+    assert_eq!(rec.last_refreshed_at, None);
+    assert_eq!(rec.resolved_sha, None);
+    assert!(
+        !dir.join("missing/repo").exists(),
+        "a failed clone leaves no half clone"
+    );
+}
+
+#[tokio::test]
+async fn url_refresh_stores_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let body = registry_body("remote", &one_entry());
+    let http = FakeHttp::new(vec![HttpResponse {
+        status: 200,
+        body: Some(body.clone()),
+        etag: Some("\"v1\"".to_string()),
+        last_modified: Some("Mon, 01 Oct 2026 00:00:00 GMT".to_string()),
+    }]);
+    let mut rec = marketplace_record("remote", url_source("https://example.com/marketplace.json"));
+
+    let outcome = refresh(&mut rec, tmp.path(), &http).await.unwrap();
+
+    assert_eq!(outcome.change, Change::Updated);
+    assert_eq!(outcome.entry_count, 1);
+    assert_eq!(outcome.resolved_sha, None);
+    assert_eq!(rec.error, None);
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("remote/registry.json")).unwrap(),
+        body
+    );
+    let meta: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join("remote/registry.meta.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(meta["etag"], "\"v1\"");
+    assert_eq!(meta["lastModified"], "Mon, 01 Oct 2026 00:00:00 GMT");
+    assert_eq!(http.calls()[0].1, None);
+}
+
+#[tokio::test]
+async fn url_refresh_304_keeps_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let body = registry_body("remote", &one_entry());
+    let http = FakeHttp::new(vec![
+        HttpResponse {
+            status: 200,
+            body: Some(body.clone()),
+            etag: Some("\"v1\"".to_string()),
+            last_modified: Some("Mon, 01 Oct 2026 00:00:00 GMT".to_string()),
+        },
+        HttpResponse {
+            status: 304,
+            body: None,
+            etag: None,
+            last_modified: None,
+        },
+    ]);
+    let mut rec = marketplace_record("remote", url_source("https://example.com/marketplace.json"));
+    refresh(&mut rec, tmp.path(), &http).await.unwrap();
+
+    let outcome = refresh(&mut rec, tmp.path(), &http).await.unwrap();
+
+    assert_eq!(outcome.change, Change::Unchanged);
+    assert_eq!(outcome.entry_count, 1);
+    assert_eq!(rec.error, None);
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("remote/registry.json")).unwrap(),
+        body
+    );
+    assert_eq!(http.calls()[1].1.as_deref(), Some("\"v1\""));
+    assert_eq!(
+        http.calls()[1].2.as_deref(),
+        Some("Mon, 01 Oct 2026 00:00:00 GMT")
+    );
+}
+
+#[tokio::test]
+async fn url_refresh_success_clears_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut rec = marketplace_record("remote", url_source("https://example.com/marketplace.json"));
+    let failing = FakeHttp::new(vec![HttpResponse {
+        status: 500,
+        body: None,
+        etag: None,
+        last_modified: None,
+    }]);
+    refresh(&mut rec, tmp.path(), &failing).await.unwrap_err();
+    assert!(rec.error.is_some());
+
+    let http = FakeHttp::new(vec![HttpResponse {
+        status: 200,
+        body: Some(registry_body("remote", &one_entry())),
+        etag: None,
+        last_modified: None,
+    }]);
+    refresh(&mut rec, tmp.path(), &http).await.unwrap();
+
+    assert_eq!(rec.error, None);
+}
+
+#[tokio::test]
+async fn url_refresh_failure_keeps_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let body = registry_body("remote", &one_entry());
+    let http = FakeHttp::new(vec![HttpResponse {
+        status: 200,
+        body: Some(body.clone()),
+        etag: Some("\"v1\"".to_string()),
+        last_modified: None,
+    }]);
+    let mut rec = marketplace_record("remote", url_source("https://example.com/marketplace.json"));
+    refresh(&mut rec, tmp.path(), &http).await.unwrap();
+    let before = rec.clone();
+    let failing = FakeHttp::new(vec![HttpResponse {
+        status: 500,
+        body: None,
+        etag: None,
+        last_modified: None,
+    }]);
+
+    let err = refresh(&mut rec, tmp.path(), &failing).await.unwrap_err();
+
+    assert!(err.contains("500"), "unexpected error: {err}");
+    assert_eq!(rec.error.as_deref(), Some(err.as_str()));
+    assert_eq!(rec.last_refreshed_at, before.last_refreshed_at);
+    assert_eq!(rec.resolved_sha, before.resolved_sha);
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("remote/registry.json")).unwrap(),
+        body
+    );
+}
+
+#[tokio::test]
+async fn path_source_rereads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("local");
+    write(
+        &source,
+        "marketplace.json",
+        &registry_body("local", &one_entry()),
+    );
+    let mut rec = marketplace_record(
+        "local",
+        PluginSource::Path {
+            path: source.to_string_lossy().to_string(),
+        },
+    );
+    assert!(rec.auto_refresh);
+    let http = FakeHttp::new(Vec::new());
+
+    let first = refresh(&mut rec, tmp.path(), &http).await.unwrap();
+
+    assert_eq!(first.change, Change::Updated);
+    assert_eq!(first.entry_count, 1);
+    assert_eq!(rec.registry_path, "marketplace.json");
+    assert_eq!(rec.resolved_sha, None);
+    assert!(
+        !rec.auto_refresh,
+        "local marketplaces are never auto-refreshed"
+    );
+    assert!(http.calls().is_empty(), "local sources do not use HTTP");
+
+    write(
+        &source,
+        "marketplace.json",
+        &registry_body(
+            "local",
+            &format!(
+                "{}, {}",
+                one_entry(),
+                r#"{"name": "two", "source": "./two"}"#
+            ),
+        ),
+    );
+    let second = refresh(&mut rec, tmp.path(), &http).await.unwrap();
+
+    assert_eq!(second.entry_count, 2);
+}
+
+#[test]
+fn records_survive_unknown_fields() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("marketplaces.json"),
+        r#"{
+          "version": 1,
+          "futureStoreField": {"nested": true},
+          "marketplaces": [{
+            "id": "acme",
+            "name": "Acme",
+            "source": {"kind": "url", "url": "https://example.com/marketplace.json"},
+            "registryPath": "marketplace.json",
+            "autoRefresh": true,
+            "lastRefreshedAt": null,
+            "resolvedSha": null,
+            "bundled": false,
+            "hidden": false,
+            "error": null,
+            "futureField": {"x": [1, 2, 3]}
+          }]
+        }"#,
+    )
+    .unwrap();
+
+    let store = MarketplaceStore::load(tmp.path());
+
+    assert_eq!(store.records.len(), 1);
+    assert_eq!(
+        store.records[0].source,
+        url_source("https://example.com/marketplace.json")
+    );
+    assert_eq!(store.records[0].extra["futureField"]["x"][1], 2);
+    assert_eq!(store.extra["futureStoreField"]["nested"], true);
+
+    store.save(tmp.path()).unwrap();
+
+    let saved: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(tmp.path().join("marketplaces.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved["version"], 1);
+    assert_eq!(saved["futureStoreField"]["nested"], true);
+    assert_eq!(saved["marketplaces"][0]["futureField"]["x"][2], 3);
+    assert_eq!(saved["marketplaces"][0]["source"]["kind"], "url");
+    assert_eq!(saved["marketplaces"][0]["registryPath"], "marketplace.json");
+}
+
+#[test]
+fn save_is_atomic() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_path_buf();
+    MarketplaceStore::default().save(&dir).unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let unparsable = Arc::new(AtomicUsize::new(0));
+    let reader = {
+        let dir = dir.clone();
+        let stop = Arc::clone(&stop);
+        let unparsable = Arc::clone(&unparsable);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                if let Ok(text) = std::fs::read_to_string(dir.join("marketplaces.json")) {
+                    if serde_json::from_str::<serde_json::Value>(&text).is_err() {
+                        unparsable.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        })
+    };
+
+    let writers: Vec<_> = (0..4)
+        .map(|w| {
+            let dir = dir.clone();
+            std::thread::spawn(move || {
+                for n in 0..50 {
+                    let mut store = MarketplaceStore::default();
+                    store.records.push(marketplace_record(
+                        &format!("m{w}-{n}"),
+                        url_source("https://example.com/marketplace.json"),
+                    ));
+                    store.save(&dir).unwrap();
+                }
+            })
+        })
+        .collect();
+    for writer in writers {
+        writer.join().unwrap();
+    }
+    stop.store(true, Ordering::Relaxed);
+    reader.join().unwrap();
+
+    assert_eq!(
+        unparsable.load(Ordering::Relaxed),
+        0,
+        "a concurrent save left an unparsable file"
+    );
+    let text = std::fs::read_to_string(dir.join("marketplaces.json")).unwrap();
+    serde_json::from_str::<serde_json::Value>(&text).expect("final file parses");
 }
