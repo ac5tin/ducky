@@ -1508,6 +1508,31 @@ async fn references_add_a_model_only_reminder() {
 }
 
 #[tokio::test]
+async fn file_references_add_a_model_only_reminder() {
+    let prompt = "what is wrong with @src/agent.rs here";
+    script(prompt, vec![MockRound::Text("done".into())]);
+    let (agent, _sink, store) = test_agent("r3-conv");
+    run(&agent, "r3-conv", prompt, &CancellationToken::new()).await;
+
+    let rounds = captures_for(prompt);
+    assert!(
+        rounds[0]
+            .systems
+            .iter()
+            .any(|s| s.contains("src/agent.rs") && s.contains("ducky__fs_read")),
+        "{:?}",
+        rounds[0].systems
+    );
+
+    // the reminder is request-only: the saved transcript keeps one user turn
+    let (_, messages) = store.load_conversation("r3-conv").unwrap();
+    assert!(
+        !messages.iter().any(|m| m["kind"] == "system"),
+        "{messages:?}"
+    );
+}
+
+#[tokio::test]
 async fn typed_hash_text_is_not_a_reference() {
     let prompt = "what about #chat_notauuid and C#";
     script(prompt, vec![MockRound::Text("done".into())]);
