@@ -6,6 +6,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::diagnostics::DiagLevel;
+use super::install::{
+    assign_id, derive_policy, fetch_to_staging, install, resolve_version, uninstall, InstallRecord,
+    InstallStore, PluginStatus, UpdatePolicy,
+};
 use super::layout::{discover, PluginTransport, RemoteKind};
 use super::manifest::{load, Layout};
 use super::marketplace::{
@@ -1646,4 +1650,512 @@ fn save_is_atomic() {
     );
     let text = std::fs::read_to_string(dir.join("marketplaces.json")).unwrap();
     serde_json::from_str::<serde_json::Value>(&text).expect("final file parses");
+}
+
+// ---------------------------------------------------------------------------
+// Install records, staging, version ladder and uninstall (design §3, §6, §7)
+// ---------------------------------------------------------------------------
+
+/// A minimal valid local plugin package with one skill.
+fn plugin_package(root: &Path, name: &str) {
+    write(root, "plugin.json", &agent_manifest(name, ""));
+    write_skill(root, "skills/demo", "demo");
+}
+
+/// An install record with every optional field empty.
+fn install_record(id: &str, name: &str, source: PluginSource) -> InstallRecord {
+    InstallRecord {
+        id: id.to_string(),
+        name: name.to_string(),
+        marketplace: None,
+        source,
+        version: Some("1.0.0".to_string()),
+        installed_at: "2026-10-01T00:00:00Z".to_string(),
+        layout: Layout::AgentPlugins,
+        enabled: false,
+        update_policy: UpdatePolicy::Auto,
+        disabled_servers: Vec::new(),
+        previous_version: None,
+        tree_hash: None,
+        last_checked_at: None,
+        available_update: None,
+        status: PluginStatus::InstalledDisabled,
+        diagnostics: Vec::new(),
+        resolved_sha: None,
+        resolved_sha256: None,
+        extra: Default::default(),
+    }
+}
+
+/// A `Path` source for a local package, installed by copy.
+fn path_source(path: &Path) -> PluginSource {
+    PluginSource::Path {
+        path: path.display().to_string(),
+    }
+}
+
+#[test]
+fn ladder_prefers_manifest_version() {
+    let sha = "9f2c8b1d4e6a77c3e5f0b1a2c3d4e5f60718293a";
+
+    assert_eq!(
+        resolve_version(Some("1.2.0"), Some("1.3.0"), Some(sha), None),
+        Some("1.2.0".to_string())
+    );
+}
+
+#[test]
+fn ladder_falls_back_to_entry() {
+    let sha = "9f2c8b1d4e6a77c3e5f0b1a2c3d4e5f60718293a";
+
+    assert_eq!(
+        resolve_version(None, Some("1.3.0"), Some(sha), None),
+        Some("1.3.0".to_string())
+    );
+}
+
+#[test]
+fn ladder_falls_back_to_sha12() {
+    let sha = "9f2c8b1d4e6a77c3e5f0b1a2c3d4e5f60718293a";
+    let sha256 = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f80912";
+
+    assert_eq!(
+        resolve_version(None, None, Some(sha), None),
+        Some(sha[..12].to_string())
+    );
+    assert_eq!(
+        resolve_version(None, None, None, Some(sha256)),
+        Some(sha256[..12].to_string())
+    );
+}
+
+#[test]
+fn ladder_unknown_last() {
+    assert_eq!(
+        resolve_version(None, None, None, None),
+        Some("unknown".to_string())
+    );
+}
+
+#[test]
+fn id_collision_appends_fingerprint() {
+    let fingerprint = "9f2c8b1d4e6a77c3e5f0b1a2c3d4e5f60718293a";
+
+    let free = assign_id("acme", Layout::AgentPlugins, &[], fingerprint);
+    assert_eq!(free, "acme");
+
+    // Two records named `acme` from different sources: the second id carries
+    // the first 6 hex characters of the resolved source fingerprint.
+    let existing = vec![install_record(
+        "acme",
+        "acme",
+        PluginSource::Path {
+            path: "/tmp/one".to_string(),
+        },
+    )];
+    let collision = assign_id("acme", Layout::AgentPlugins, &existing, fingerprint);
+    assert_eq!(collision, format!("acme-{}", &fingerprint[..6]));
+}
+
+#[test]
+fn policy_is_auto_for_skills_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "plugin.json", &agent_manifest("skills-only", ""));
+    write_skill(tmp.path(), "skills/demo", "demo");
+
+    let manifest = load(tmp.path()).unwrap();
+    let discovered = discover(tmp.path(), &manifest);
+
+    assert_eq!(discovered.servers.len() + discovered.subagents.len(), 0);
+    assert_eq!(derive_policy(&discovered), UpdatePolicy::Auto);
+}
+
+#[test]
+fn policy_is_manual_with_mcp() {
+    let tmp = tempfile::tempdir().unwrap();
+    let discovered = discover_agent(
+        tmp.path(),
+        Some(r#"{"local": {"type": "stdio", "command": "node"}}"#),
+    );
+
+    assert_eq!(discovered.servers.len(), 1);
+    assert_eq!(derive_policy(&discovered), UpdatePolicy::Manual);
+}
+
+#[test]
+fn policy_is_manual_with_extensions() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "plugin.json", &agent_manifest("with-subagent", ""));
+    write(
+        tmp.path(),
+        "app.ducky/subagents/reviewer.md",
+        "---\nname: reviewer\ndescription: reviews code\n---\nBody.",
+    );
+
+    let manifest = load(tmp.path()).unwrap();
+    let discovered = discover(tmp.path(), &manifest);
+
+    assert_eq!(discovered.subagents.len(), 1);
+    assert_eq!(derive_policy(&discovered), UpdatePolicy::Manual);
+}
+
+#[test]
+fn install_writes_record_disabled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    plugin_package(&source, "demo-plugin");
+    let plugins = tmp.path().join("plugins");
+
+    let mut store = InstallStore::load(&plugins);
+    let record = install(&mut store, &plugins, &path_source(&source), None, None).unwrap();
+
+    assert!(!record.enabled);
+    assert_eq!(record.status, PluginStatus::InstalledDisabled);
+    assert_eq!(record.id, "demo-plugin");
+    assert!(plugins.join(&record.id).join("package/plugin.json").is_file());
+
+    let staging = plugins.join(".staging");
+    assert!(
+        !staging.exists()
+            || std::fs::read_dir(&staging)
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(false),
+        "staging is not empty after a successful install"
+    );
+
+    let reloaded = InstallStore::load(&plugins);
+    assert_eq!(reloaded.records, vec![record]);
+}
+
+#[test]
+fn install_rejects_invalid_package() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    write(&source, "plugin.json", &agent_manifest("Bad--Name", ""));
+    let plugins = tmp.path().join("plugins");
+
+    let mut store = InstallStore::load(&plugins);
+    let result = install(&mut store, &plugins, &path_source(&source), None, None);
+
+    assert!(result.is_err());
+    assert!(store.records.is_empty());
+    let leftovers: Vec<String> = std::fs::read_dir(&plugins)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name != ".staging")
+        .collect();
+    assert!(leftovers.is_empty(), "package debris: {leftovers:?}");
+    let staging = plugins.join(".staging");
+    assert!(staging
+        .read_dir()
+        .map(|mut entries| entries.next().is_none())
+        .unwrap_or(true));
+}
+
+#[test]
+fn install_twice_is_idempotent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    plugin_package(&source, "demo-plugin");
+    let plugins = tmp.path().join("plugins");
+    let source = path_source(&source);
+
+    let mut store = InstallStore::load(&plugins);
+    install(&mut store, &plugins, &source, None, None).unwrap();
+    let second = install(&mut store, &plugins, &source, None, None);
+
+    let err = second.unwrap_err();
+    assert!(err.contains("already installed"), "unexpected error: {err}");
+    assert_eq!(store.records.len(), 1);
+}
+
+#[test]
+fn uninstall_keeps_data_by_default() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    plugin_package(&source, "demo-plugin");
+    let plugins = tmp.path().join("plugins");
+    let data = tmp.path().join("plugin-data/demo-plugin");
+
+    let mut store = InstallStore::load(&plugins);
+    let record = install(&mut store, &plugins, &path_source(&source), None, None).unwrap();
+    write(&data, "state.json", "{}");
+
+    uninstall(&mut store, &plugins, &data, &record.id, false).unwrap();
+
+    assert!(data.join("state.json").is_file(), "plugin data was deleted");
+    assert!(store.records.is_empty());
+    assert!(!plugins.join(&record.id).exists());
+}
+
+#[test]
+fn uninstall_deletes_data_on_request() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    plugin_package(&source, "demo-plugin");
+    let plugins = tmp.path().join("plugins");
+    let data = tmp.path().join("plugin-data/demo-plugin");
+
+    let mut store = InstallStore::load(&plugins);
+    let record = install(&mut store, &plugins, &path_source(&source), None, None).unwrap();
+    write(&data, "state.json", "{}");
+
+    uninstall(&mut store, &plugins, &data, &record.id, true).unwrap();
+
+    assert!(!data.exists(), "plugin data survived a requested delete");
+    assert!(!plugins.join(&record.id).exists());
+}
+
+#[test]
+fn install_from_source_without_marketplace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    git_init(&repo);
+    write(
+        &repo,
+        "plugin.json",
+        &agent_manifest("git-plugin", r#", "version": "1.2.0""#),
+    );
+    write_skill(&repo, "skills/demo", "demo");
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-m", "plugin"]);
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+    let plugins = tmp.path().join("plugins");
+
+    let mut store = InstallStore::load(&plugins);
+    let record = install(&mut store, &plugins, &git_source(&repo), None, None).unwrap();
+
+    assert_eq!(record.marketplace, None);
+    assert_eq!(record.version.as_deref(), Some("1.2.0"));
+    assert_eq!(record.resolved_sha.as_deref(), Some(head.as_str()));
+    assert!(plugins.join(&record.id).join("package/plugin.json").is_file());
+    assert!(
+        !plugins.join(&record.id).join("package/.git").exists(),
+        "the installed package kept a git checkout"
+    );
+}
+
+#[test]
+fn uninstall_returns_owned_server_ids() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    write(&source, "plugin.json", &agent_manifest("with-server", ""));
+    write(
+        &source,
+        "mcp.json",
+        &format!(
+            r#"{{"$schema": "{SPEC_100}", "mcpServers": {{"local-validator": {{"type": "stdio", "command": "node"}}}}}}"#
+        ),
+    );
+    let plugins = tmp.path().join("plugins");
+    let data = tmp.path().join("plugin-data/with-server");
+
+    let mut store = InstallStore::load(&plugins);
+    let record = install(&mut store, &plugins, &path_source(&source), None, None).unwrap();
+    let ids = uninstall(&mut store, &plugins, &data, &record.id, false).unwrap();
+
+    assert_eq!(ids, vec![format!("plugin:{}:local-validator", record.id)]);
+}
+
+#[test]
+fn install_checks_out_the_named_sha() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    git_init(&repo);
+    write(&repo, "plugin.json", &agent_manifest("pinned", ""));
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-m", "first"]);
+    let first = git(&repo, &["rev-parse", "HEAD"]);
+    write(&repo, "marker.txt", "second revision");
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-m", "second"]);
+
+    let plugins = tmp.path().join("plugins");
+    let mut store = InstallStore::load(&plugins);
+    let source = PluginSource::Git {
+        url: file_url(&repo),
+        path: None,
+        git_ref: None,
+        sha: Some(first.clone()),
+    };
+    let record = install(&mut store, &plugins, &source, None, None).unwrap();
+
+    assert_eq!(record.resolved_sha.as_deref(), Some(first.as_str()));
+    assert!(
+        !plugins.join(&record.id).join("package/marker.txt").exists(),
+        "install did not check out the named sha"
+    );
+}
+
+#[test]
+fn fetch_to_staging_records_git_sha() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    git_init(&repo);
+    write(&repo, "plugin.json", &agent_manifest("staged", ""));
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-m", "plugin"]);
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+    let target = tmp.path().join("staging/package");
+    let mut sha = None;
+    let mut sha256 = None;
+
+    fetch_to_staging(
+        &git_source(&repo),
+        &target,
+        &mut sha,
+        &mut sha256,
+        &FakeHttp::new(Vec::new()),
+    )
+    .unwrap();
+
+    assert_eq!(sha.as_deref(), Some(head.as_str()));
+    assert_eq!(sha256, None);
+    assert!(target.join("plugin.json").is_file());
+    assert!(!target.join(".git").exists());
+}
+
+#[test]
+fn fetch_to_staging_takes_git_subdir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    git_init(&repo);
+    write(&repo, "packages/plug/plugin.json", &agent_manifest("sub", ""));
+    write(&repo, "README.md", "not the package");
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-m", "plugin"]);
+    let target = tmp.path().join("staging/package");
+    let source = PluginSource::GitSubdir {
+        url: file_url(&repo),
+        path: "packages/plug".to_string(),
+        git_ref: None,
+        sha: None,
+    };
+    let mut sha = None;
+    let mut sha256 = None;
+
+    fetch_to_staging(
+        &source,
+        &target,
+        &mut sha,
+        &mut sha256,
+        &FakeHttp::new(Vec::new()),
+    )
+    .unwrap();
+
+    assert!(target.join("plugin.json").is_file());
+    assert!(!target.join("packages").exists());
+    assert!(sha.is_some());
+}
+
+#[test]
+fn status_and_policy_serialise_to_the_pinned_strings() {
+    let statuses = [
+        (PluginStatus::InstalledDisabled, "installed_disabled"),
+        (PluginStatus::Enabled, "enabled"),
+        (PluginStatus::Invalid, "invalid"),
+        (PluginStatus::UpdateAvailable, "update_available"),
+        (PluginStatus::ModifiedLocally, "modified_locally"),
+        (PluginStatus::Error, "error"),
+    ];
+    for (status, expected) in statuses {
+        assert_eq!(serde_json::to_value(status).unwrap(), expected);
+    }
+    assert_eq!(serde_json::to_value(UpdatePolicy::Auto).unwrap(), "auto");
+    assert_eq!(serde_json::to_value(UpdatePolicy::Manual).unwrap(), "manual");
+}
+
+#[test]
+fn corrupt_install_store_keeps_the_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("installed.json"), "{ not json").unwrap();
+
+    let store = InstallStore::load(tmp.path());
+
+    assert!(store.records.is_empty());
+    assert!(store.diagnostics.iter().any(|d| d.level == DiagLevel::Error));
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("installed.json")).unwrap(),
+        "{ not json",
+        "load overwrote the corrupt file"
+    );
+}
+
+#[test]
+fn concurrent_record_writes_never_corrupt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().to_path_buf();
+    InstallStore::load(&dir).save(&dir).unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let unparsable = Arc::new(AtomicUsize::new(0));
+    let failed = Arc::new(AtomicUsize::new(0));
+    let reader = {
+        let dir = dir.clone();
+        let stop = Arc::clone(&stop);
+        let unparsable = Arc::clone(&unparsable);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                if let Ok(text) = std::fs::read_to_string(dir.join("installed.json")) {
+                    if serde_json::from_str::<serde_json::Value>(&text).is_err() {
+                        unparsable.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        })
+    };
+
+    // 4 writers x 50 interleaved add/remove saves: a shared temp name or a
+    // non-atomic write must fail the all-Ok and parse assertions below.
+    let writers: Vec<_> = (0..4)
+        .map(|w| {
+            let dir = dir.clone();
+            let failed = Arc::clone(&failed);
+            std::thread::spawn(move || {
+                for n in 0..50 {
+                    let id = format!("p{w}-{n}");
+                    let mut store = InstallStore::load(&dir);
+                    store.records.retain(|record| record.id != id);
+                    store.records.push(install_record(
+                        &id,
+                        &id,
+                        PluginSource::Git {
+                            url: format!("https://example.com/{w}.git"),
+                            path: None,
+                            git_ref: None,
+                            sha: None,
+                        },
+                    ));
+                    if store.save(&dir).is_err() {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })
+        })
+        .collect();
+    for writer in writers {
+        writer.join().unwrap();
+    }
+    stop.store(true, Ordering::Relaxed);
+    reader.join().unwrap();
+
+    assert_eq!(failed.load(Ordering::Relaxed), 0, "a concurrent save failed");
+    assert_eq!(
+        unparsable.load(Ordering::Relaxed),
+        0,
+        "a concurrent save left an unparsable file"
+    );
+    let text = std::fs::read_to_string(dir.join("installed.json")).unwrap();
+    let store: InstallStore = serde_json::from_str(&text).expect("final file parses");
+    let mut ids: Vec<_> = store.records.iter().map(|record| record.id.clone()).collect();
+    let count = ids.len();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), count, "duplicate records after concurrent writes");
+    for record in &store.records {
+        assert!(!record.id.is_empty());
+        assert!(matches!(&record.source, PluginSource::Git { .. }));
+        assert_eq!(record.version.as_deref(), Some("1.0.0"));
+    }
 }

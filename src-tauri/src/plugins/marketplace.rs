@@ -850,7 +850,7 @@ fn refresh_git(
 }
 
 /// The clone URL, optional subdirectory and optional ref of a git source.
-fn git_target(source: &PluginSource) -> Result<(String, Option<String>, Option<String>), String> {
+pub(crate) fn git_target(source: &PluginSource) -> Result<(String, Option<String>, Option<String>), String> {
     match source {
         PluginSource::Github {
             repo,
@@ -911,7 +911,7 @@ fn read_git_registry(repo: &Path, sub_path: Option<&str>) -> Result<(Registry, P
 ///
 /// Spec §5 / R17: try `--filter=blob:none` first. If git rejects that flag,
 /// fall back to a plain `--depth 1` clone.
-fn clone_repo(url: &str, git_ref: Option<&str>, repo: &Path) -> Result<(), String> {
+pub(crate) fn clone_repo(url: &str, git_ref: Option<&str>, repo: &Path) -> Result<(), String> {
     match clone_attempts(url, git_ref, repo, true) {
         Ok(()) => Ok(()),
         Err(err) if filter_flag_rejected(&err) => {
@@ -1000,7 +1000,7 @@ fn git_command() -> Command {
 }
 
 /// Run `git -C repo …` and fail with the trimmed stderr.
-fn git_in(repo: &Path, args: &[&str]) -> Result<String, String> {
+pub(crate) fn git_in(repo: &Path, args: &[&str]) -> Result<String, String> {
     let mut command = git_command();
     command.arg("-C").arg(repo).args(args);
     git_output(command)
@@ -1017,7 +1017,7 @@ fn git_output(mut command: Command) -> Result<String, String> {
 }
 
 /// One string for the UI from a failed parse.
-fn join_diagnostics(diagnostics: Vec<Diagnostic>) -> String {
+pub(crate) fn join_diagnostics(diagnostics: Vec<Diagnostic>) -> String {
     diagnostics
         .into_iter()
         .map(|diagnostic| diagnostic.message)

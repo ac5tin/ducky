@@ -26,11 +26,13 @@ pub mod diagnostics {
 
 pub use diagnostics::{DiagLevel, Diagnostic};
 
+pub mod install;
 pub mod layout;
 pub mod manifest;
 pub mod marketplace;
 pub mod path;
 
+pub use install::{AvailableUpdate, InstallRecord, InstallStore, PluginStatus, UpdatePolicy};
 pub use marketplace::MarketplaceRecord;
 
 #[cfg(test)]
