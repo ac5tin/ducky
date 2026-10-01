@@ -302,8 +302,9 @@ export function SettingsView() {
                 <span className="text-sm text-slate-400">% of the context window</span>
               </div>
               <p className="mt-1 text-xs text-slate-400">
-                The newest exchange stays as real messages; only older ones become a
-                summary. /compact does the same thing when you ask for it.
+                Older messages become a summary; the newest exchange stays as
+                real messages when it fits. /compact does the same thing when
+                you ask for it.
               </p>
             </div>
           </div>

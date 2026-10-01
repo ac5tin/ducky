@@ -367,7 +367,6 @@ const TAIL_BUDGET_RATIO: f64 = 0.25;
 /// waiting on survives; only a turn that is itself bigger than the budget is
 /// cut mid-turn. `None` = nothing worth compacting.
 pub fn cut_index(history: &[Msg], tail_budget: u64) -> Option<usize> {
-    let is_carrier = |m: &Msg| matches!(m, Msg::User { text, .. } if text.starts_with(COMPACT_MARKER));
     let newest = history.iter().rposition(
         |m| matches!(m, Msg::User { text, .. } if !text.starts_with(COMPACT_MARKER)),
     )?;
@@ -384,12 +383,18 @@ pub fn cut_index(history: &[Msg], tail_budget: u64) -> Option<usize> {
             break;
         }
     }
-    // the largest tail that fits, starting where the provider expects
+    // the largest tail that fits, starting where the provider expects: a user
+    // message (but not the summary carrier) or an assistant message, and
+    // nothing else — a system message or a tool result would be out of place
+    // at the front of a request
     let cut = history
         .iter()
         .enumerate()
         .skip(fit)
-        .find(|(_, m)| !is_carrier(m) && !matches!(m, Msg::ToolResult { .. }))
+        .find(|(_, m)| {
+            matches!(m, Msg::Assistant { .. })
+                || matches!(m, Msg::User { text, .. } if !text.starts_with(COMPACT_MARKER))
+        })
         .map_or(newest, |(i, _)| i);
     (cut > 0).then_some(cut)
 }
@@ -1213,6 +1218,21 @@ mod tests {
         assert_eq!(cut_index(&history, 0), Some(4));
         // everything fits: nothing to drop
         assert_eq!(cut_index(&history, 500), None);
+    }
+
+    #[test]
+    fn cut_never_lands_on_a_system_message() {
+        let history = vec![
+            user(&"a".repeat(4000)),
+            assistant(&"b".repeat(4000)),
+            Msg::System {
+                text: "reminder".into(),
+            },
+            user("last"),
+        ];
+        // the system message sits inside the fitting region but cannot start
+        // the tail, so the cut moves on to the newest user message
+        assert_eq!(cut_index(&history, 1_000), Some(3));
     }
 
     #[test]
