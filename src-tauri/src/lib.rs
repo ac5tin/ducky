@@ -11,6 +11,7 @@ pub mod config;
 pub mod events;
 pub mod mcp;
 pub mod oauth;
+pub mod plugins;
 pub mod providers;
 pub mod snapshot;
 pub mod state;
