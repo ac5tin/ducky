@@ -2431,7 +2431,11 @@ ProviderEvent::Usage {
 
     /// Compact before the next model call when the window is nearly full, so a
     /// long tool loop is bounded and not just a new user message.
-    async fn compact_if_full(&self, conversation_id: &str, history: &mut Vec<Msg>) -> CompactOutcome {
+    async fn compact_if_full(
+        &self,
+        conversation_id: &str,
+        history: &mut Vec<Msg>,
+    ) -> CompactOutcome {
         let (enabled, ratio) = self.compaction_settings();
         let limit = if enabled {
             self.conversation_context_limit(conversation_id).await
@@ -2451,8 +2455,11 @@ ProviderEvent::Usage {
                 });
                 // the kept tail alone can still be over the trigger on a huge
                 // turn; another pass would land at the same cut and do nothing
-                if compact::over_threshold(ratio, limit, self.context_used(conversation_id, history))
-                {
+                if compact::over_threshold(
+                    ratio,
+                    limit,
+                    self.context_used(conversation_id, history),
+                ) {
                     CompactOutcome::Done
                 } else {
                     CompactOutcome::Compacted

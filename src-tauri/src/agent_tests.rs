@@ -109,13 +109,7 @@ static CONTEXT_LIMITS: LazyLock<Mutex<HashMap<String, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub(crate) fn context_limit_override(conversation_id: &str) -> Option<Option<u64>> {
-    Some(
-        CONTEXT_LIMITS
-            .lock()
-            .unwrap()
-            .get(conversation_id)
-            .copied(),
-    )
+    Some(CONTEXT_LIMITS.lock().unwrap().get(conversation_id).copied())
 }
 
 /// Report `limit` as the context window of `conversation_id` until the guard
@@ -2614,5 +2608,8 @@ async fn the_loop_auto_compacts_before_the_model_call() {
         texts.iter().any(|t| t == "new ask"),
         "the request the user is waiting on must survive: {texts:?}"
     );
-    assert!(texts.iter().any(|t| t == "done"), "the turn must finish: {texts:?}");
+    assert!(
+        texts.iter().any(|t| t == "done"),
+        "the turn must finish: {texts:?}"
+    );
 }

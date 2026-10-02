@@ -367,9 +367,9 @@ const TAIL_BUDGET_RATIO: f64 = 0.25;
 /// waiting on survives; only a turn that is itself bigger than the budget is
 /// cut mid-turn. `None` = nothing worth compacting.
 pub fn cut_index(history: &[Msg], tail_budget: u64) -> Option<usize> {
-    let newest = history.iter().rposition(
-        |m| matches!(m, Msg::User { text, .. } if !text.starts_with(COMPACT_MARKER)),
-    )?;
+    let newest = history
+        .iter()
+        .rposition(|m| matches!(m, Msg::User { text, .. } if !text.starts_with(COMPACT_MARKER)))?;
     // earliest index whose whole tail fits the budget
     let chars: Vec<usize> = history.iter().map(msg_chars).collect();
     let mut running: usize = chars.iter().sum();
@@ -512,12 +512,7 @@ pub fn install(history: &mut Vec<Msg>, cut: usize, summary: &str) {
 
 /// Whether the loop should compact before the next model call. Pure, so every
 /// guard is testable without a provider or a catalog.
-pub fn auto_compact_due(
-    enabled: bool,
-    ratio: f64,
-    limit: Option<u64>,
-    used: Option<u64>,
-) -> bool {
+pub fn auto_compact_due(enabled: bool, ratio: f64, limit: Option<u64>, used: Option<u64>) -> bool {
     enabled && used.is_some_and(|used| over_threshold(ratio, limit, used))
 }
 
@@ -683,8 +678,8 @@ pub async fn run(
         None => None,
     };
     let budget = tail_budget(limit);
-    let window = window(&history, budget)
-        .ok_or("Nothing to compact yet — send another message first.")?;
+    let window =
+        window(&history, budget).ok_or("Nothing to compact yet — send another message first.")?;
     let summary = summarize_window(agent, conversation_id, &window, instructions).await?;
     let messages: Vec<serde_json::Value> = apply_with_tail(&history, &summary, budget)
         .iter()
@@ -884,10 +879,7 @@ mod tests {
     #[test]
     fn cut_is_none_without_a_second_user_turn() {
         assert_eq!(cut_index(&[user("only ask")], 0), None);
-        assert_eq!(
-            cut_index(&[user("only ask"), assistant("answer")], 0),
-            None
-        );
+        assert_eq!(cut_index(&[user("only ask"), assistant("answer")], 0), None);
         assert_eq!(
             cut_index(
                 &[
@@ -1152,21 +1144,9 @@ mod tests {
 
     #[test]
     fn auto_compact_fires_at_the_threshold() {
-        assert!(auto_compact_due(
-            true,
-            0.8,
-            Some(100_000),
-            Some(80_000)));
-        assert!(auto_compact_due(
-            true,
-            0.8,
-            Some(100_000),
-            Some(95_000)));
-        assert!(!auto_compact_due(
-            true,
-            0.8,
-            Some(100_000),
-            Some(79_999)));
+        assert!(auto_compact_due(true, 0.8, Some(100_000), Some(80_000)));
+        assert!(auto_compact_due(true, 0.8, Some(100_000), Some(95_000)));
+        assert!(!auto_compact_due(true, 0.8, Some(100_000), Some(79_999)));
     }
 
     #[test]
