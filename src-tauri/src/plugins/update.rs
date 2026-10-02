@@ -415,28 +415,46 @@ fn load_store(plugins_dir: &Path) -> Result<InstallStore, String> {
 
 /// Put a killed swap back before `apply` or `rollback` does anything else.
 ///
-/// A kill inside `rollback` leaves the new bytes in `package.rollback-tmp`.
-/// Restoring that directory leaves every `package.previous-*` in place.
-/// One previous directory is restored only when its suffix is not
-/// `previous_dir_suffix` of `record.previous_version`. More than one is
-/// left in place and named.
+/// 1. Missing `package/` and `package.rollback-tmp` → that dir is the new
+///    bytes. Rename it to `package/` and leave every other dir alone.
+/// 2. Any `package.held-*` → the parked rollback source. If `package/` is
+///    missing, the `package.previous-*` dir for `previous_version` holds the
+///    live tree: rename it back first. Then rename the single held dir to
+///    that same name. The suffix is `previous_dir_suffix` of
+///    `previous_version`. More than one held dir, or an existing
+///    destination, is named and left in place.
+/// 3. One `package.previous-*` whose suffix differs → mid-apply kill.
+///    Rename it to `package/`.
+/// 4. One matching suffix and no held dir → the recorded rollback source.
+///    Refuse.
+/// 5. More than one `package.previous-*` → rename nothing and name them.
 fn recover_missing_package(
     plugin_dir: &Path,
     live: &Path,
     record: &InstallRecord,
 ) -> Result<(), String> {
+    if !live.is_dir() {
+        let aside = live.with_file_name("package.rollback-tmp");
+        if aside.is_dir() {
+            return std::fs::rename(&aside, live).map_err(|err| {
+                format!(
+                    "cannot restore {} to {}: {err}",
+                    aside.display(),
+                    live.display()
+                )
+            });
+        }
+    }
+    let held = match list_held(plugin_dir) {
+        Ok(held) => held,
+        Err(_) if !plugin_dir.exists() => Vec::new(),
+        Err(err) => return Err(err),
+    };
+    if !held.is_empty() {
+        return restore_held_rollback_source(plugin_dir, live, record, &held);
+    }
     if live.is_dir() {
         return Ok(());
-    }
-    let aside = live.with_file_name("package.rollback-tmp");
-    if aside.is_dir() {
-        return std::fs::rename(&aside, live).map_err(|err| {
-            format!(
-                "cannot restore {} to {}: {err}",
-                aside.display(),
-                live.display()
-            )
-        });
     }
     let previous = match list_previous(plugin_dir) {
         Ok(previous) => previous,
@@ -473,8 +491,8 @@ fn restore_unless_rollback_source(
         .and_then(|name| name.strip_prefix("package.previous-"));
     // None is not a recorded rollback source. A kill before the record
     // write still restores. Compare suffixes, not the raw version.
-    // ponytail: unsafe versions share the suffix `unknown`, so a later kill
-    // during another unsafe update is refused rather than restored.
+    // ponytail: a matching suffix refuses only when no `package.held-*`
+    // exists. That check runs first. Unsafe versions still share `unknown`.
     if let (Some(dir_suffix), Some(recorded)) = (dir_suffix, record.previous_version.as_deref()) {
         if dir_suffix == previous_dir_suffix(recorded) {
             return Err(format!(
@@ -494,19 +512,80 @@ fn restore_unless_rollback_source(
 }
 
 fn list_previous(plugin_dir: &Path) -> Result<Vec<PathBuf>, String> {
+    list_prefixed(plugin_dir, "package.previous-")
+}
+
+fn list_held(plugin_dir: &Path) -> Result<Vec<PathBuf>, String> {
+    list_prefixed(plugin_dir, "package.held-")
+}
+
+fn list_prefixed(plugin_dir: &Path, prefix: &str) -> Result<Vec<PathBuf>, String> {
     let entries = std::fs::read_dir(plugin_dir)
         .map_err(|err| format!("cannot read {}: {err}", plugin_dir.display()))?;
     let mut found = Vec::new();
     for entry in entries {
-        let entry =
-            entry.map_err(|err| format!("cannot read {}: {err}", plugin_dir.display()))?;
+        let entry = entry.map_err(|err| format!("cannot read {}: {err}", plugin_dir.display()))?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with("package.previous-") && entry.path().is_dir() {
+        if name.starts_with(prefix) && entry.path().is_dir() {
             found.push(entry.path());
         }
     }
     Ok(found)
+}
+
+/// `held` is the dir `hold_existing` parked. Put it back at the
+/// `package.previous-*` dir for `previous_version`. Never delete that dir.
+fn restore_held_rollback_source(
+    plugin_dir: &Path,
+    live: &Path,
+    record: &InstallRecord,
+    held: &[PathBuf],
+) -> Result<(), String> {
+    if held.len() != 1 {
+        let names = held
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "package {} has more than one held revision: {names}",
+            live.display()
+        ));
+    }
+    let held = &held[0];
+    let suffix = previous_dir_suffix(record.previous_version.as_deref().unwrap_or("unknown"));
+    let previous = plugin_dir.join(format!("package.previous-{suffix}"));
+    if !live.is_dir() {
+        if !previous.is_dir() {
+            return Err(format!(
+                "package {} is missing; cannot restore the live tree from {}",
+                live.display(),
+                previous.display()
+            ));
+        }
+        std::fs::rename(&previous, live).map_err(|err| {
+            format!(
+                "cannot restore {} to {}: {err}",
+                previous.display(),
+                live.display()
+            )
+        })?;
+    }
+    if previous.exists() {
+        return Err(format!(
+            "will not overwrite {}; {} left in place",
+            previous.display(),
+            held.display()
+        ));
+    }
+    std::fs::rename(held, &previous).map_err(|err| {
+        format!(
+            "cannot restore {} to {}: {err}",
+            held.display(),
+            previous.display()
+        )
+    })
 }
 
 /// `live` → `previous`, then `staged` → `live`. An existing previous dir is
