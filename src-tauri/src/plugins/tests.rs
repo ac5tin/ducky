@@ -2015,14 +2015,7 @@ fn fetch_to_staging_records_git_sha() {
     let mut sha = None;
     let mut sha256 = None;
 
-    fetch_to_staging(
-        &git_source(&repo),
-        &target,
-        &mut sha,
-        &mut sha256,
-        &FakeHttp::new(Vec::new()),
-    )
-    .unwrap();
+    fetch_to_staging(&git_source(&repo), &target, &mut sha, &mut sha256).unwrap();
 
     assert_eq!(sha.as_deref(), Some(head.as_str()));
     assert_eq!(sha256, None);
@@ -2053,18 +2046,16 @@ fn fetch_to_staging_takes_git_subdir() {
     let mut sha = None;
     let mut sha256 = None;
 
-    fetch_to_staging(
-        &source,
-        &target,
-        &mut sha,
-        &mut sha256,
-        &FakeHttp::new(Vec::new()),
-    )
-    .unwrap();
+    fetch_to_staging(&source, &target, &mut sha, &mut sha256).unwrap();
 
     assert!(target.join("plugin.json").is_file());
     assert!(!target.join("packages").exists());
     assert!(sha.is_some());
+    assert!(!target.join(".git").exists(), "subdir package kept .git");
+    assert!(
+        !target.with_file_name(".git-clone").exists(),
+        "git clone was left beside the package"
+    );
 }
 
 #[test]
@@ -2194,4 +2185,273 @@ fn concurrent_record_writes_never_corrupt() {
         assert!(matches!(&record.source, PluginSource::Git { .. }));
         assert_eq!(record.version.as_deref(), Some("1.0.0"));
     }
+}
+
+/// A Claude Code package. `name` is not an Agent Plugins name.
+fn claude_package(root: &Path, name: &str) {
+    write(
+        root,
+        ".claude-plugin/plugin.json",
+        &format!(r#"{{"name": "{name}"}}"#),
+    );
+}
+
+/// Install `keeper`, then a Claude package whose name slugs to an unsafe id.
+fn unsafe_claude_name_does_not_wipe_plugins(name: &str) {
+    let tmp = tempfile::tempdir().unwrap();
+    let keeper_src = tmp.path().join("keeper-src");
+    plugin_package(&keeper_src, "keeper");
+    let plugins = tmp.path().join("plugins");
+    let mut store = InstallStore::load(&plugins);
+    install(&mut store, &plugins, &path_source(&keeper_src), None, None).unwrap();
+    let snapshot = std::fs::read(plugins.join("installed.json")).unwrap();
+    let source = tmp.path().join("bad-src");
+    claude_package(&source, name);
+
+    match install(&mut store, &plugins, &path_source(&source), None, None) {
+        Ok(record) => {
+            assert!(!record.id.is_empty(), "empty plugin id for name {name}");
+            assert_ne!(record.id, ".");
+            assert_ne!(record.id, "..");
+            assert!(
+                !record.id.contains('/') && !record.id.contains('\\'),
+                "{}",
+                record.id
+            );
+            uninstall(
+                &mut store,
+                &plugins,
+                &tmp.path().join("data"),
+                &record.id,
+                false,
+            )
+            .unwrap();
+        }
+        Err(err) => {
+            assert!(err.contains(name), "{err}");
+            assert!(err.contains("plugin id"), "{err}");
+            assert_eq!(
+                std::fs::read(plugins.join("installed.json")).unwrap(),
+                snapshot,
+                "rejected install rewrote installed.json"
+            );
+        }
+    }
+    assert!(
+        plugins.join("keeper/package/plugin.json").is_file(),
+        "sibling plugin was deleted"
+    );
+    assert!(
+        plugins.join("installed.json").is_file(),
+        "installed.json was deleted"
+    );
+    let text = std::fs::read_to_string(plugins.join("installed.json")).unwrap();
+    assert!(
+        text.contains("keeper"),
+        "installed.json lost the other plugin: {text}"
+    );
+}
+
+#[test]
+fn dashed_claude_name_does_not_wipe_plugins() {
+    unsafe_claude_name_does_not_wipe_plugins("---");
+}
+
+#[test]
+fn dotdot_claude_name_does_not_wipe_plugins() {
+    unsafe_claude_name_does_not_wipe_plugins("..");
+}
+
+/// A hand-edited id must not be joined onto `plugins/` and deleted.
+fn uninstall_of_unsafe_id_keeps_siblings(id: &str) {
+    let tmp = tempfile::tempdir().unwrap();
+    let keeper_src = tmp.path().join("keeper-src");
+    plugin_package(&keeper_src, "keeper");
+    let plugins = tmp.path().join("plugins");
+    let mut store = InstallStore::load(&plugins);
+    install(&mut store, &plugins, &path_source(&keeper_src), None, None).unwrap();
+    store
+        .records
+        .push(install_record(id, "bad", path_source(&keeper_src)));
+    store.save(&plugins).unwrap();
+    let marker = tmp.path().join("outside-marker");
+    std::fs::write(&marker, "keep").unwrap();
+
+    let result = uninstall(&mut store, &plugins, &tmp.path().join("data"), id, false);
+    assert!(
+        marker.is_file(),
+        "uninstall of `{id}` deleted the parent of plugins/"
+    );
+    assert!(
+        plugins.join("keeper/package/plugin.json").is_file(),
+        "sibling plugin was deleted"
+    );
+    assert!(
+        plugins.join("installed.json").is_file(),
+        "installed.json was deleted"
+    );
+    let text = std::fs::read_to_string(plugins.join("installed.json")).unwrap();
+    assert!(text.contains("keeper"), "{text}");
+    assert!(
+        store.records.iter().any(|record| record.id == id),
+        "unsafe id was removed from the store"
+    );
+    let err = result.expect_err("unsafe id must be refused");
+    assert!(!err.is_empty(), "{err}");
+}
+
+#[test]
+fn uninstall_of_dotdot_id_keeps_other_plugins() {
+    uninstall_of_unsafe_id_keeps_siblings("..");
+}
+
+#[test]
+fn uninstall_of_empty_id_keeps_other_plugins() {
+    uninstall_of_unsafe_id_keeps_siblings("");
+}
+
+#[test]
+fn uninstall_keeps_record_when_package_delete_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    plugin_package(&source, "demo-plugin");
+    let plugins = tmp.path().join("plugins");
+    let mut store = InstallStore::load(&plugins);
+    let record = install(&mut store, &plugins, &path_source(&source), None, None).unwrap();
+    let dir = plugins.join(&record.id);
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::write(&dir, "not a directory").unwrap();
+    let before = std::fs::read(plugins.join("installed.json")).unwrap();
+
+    let err = uninstall(
+        &mut store,
+        &plugins,
+        &tmp.path().join("data"),
+        &record.id,
+        false,
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("cannot remove") || err.contains(&record.id),
+        "{err}"
+    );
+    assert!(
+        store.records.iter().any(|item| item.id == record.id),
+        "record was dropped before the directory delete failed"
+    );
+    assert_eq!(
+        std::fs::read(plugins.join("installed.json")).unwrap(),
+        before,
+        "installed.json lost the record"
+    );
+}
+
+#[test]
+fn save_refuses_corrupt_install_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plugins = tmp.path().join("plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    let truncated = b"{ not json";
+    std::fs::write(plugins.join("installed.json"), truncated).unwrap();
+
+    let store = InstallStore::load(&plugins);
+    let err = store.save(&plugins).unwrap_err();
+    assert!(err.to_string().contains("installed.json"), "{err}");
+    assert_eq!(
+        std::fs::read(plugins.join("installed.json")).unwrap(),
+        truncated
+    );
+}
+
+#[test]
+fn install_refuses_corrupt_store_without_staging() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plugins = tmp.path().join("plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    let truncated = b"{ not json";
+    std::fs::write(plugins.join("installed.json"), truncated).unwrap();
+    let source = tmp.path().join("source");
+    plugin_package(&source, "demo-plugin");
+    assert!(!plugins.join(".staging").exists());
+
+    let mut store = InstallStore::load(&plugins);
+    let err = install(&mut store, &plugins, &path_source(&source), None, None).unwrap_err();
+    assert!(err.contains("corrupt"), "{err}");
+    assert!(err.contains("installed.json"), "{err}");
+    assert_eq!(
+        std::fs::read(plugins.join("installed.json")).unwrap(),
+        truncated
+    );
+    assert!(
+        !plugins.join(".staging").exists(),
+        "install fetched before rejecting the corrupt store"
+    );
+}
+
+#[test]
+fn fetch_to_staging_missing_subdir_removes_clone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    git_init(&repo);
+    write(&repo, "README.md", "no package");
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-m", "empty"]);
+    let target = tmp.path().join("staging/package");
+    let source = PluginSource::GitSubdir {
+        url: file_url(&repo),
+        path: "missing/plug".to_string(),
+        git_ref: None,
+        sha: None,
+    };
+    let mut sha = None;
+    let mut sha256 = None;
+
+    let err = fetch_to_staging(&source, &target, &mut sha, &mut sha256).unwrap_err();
+    assert!(err.contains("missing"), "{err}");
+    assert!(
+        !target.with_file_name(".git-clone").exists(),
+        "git clone was left beside the package"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn install_rejects_escaping_symlink() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tmp.path().join("outside-secret.txt");
+    std::fs::write(&outside, "secret-bytes").unwrap();
+    let source = tmp.path().join("source");
+    plugin_package(&source, "leaky");
+    symlink(&outside, &source.join("leak"));
+    let plugins = tmp.path().join("plugins");
+    let mut store = InstallStore::load(&plugins);
+
+    let err = install(&mut store, &plugins, &path_source(&source), None, None).unwrap_err();
+    assert!(err.contains("outside") || err.contains("link"), "{err}");
+    assert!(
+        !plugins.join("leaky/package/leak").exists(),
+        "escaping link was installed"
+    );
+    assert!(store.records.is_empty());
+}
+
+#[test]
+#[cfg(unix)]
+fn install_keeps_in_root_symlink() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    plugin_package(&source, "linked");
+    symlink(Path::new("plugin.json"), &source.join("alias.json"));
+    let plugins = tmp.path().join("plugins");
+    let mut store = InstallStore::load(&plugins);
+
+    let record = install(&mut store, &plugins, &path_source(&source), None, None).unwrap();
+    let link = plugins.join(&record.id).join("package/alias.json");
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "in-root link was copied as a file"
+    );
 }

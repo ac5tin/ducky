@@ -15,8 +15,7 @@ use super::diagnostics::{DiagLevel, Diagnostic};
 use super::layout::{discover, Discovered};
 use super::manifest::{self, Layout};
 use super::marketplace::{
-    clone_repo, git_in, git_target, join_diagnostics, parse_git_remote, Entry, HttpClient,
-    HttpResponse, PluginSource,
+    clone_repo, git_in, git_target, join_diagnostics, parse_git_remote, Entry, PluginSource,
 };
 use super::path::resolve_within;
 
@@ -114,6 +113,9 @@ pub struct InstallStore {
     /// Load problems, kept beside the records and never persisted.
     #[serde(skip)]
     pub diagnostics: Vec<Diagnostic>,
+    /// Set when `installed.json` could not be read. `save` must not replace it.
+    #[serde(skip)]
+    pub poisoned: bool,
 }
 
 fn store_version() -> u32 {
@@ -127,6 +129,7 @@ impl Default for InstallStore {
             records: Vec::new(),
             extra: BTreeMap::new(),
             diagnostics: Vec::new(),
+            poisoned: false,
         }
     }
 }
@@ -156,11 +159,18 @@ impl InstallStore {
             target: "installed.json".to_string(),
             message,
         });
+        store.poisoned = true;
         store
     }
 
     /// Write `dir/installed.json` through a unique temp file plus rename.
     pub fn save(&self, dir: &Path) -> io::Result<()> {
+        if self.poisoned {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "corrupt install store: refusing to overwrite installed.json",
+            ));
+        }
         std::fs::create_dir_all(dir)?;
         let file = dir.join("installed.json");
         let tmp = temp_sibling(&file);
@@ -306,37 +316,17 @@ fn staging_root(plugins_dir: &Path) -> PathBuf {
     ))
 }
 
-/// `install` never fetches over HTTP: every supported source kind is git or
-/// the filesystem. This client keeps the shared staging signature (R1) — it
-/// must not build a TLS stack, which panics outside the Tauri runtime — and
-/// fails loudly if an HTTP-backed source kind ever reaches it.
-struct NoHttp;
-
-#[async_trait::async_trait]
-impl HttpClient for NoHttp {
-    async fn get_conditional(
-        &self,
-        url: &str,
-        _etag: Option<&str>,
-        _last_modified: Option<&str>,
-    ) -> Result<HttpResponse, String> {
-        Err(format!("no HTTP client during install: {url}"))
-    }
-}
-
 /// Fetch one plugin source into `target`, a package path inside a unique
 /// staging directory. Install and update share this code path (R1).
 ///
 /// `resolved_sha` is set for git-backed sources (the checked-out commit).
 /// `resolved_sha256` is reserved for non-git revisions; no source kind
-/// produces one today (the archive flow is out of scope), and the parameter
-/// is part of the shared signature for Task 6.
+/// produces one today (the archive flow is out of scope).
 pub(crate) fn fetch_to_staging(
     source: &PluginSource,
     target: &Path,
     resolved_sha: &mut Option<String>,
     resolved_sha256: &mut Option<String>,
-    _http: &dyn HttpClient,
 ) -> Result<(), String> {
     *resolved_sha = None;
     *resolved_sha256 = None;
@@ -377,19 +367,30 @@ fn fetch_git(
         }
         Some(sub) => {
             let clone = target.with_file_name(".git-clone");
-            clone_repo(&url, git_ref.as_deref(), &clone)?;
-            if let Some(sha) = sha {
-                checkout_sha(&clone, sha)?;
+            let installed = (|| -> Result<(), String> {
+                clone_repo(&url, git_ref.as_deref(), &clone)?;
+                if let Some(sha) = sha {
+                    checkout_sha(&clone, sha)?;
+                }
+                let wanted = clone.join(&sub);
+                if !wanted.exists() {
+                    return Err(format!("plugin path {sub} is missing in this revision"));
+                }
+                let package = resolve_within(&clone, &wanted)
+                    .ok_or_else(|| format!("plugin path {sub} resolves outside the repository"))?;
+                *resolved_sha = Some(git_in(&clone, &["rev-parse", "HEAD"])?);
+                std::fs::rename(&package, target).map_err(|err| {
+                    format!("cannot move {} into place: {err}", package.display())
+                })?;
+                remove_git_dir(target)
+            })();
+            let removed = std::fs::remove_dir_all(&clone);
+            match installed {
+                Err(err) => Err(err),
+                Ok(()) => {
+                    removed.map_err(|err| format!("cannot remove {}: {err}", clone.display()))
+                }
             }
-            let wanted = clone.join(&sub);
-            if !wanted.exists() {
-                return Err(format!("plugin path {sub} is missing in this revision"));
-            }
-            let package = resolve_within(&clone, &wanted)
-                .ok_or_else(|| format!("plugin path {sub} resolves outside the repository"))?;
-            *resolved_sha = Some(git_in(&clone, &["rev-parse", "HEAD"])?);
-            std::fs::rename(&package, target)
-                .map_err(|err| format!("cannot move {} into place: {err}", package.display()))
         }
     }
 }
@@ -423,19 +424,19 @@ fn remove_git_dir(package: &Path) -> Result<(), String> {
 }
 
 /// Copy a local path into staging. The top-level path is canonicalized, so
-/// installing through a symlink copies the real package; nested symlinks are
-/// kept as links and containment is enforced later, per design §13.
+/// installing through a symlink copies the real package. An in-root link is
+/// kept; a link that resolves outside the package is rejected.
 fn copy_package(source: &Path, target: &Path) -> Result<(), String> {
     let source = std::fs::canonicalize(source)
         .map_err(|err| format!("cannot read source path {}: {err}", source.display()))?;
-    copy_tree(&source, target)
+    copy_tree(&source, target, &source)
 }
 
-fn copy_tree(source: &Path, target: &Path) -> Result<(), String> {
+fn copy_tree(source: &Path, target: &Path, root: &Path) -> Result<(), String> {
     let meta = std::fs::symlink_metadata(source)
         .map_err(|err| format!("cannot read {}: {err}", source.display()))?;
     if meta.file_type().is_symlink() {
-        return copy_link(source, target);
+        return copy_link(source, target, root);
     }
     if meta.is_dir() {
         std::fs::create_dir_all(target)
@@ -444,7 +445,7 @@ fn copy_tree(source: &Path, target: &Path) -> Result<(), String> {
             .map_err(|err| format!("cannot read {}: {err}", source.display()))?;
         for entry in entries {
             let entry = entry.map_err(|err| format!("cannot read {}: {err}", source.display()))?;
-            copy_tree(&entry.path(), &target.join(entry.file_name()))?;
+            copy_tree(&entry.path(), &target.join(entry.file_name()), root)?;
         }
         return Ok(());
     }
@@ -457,8 +458,23 @@ fn copy_tree(source: &Path, target: &Path) -> Result<(), String> {
         .map_err(|err| format!("cannot copy {}: {err}", source.display()))
 }
 
+/// Deny a link whose canonical target is outside `root`. A missing target
+/// stays on the platform path: Unix recreates the link, Windows fails later.
+fn reject_escaping_link(source: &Path, root: &Path) -> Result<(), String> {
+    match std::fs::canonicalize(source) {
+        Ok(canonical) if canonical.starts_with(root) => Ok(()),
+        Ok(_) => Err(format!(
+            "link {} points outside the package",
+            source.display()
+        )),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!("cannot read link {}: {err}", source.display())),
+    }
+}
+
 #[cfg(unix)]
-fn copy_link(source: &Path, target: &Path) -> Result<(), String> {
+fn copy_link(source: &Path, target: &Path, root: &Path) -> Result<(), String> {
+    reject_escaping_link(source, root)?;
     let link = std::fs::read_link(source)
         .map_err(|err| format!("cannot read link {}: {err}", source.display()))?;
     if let Some(parent) = target.parent() {
@@ -470,15 +486,39 @@ fn copy_link(source: &Path, target: &Path) -> Result<(), String> {
 }
 
 #[cfg(not(unix))]
-fn copy_link(source: &Path, target: &Path) -> Result<(), String> {
+fn copy_link(source: &Path, target: &Path, root: &Path) -> Result<(), String> {
     // Windows symlinks need a privilege; follow the link instead.
+    reject_escaping_link(source, root)?;
     let resolved = std::fs::canonicalize(source)
         .map_err(|err| format!("cannot read link {}: {err}", source.display()))?;
-    copy_tree(&resolved, target)
+    copy_tree(&resolved, target, root)
 }
 
 // ---------------------------------------------------------------------------
 // Install and uninstall (design §6)
+
+/// `plugins/<id>` as a direct child. Empty, `.`, `..`, and separators are
+/// rejected before any join. `remove_dir_all` must never see `plugins_dir`.
+fn package_dir(plugins_dir: &Path, id: &str) -> Result<PathBuf, String> {
+    if id.is_empty() || id == "." || id == ".." || id.contains('/') || id.contains('\\') {
+        return Err(format!("plugin id `{id}` is not a safe directory name"));
+    }
+    let root = std::fs::canonicalize(plugins_dir)
+        .map_err(|err| format!("cannot read plugins directory: {err}"))?;
+    let child = root.join(id);
+    let parent = child.parent().ok_or_else(|| {
+        format!("plugin id `{id}` is not a direct child of the plugins directory")
+    })?;
+    let parent = std::fs::canonicalize(parent).map_err(|err| {
+        format!("plugin id `{id}` is not a direct child of the plugins directory: {err}")
+    })?;
+    if parent != root {
+        return Err(format!(
+            "plugin id `{id}` is not a direct child of the plugins directory"
+        ));
+    }
+    Ok(child)
+}
 
 /// Install one plugin source.
 ///
@@ -491,6 +531,15 @@ pub fn install(
     entry: Option<&Entry>,
     marketplace: Option<&str>,
 ) -> Result<InstallRecord, String> {
+    if store.poisoned {
+        let detail = store
+            .diagnostics
+            .iter()
+            .map(|diag| diag.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!("corrupt install store: {detail}"));
+    }
     if let Some(existing) = store.records.iter().find(|record| &record.source == source) {
         return Err(format!("{} is already installed", existing.id));
     }
@@ -503,13 +552,7 @@ pub fn install(
 
     let mut resolved_sha = None;
     let mut resolved_sha256 = None;
-    fetch_to_staging(
-        source,
-        &package,
-        &mut resolved_sha,
-        &mut resolved_sha256,
-        &NoHttp,
-    )?;
+    fetch_to_staging(source, &package, &mut resolved_sha, &mut resolved_sha256)?;
 
     let manifest = manifest::load(&package).map_err(join_diagnostics)?;
     let discovered = discover(&package, &manifest);
@@ -534,7 +577,10 @@ pub fn install(
         resolved_sha256.as_deref(),
     );
 
-    let destination = plugins_dir.join(&id);
+    std::fs::create_dir_all(plugins_dir)
+        .map_err(|err| format!("cannot create {}: {err}", plugins_dir.display()))?;
+    let destination = package_dir(plugins_dir, &id)
+        .map_err(|err| format!("cannot install `{}`: {err}", manifest.name))?;
     let destination_created = !destination.exists();
     std::fs::create_dir_all(&destination)
         .map_err(|err| format!("cannot create {}: {err}", destination.display()))?;
@@ -596,15 +642,9 @@ pub fn uninstall(
     let Some(index) = store.records.iter().position(|record| record.id == id) else {
         return Err(format!("plugin `{id}` is not installed"));
     };
-    let server_ids = owned_server_ids(&plugins_dir.join(id).join("package"), id);
+    let directory = package_dir(plugins_dir, id)?;
+    let server_ids = owned_server_ids(&directory.join("package"), id);
 
-    let record = store.records.remove(index);
-    if let Err(err) = store.save(plugins_dir) {
-        store.records.insert(index, record);
-        return Err(format!("cannot write the install record: {err}"));
-    }
-
-    let directory = plugins_dir.join(id);
     if directory.exists() {
         std::fs::remove_dir_all(&directory)
             .map_err(|err| format!("cannot remove {}: {err}", directory.display()))?;
@@ -612,6 +652,12 @@ pub fn uninstall(
     if delete_data && data_dir.exists() {
         std::fs::remove_dir_all(data_dir)
             .map_err(|err| format!("cannot remove {}: {err}", data_dir.display()))?;
+    }
+
+    let record = store.records.remove(index);
+    if let Err(err) = store.save(plugins_dir) {
+        store.records.insert(index, record);
+        return Err(format!("cannot write the install record: {err}"));
     }
     Ok(server_ids)
 }
