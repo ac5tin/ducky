@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -497,27 +497,44 @@ fn copy_link(source: &Path, target: &Path, root: &Path) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 // Install and uninstall (design §6)
 
-/// `plugins/<id>` as a direct child. Empty, `.`, `..`, and separators are
-/// rejected before any join. `remove_dir_all` must never see `plugins_dir`.
-fn package_dir(plugins_dir: &Path, id: &str) -> Result<PathBuf, String> {
-    if id.is_empty() || id == "." || id == ".." || id.contains('/') || id.contains('\\') {
+/// `plugins/<id>` as a direct child. Rejected before any join. The returned
+/// path is that join, never a canonical reconstruction. `remove_dir_all` must
+/// never see `plugins_dir`.
+pub(crate) fn package_dir(plugins_dir: &Path, id: &str) -> Result<PathBuf, String> {
+    if !safe_id(id) {
         return Err(format!("plugin id `{id}` is not a safe directory name"));
     }
-    let root = std::fs::canonicalize(plugins_dir)
-        .map_err(|err| format!("cannot read plugins directory: {err}"))?;
-    let child = root.join(id);
-    let parent = child.parent().ok_or_else(|| {
-        format!("plugin id `{id}` is not a direct child of the plugins directory")
-    })?;
-    let parent = std::fs::canonicalize(parent).map_err(|err| {
-        format!("plugin id `{id}` is not a direct child of the plugins directory: {err}")
-    })?;
-    if parent != root {
+    let child = plugins_dir.join(id);
+    if child == plugins_dir || child.parent() != Some(plugins_dir) {
         return Err(format!(
             "plugin id `{id}` is not a direct child of the plugins directory"
         ));
     }
     Ok(child)
+}
+
+/// One ordinary directory name, on every platform.
+///
+/// A Windows disk prefix (`C:foo`) is one `Normal` component on Linux, so the
+/// prefix is rejected here too. Trailing spaces and dots are the Win32 shrink
+/// class; `"..."` is rejected for that reason, not as `..`.
+fn safe_id(id: &str) -> bool {
+    if id.is_empty() || id.contains('/') || id.contains('\\') {
+        return false;
+    }
+    let trimmed = id.trim_end_matches([' ', '.']);
+    if trimmed != id || trimmed.is_empty() {
+        return false;
+    }
+    let bytes = id.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return false;
+    }
+    let mut components = Path::new(id).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(os)), None) => os == id,
+        _ => false,
+    }
 }
 
 /// Install one plugin source.
@@ -542,6 +559,20 @@ pub fn install(
     }
     if let Some(existing) = store.records.iter().find(|record| &record.source == source) {
         return Err(format!("{} is already installed", existing.id));
+    }
+    if let PluginSource::Path { path } = source {
+        let path = Path::new(path);
+        if let Ok(manifest) = manifest::load(path) {
+            let id = assign_id(
+                &manifest.name,
+                manifest.layout,
+                &store.records,
+                &path_fingerprint(path),
+            );
+            if let Err(err) = package_dir(plugins_dir, &id) {
+                return Err(format!("cannot install `{}`: {err}", manifest.name));
+            }
+        }
     }
 
     let staging = staging_root(plugins_dir);
@@ -630,8 +661,8 @@ pub fn install(
 ///
 /// Returns the `plugin:<id>:<server>` ids the package declared, so the caller
 /// can disconnect them; the MCP manager is not touched here. The package and
-/// its record go; `data_dir` (the plugin's own data directory) stays unless
-/// `delete_data` is set.
+/// its record go. `data_dir/<id>` stays unless `delete_data` is set. The
+/// caller passes the parent data directory, not `plugin-data/<id>`.
 pub fn uninstall(
     store: &mut InstallStore,
     plugins_dir: &Path,
@@ -649,9 +680,12 @@ pub fn uninstall(
         std::fs::remove_dir_all(&directory)
             .map_err(|err| format!("cannot remove {}: {err}", directory.display()))?;
     }
-    if delete_data && data_dir.exists() {
-        std::fs::remove_dir_all(data_dir)
-            .map_err(|err| format!("cannot remove {}: {err}", data_dir.display()))?;
+    if delete_data {
+        let data_child = package_dir(data_dir, id)?;
+        if data_child.exists() {
+            std::fs::remove_dir_all(&data_child)
+                .map_err(|err| format!("cannot remove {}: {err}", data_child.display()))?;
+        }
     }
 
     let record = store.records.remove(index);

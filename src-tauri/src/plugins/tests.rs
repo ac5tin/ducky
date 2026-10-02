@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 
 use super::diagnostics::DiagLevel;
 use super::install::{
-    assign_id, derive_policy, fetch_to_staging, install, resolve_version, uninstall, InstallRecord,
-    InstallStore, PluginStatus, UpdatePolicy,
+    assign_id, derive_policy, fetch_to_staging, install, package_dir, resolve_version, uninstall,
+    InstallRecord, InstallStore, PluginStatus, UpdatePolicy,
 };
 use super::layout::{discover, PluginTransport, RemoteKind};
 use super::manifest::{load, Layout};
@@ -1906,15 +1906,17 @@ fn uninstall_deletes_data_on_request() {
     let source = tmp.path().join("source");
     plugin_package(&source, "demo-plugin");
     let plugins = tmp.path().join("plugins");
-    let data = tmp.path().join("plugin-data/demo-plugin");
+    let data_root = tmp.path().join("plugin-data");
+    let data = data_root.join("demo-plugin");
 
     let mut store = InstallStore::load(&plugins);
     let record = install(&mut store, &plugins, &path_source(&source), None, None).unwrap();
     write(&data, "state.json", "{}");
 
-    uninstall(&mut store, &plugins, &data, &record.id, true).unwrap();
+    uninstall(&mut store, &plugins, &data_root, &record.id, true).unwrap();
 
     assert!(!data.exists(), "plugin data survived a requested delete");
+    assert!(data_root.is_dir(), "parent data directory was deleted");
     assert!(!plugins.join(&record.id).exists());
 }
 
@@ -2308,6 +2310,136 @@ fn uninstall_of_dotdot_id_keeps_other_plugins() {
 #[test]
 fn uninstall_of_empty_id_keeps_other_plugins() {
     uninstall_of_unsafe_id_keeps_siblings("");
+}
+
+const UNSAFE_IDS: [&str; 13] = [
+    "", ".", "..", " ", ". ", ".. ", "...", "foo.", "foo ", "a/b", "a\\b", "C:foo", "C:..",
+];
+
+#[test]
+fn package_dir_rejects_unsafe_ids() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plugins = tmp.path().join("plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    for id in UNSAFE_IDS {
+        let err = package_dir(&plugins, id).expect_err(id);
+        assert!(!err.is_empty(), "{id}: {err}");
+    }
+}
+
+#[test]
+fn package_dir_accepts_ordinary_slug() {
+    let tmp = tempfile::tempdir().unwrap();
+    let plugins = tmp.path().join("plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    assert_eq!(package_dir(&plugins, "acme").unwrap(), plugins.join("acme"));
+    assert_eq!(
+        package_dir(&plugins, "acme-tools-1.2").unwrap(),
+        plugins.join("acme-tools-1.2")
+    );
+}
+
+fn keeper_bytes(plugins: &Path) -> (Vec<u8>, Vec<u8>) {
+    (
+        std::fs::read(plugins.join("installed.json")).unwrap(),
+        std::fs::read(plugins.join("keeper/package/plugin.json")).unwrap(),
+    )
+}
+
+fn uninstall_of_hand_edited_id_keeps_bytes(id: &str) {
+    let tmp = tempfile::tempdir().unwrap();
+    let keeper_src = tmp.path().join("keeper-src");
+    plugin_package(&keeper_src, "keeper");
+    let plugins = tmp.path().join("plugins");
+    let mut store = InstallStore::load(&plugins);
+    install(&mut store, &plugins, &path_source(&keeper_src), None, None).unwrap();
+    store
+        .records
+        .push(install_record(id, "bad", path_source(&keeper_src)));
+    store.save(&plugins).unwrap();
+    let before = keeper_bytes(&plugins);
+
+    let err = uninstall(&mut store, &plugins, &tmp.path().join("data"), id, false).expect_err(id);
+    assert!(!err.is_empty(), "{id}: {err}");
+    assert_eq!(
+        keeper_bytes(&plugins),
+        before,
+        "id `{id}` changed the store"
+    );
+    assert!(
+        store.records.iter().any(|record| record.id == id),
+        "unsafe id `{id}` was removed from the store"
+    );
+}
+
+#[test]
+fn uninstall_of_unsafe_ids_leaves_store_byte_identical() {
+    for id in UNSAFE_IDS {
+        uninstall_of_hand_edited_id_keeps_bytes(id);
+    }
+}
+
+#[test]
+fn install_of_empty_slug_names_manifest_and_skips_staging() {
+    let tmp = tempfile::tempdir().unwrap();
+    let keeper_src = tmp.path().join("keeper-src");
+    plugin_package(&keeper_src, "keeper");
+    let plugins = tmp.path().join("plugins");
+    let mut store = InstallStore::load(&plugins);
+    install(&mut store, &plugins, &path_source(&keeper_src), None, None).unwrap();
+    let staging = plugins.join(".staging");
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging).unwrap();
+    }
+    let before = keeper_bytes(&plugins);
+    let source = tmp.path().join("bad-src");
+    claude_package(&source, "---");
+
+    let err = install(&mut store, &plugins, &path_source(&source), None, None).unwrap_err();
+    assert!(err.contains("---"), "{err}");
+    assert!(err.contains("plugin id"), "{err}");
+    assert_eq!(store.records.len(), 1, "rejected install wrote a record");
+    assert_eq!(keeper_bytes(&plugins), before);
+    assert!(
+        !staging.exists(),
+        "rejected install created plugins/.staging"
+    );
+}
+
+#[test]
+fn uninstall_delete_data_unsafe_id_stays_inside_data_dir() {
+    for id in UNSAFE_IDS {
+        let tmp = tempfile::tempdir().unwrap();
+        let keeper_src = tmp.path().join("keeper-src");
+        plugin_package(&keeper_src, "keeper");
+        let plugins = tmp.path().join("plugins");
+        let mut store = InstallStore::load(&plugins);
+        install(&mut store, &plugins, &path_source(&keeper_src), None, None).unwrap();
+        store
+            .records
+            .push(install_record(id, "bad", path_source(&keeper_src)));
+        store.save(&plugins).unwrap();
+        let before = keeper_bytes(&plugins);
+        let outside = tmp.path().join("outside-marker");
+        std::fs::write(&outside, "keep").unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let inside = data.join("sibling.txt");
+        std::fs::write(&inside, "keep").unwrap();
+
+        let err = uninstall(&mut store, &plugins, &data, id, true).expect_err(id);
+        assert!(!err.is_empty(), "{id}: {err}");
+        assert!(outside.is_file(), "id `{id}` deleted outside data_dir");
+        assert!(
+            inside.is_file(),
+            "id `{id}` deleted a sibling inside data_dir"
+        );
+        assert_eq!(
+            keeper_bytes(&plugins),
+            before,
+            "id `{id}` changed the store"
+        );
+    }
 }
 
 #[test]
