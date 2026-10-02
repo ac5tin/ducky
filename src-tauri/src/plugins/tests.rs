@@ -2604,6 +2604,13 @@ fn versioned_package(root: &Path, name: &str, version: &str, marker: &str) {
     write(root, "marker.txt", marker);
 }
 
+/// No manifest version. The ladder's last rung is the literal `unknown`.
+fn unversioned_package(root: &Path, name: &str, marker: &str) {
+    write(root, "plugin.json", &agent_manifest(name, ""));
+    write_skill(root, "skills/demo", "demo");
+    write(root, "marker.txt", marker);
+}
+
 fn test_entry(name: &str, version: Option<&str>, source: PluginSource) -> Entry {
     Entry {
         name: name.to_string(),
@@ -3315,6 +3322,139 @@ fn rollback_refuses_when_only_copy_is_rollback_source() {
     );
     assert_eq!(record.version.as_deref(), Some("1.0.0"));
     assert!(record.previous_version.is_none());
+}
+
+/// Hide `package/` and assert recovery will not consume the only previous dir.
+fn expect_rollback_source_kept(
+    plugins: &Path,
+    record: &mut InstallRecord,
+    previous: &Path,
+    old_marker: &str,
+) {
+    let package = plugins.join(&record.id).join("package");
+    let held = package.with_file_name("held-new");
+    let version = record.version.clone();
+    let previous_version = record.previous_version.clone();
+    std::fs::rename(&package, &held).unwrap();
+
+    let rollback_err = rollback(record, plugins).unwrap_err();
+    let apply_err = apply(record, plugins, None, false).unwrap_err();
+
+    assert!(
+        rollback_err.contains("recorded rollback source"),
+        "{rollback_err}"
+    );
+    assert!(
+        rollback_err.contains(&previous.display().to_string()),
+        "{rollback_err}"
+    );
+    assert!(
+        apply_err.contains("recorded rollback source"),
+        "{apply_err}"
+    );
+    assert!(previous.is_dir(), "rollback source was consumed");
+    assert!(!package.exists());
+    assert_eq!(record.version, version);
+    assert_eq!(record.previous_version, previous_version);
+    let loaded = InstallStore::load(plugins);
+    let saved = loaded
+        .records
+        .iter()
+        .find(|item| item.id == record.id)
+        .unwrap();
+    assert_eq!(saved.version, version);
+    assert_eq!(saved.previous_version, previous_version);
+
+    std::fs::rename(&held, &package).unwrap();
+    rollback(record, plugins).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(package.join("marker.txt")).unwrap(),
+        old_marker
+    );
+    assert_eq!(record.version, previous_version);
+    assert!(record.previous_version.is_none());
+    assert!(!previous.exists());
+}
+
+#[test]
+fn recovery_refuses_unknown_version_rollback_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    unversioned_package(&source, "demo-plugin", "old-bytes");
+    let plugins = tmp.path().join("plugins");
+    let mut store = InstallStore::load(&plugins);
+    let mut record = install(&mut store, &plugins, &path_source(&source), None, None).unwrap();
+    assert_eq!(record.version.as_deref(), Some("unknown"));
+    assert!(record.resolved_sha.is_none());
+    assert!(record.resolved_sha256.is_none());
+    unversioned_package(&source, "demo-plugin", "new-bytes");
+    apply(&mut record, &plugins, None, false).unwrap();
+
+    let id_dir = plugins.join(&record.id);
+    let previous = id_dir.join("package.previous-unknown");
+    assert!(previous.is_dir(), "suffix drifted from the ladder value");
+    assert_eq!(count_previous(&id_dir), 1);
+    assert_eq!(record.previous_version.as_deref(), Some("unknown"));
+    assert_eq!(record.version.as_deref(), Some("unknown"));
+    assert_eq!(
+        std::fs::read_to_string(previous.join("marker.txt")).unwrap(),
+        "old-bytes"
+    );
+
+    expect_rollback_source_kept(&plugins, &mut record, &previous, "old-bytes");
+}
+
+#[test]
+fn recovery_refuses_sanitized_version_rollback_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    versioned_package(&source, "demo-plugin", "1.0/beta", "old-bytes");
+    let plugins = tmp.path().join("plugins");
+    let mut store = InstallStore::load(&plugins);
+    let mut record = install(&mut store, &plugins, &path_source(&source), None, None).unwrap();
+    assert_eq!(record.version.as_deref(), Some("1.0/beta"));
+    versioned_package(&source, "demo-plugin", "2.0", "new-bytes");
+    apply(&mut record, &plugins, None, false).unwrap();
+
+    let id_dir = plugins.join(&record.id);
+    let previous = id_dir.join("package.previous-unknown");
+    assert!(previous.is_dir(), "unsafe version was not sanitized");
+    assert_eq!(count_previous(&id_dir), 1);
+    assert_eq!(record.previous_version.as_deref(), Some("1.0/beta"));
+    assert_eq!(record.version.as_deref(), Some("2.0"));
+    assert_eq!(
+        std::fs::read_to_string(previous.join("marker.txt")).unwrap(),
+        "old-bytes"
+    );
+
+    expect_rollback_source_kept(&plugins, &mut record, &previous, "old-bytes");
+}
+
+#[test]
+fn recover_restores_sanitized_previous_when_version_differs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    versioned_package(&source, "demo-plugin", "1.0/beta", "old-bytes");
+    let plugins = tmp.path().join("plugins");
+    let mut store = InstallStore::load(&plugins);
+    let mut record = install(&mut store, &plugins, &path_source(&source), None, None).unwrap();
+    let id_dir = plugins.join(&record.id);
+    let live = id_dir.join("package");
+    let previous = id_dir.join("package.previous-unknown");
+    std::fs::rename(&live, &previous).unwrap();
+    record.previous_version = Some("0.9.0".to_string());
+    std::fs::remove_dir_all(&source).unwrap();
+
+    let err = apply(&mut record, &plugins, None, false).unwrap_err();
+
+    assert_eq!(
+        std::fs::read_to_string(id_dir.join("package/marker.txt")).unwrap(),
+        "old-bytes",
+        "{err}"
+    );
+    assert!(!previous.exists(), "{err}");
+    assert_eq!(record.version.as_deref(), Some("1.0/beta"), "{err}");
+    assert_eq!(record.previous_version.as_deref(), Some("0.9.0"));
 }
 
 #[test]

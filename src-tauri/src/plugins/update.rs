@@ -121,7 +121,7 @@ pub fn apply(
     let from = record.version.clone();
     let previous = plugin_dir.join(format!(
         "package.previous-{}",
-        revision_label(from.as_deref())
+        previous_dir_suffix(from.as_deref().unwrap_or("unknown"))
     ));
     // An existing previous dir is held until the new `package/` rename
     // succeeds. A kill between the renames is repaired on the next call.
@@ -182,7 +182,7 @@ pub fn rollback(record: &mut InstallRecord, plugins_dir: &Path) -> Result<(), St
     recover_missing_package(&plugin_dir, &live, record)?;
     let previous = plugin_dir.join(format!(
         "package.previous-{}",
-        revision_label(record.previous_version.as_deref())
+        previous_dir_suffix(record.previous_version.as_deref().unwrap_or("unknown"))
     ));
     if record.previous_version.is_none() || !previous.is_dir() {
         return Err("no previous revision to roll back".to_string());
@@ -354,18 +354,22 @@ fn is_disabled(name: &str, id: &str, disabled: &[String]) -> bool {
     disabled.iter().any(|item| item == name || item == &full)
 }
 
-fn revision_label(version: Option<&str>) -> String {
-    let raw = version.unwrap_or("unknown");
-    let unsafe_name = raw.is_empty()
-        || raw == "."
-        || raw == ".."
-        || raw.ends_with(' ')
-        || raw.ends_with('.')
-        || raw.chars().any(|ch| ch == '/' || ch == '\\' || ch == '\0');
+/// Directory suffix for `package.previous-<suffix>`. The same function
+/// builds the name and compares it, so a sanitized version cannot drift
+/// from `previous_version`.
+fn previous_dir_suffix(version: &str) -> String {
+    let unsafe_name = version.is_empty()
+        || version == "."
+        || version == ".."
+        || version.ends_with(' ')
+        || version.ends_with('.')
+        || version
+            .chars()
+            .any(|ch| ch == '/' || ch == '\\' || ch == '\0');
     if unsafe_name {
         "unknown".to_string()
     } else {
-        raw.to_string()
+        version.to_string()
     }
 }
 
@@ -413,8 +417,9 @@ fn load_store(plugins_dir: &Path) -> Result<InstallStore, String> {
 ///
 /// A kill inside `rollback` leaves the new bytes in `package.rollback-tmp`.
 /// Restoring that directory leaves every `package.previous-*` in place.
-/// One previous directory is restored only when its label is not
-/// `record.previous_version`. More than one is left in place and named.
+/// One previous directory is restored only when its suffix is not
+/// `previous_dir_suffix` of `record.previous_version`. More than one is
+/// left in place and named.
 fn recover_missing_package(
     plugin_dir: &Path,
     live: &Path,
@@ -462,18 +467,22 @@ fn restore_unless_rollback_source(
     live: &Path,
     record: &InstallRecord,
 ) -> Result<(), String> {
-    let label = previous
+    let dir_suffix = previous
         .file_name()
         .and_then(|name| name.to_str())
         .and_then(|name| name.strip_prefix("package.previous-"));
-    // Suffix vs `previous_version`, not `revision_label`. An unsafe version
-    // is stored raw and named `unknown`; that case is not this compare.
-    if label.is_some() && record.previous_version.as_deref() == label {
-        return Err(format!(
-            "package {} is missing; its only copy is the recorded rollback source {}",
-            live.display(),
-            previous.display()
-        ));
+    // None is not a recorded rollback source. A kill before the record
+    // write still restores. Compare suffixes, not the raw version.
+    // ponytail: unsafe versions share the suffix `unknown`, so a later kill
+    // during another unsafe update is refused rather than restored.
+    if let (Some(dir_suffix), Some(recorded)) = (dir_suffix, record.previous_version.as_deref()) {
+        if dir_suffix == previous_dir_suffix(recorded) {
+            return Err(format!(
+                "package {} is missing; its only copy is the recorded rollback source {}",
+                live.display(),
+                previous.display()
+            ));
+        }
     }
     std::fs::rename(previous, live).map_err(|err| {
         format!(
