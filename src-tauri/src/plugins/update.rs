@@ -90,7 +90,7 @@ pub fn apply(
 ) -> Result<UpdateOutcome, String> {
     let plugin_dir = package_dir(plugins_dir, &record.id)?;
     let live = plugin_dir.join("package");
-    recover_missing_package(&plugin_dir, &live)?;
+    recover_missing_package(&plugin_dir, &live, record)?;
     let modified_locally = locally_modified(record, &live);
     if modified_locally && !force {
         record.status = PluginStatus::ModifiedLocally;
@@ -179,7 +179,7 @@ pub fn apply(
 pub fn rollback(record: &mut InstallRecord, plugins_dir: &Path) -> Result<(), String> {
     let plugin_dir = package_dir(plugins_dir, &record.id)?;
     let live = plugin_dir.join("package");
-    recover_missing_package(&plugin_dir, &live)?;
+    recover_missing_package(&plugin_dir, &live, record)?;
     let previous = plugin_dir.join(format!(
         "package.previous-{}",
         revision_label(record.previous_version.as_deref())
@@ -411,45 +411,77 @@ fn load_store(plugins_dir: &Path) -> Result<InstallStore, String> {
 
 /// Put a killed swap back before `apply` or `rollback` does anything else.
 ///
-/// Exactly one `package.previous-*` is the old `package/`. More than one is
-/// ambiguous: restore the newest and name it in the error. Do not continue.
-fn recover_missing_package(plugin_dir: &Path, live: &Path) -> Result<(), String> {
+/// A kill inside `rollback` leaves the new bytes in `package.rollback-tmp`.
+/// Restoring that directory leaves every `package.previous-*` in place.
+/// One previous directory is restored only when its label is not
+/// `record.previous_version`. More than one is left in place and named.
+fn recover_missing_package(
+    plugin_dir: &Path,
+    live: &Path,
+    record: &InstallRecord,
+) -> Result<(), String> {
     if live.is_dir() {
         return Ok(());
     }
-    let mut previous = match list_previous(plugin_dir) {
+    let aside = live.with_file_name("package.rollback-tmp");
+    if aside.is_dir() {
+        return std::fs::rename(&aside, live).map_err(|err| {
+            format!(
+                "cannot restore {} to {}: {err}",
+                aside.display(),
+                live.display()
+            )
+        });
+    }
+    let previous = match list_previous(plugin_dir) {
         Ok(previous) => previous,
-        Err(_) if !plugin_dir.exists() => return Ok(()),
+        Err(_) if !plugin_dir.exists() => {
+            return Err(format!("package {} is missing", live.display()));
+        }
         Err(err) => return Err(err),
     };
-    if previous.is_empty() {
-        return Ok(());
+    match previous.as_slice() {
+        [] => Err(format!("package {} is missing", live.display())),
+        [one] => restore_unless_rollback_source(one, live, record),
+        many => {
+            let names = many
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(format!(
+                "package {} is missing; more than one previous revision: {names}",
+                live.display()
+            ))
+        }
     }
-    previous.sort_by(|left, right| {
-        dir_mtime(right).cmp(&dir_mtime(left)).then_with(|| {
-            right.file_name().cmp(&left.file_name())
-        })
-    });
-    let newest = previous.remove(0);
-    let newest_name = newest
+}
+
+fn restore_unless_rollback_source(
+    previous: &Path,
+    live: &Path,
+    record: &InstallRecord,
+) -> Result<(), String> {
+    let label = previous
         .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned();
-    std::fs::rename(&newest, live).map_err(|err| {
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("package.previous-"));
+    // Suffix vs `previous_version`, not `revision_label`. An unsafe version
+    // is stored raw and named `unknown`; that case is not this compare.
+    if label.is_some() && record.previous_version.as_deref() == label {
+        return Err(format!(
+            "package {} is missing; its only copy is the recorded rollback source {}",
+            live.display(),
+            previous.display()
+        ));
+    }
+    std::fs::rename(previous, live).map_err(|err| {
         format!(
             "cannot restore {} to {}: {err}",
-            newest.display(),
+            previous.display(),
             live.display()
         )
-    })?;
-    if previous.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "package was missing; restored the newest previous revision {newest_name}"
-        ))
-    }
+    })
 }
 
 fn list_previous(plugin_dir: &Path) -> Result<Vec<PathBuf>, String> {
@@ -466,12 +498,6 @@ fn list_previous(plugin_dir: &Path) -> Result<Vec<PathBuf>, String> {
         }
     }
     Ok(found)
-}
-
-fn dir_mtime(path: &Path) -> SystemTime {
-    std::fs::metadata(path)
-        .and_then(|meta| meta.modified())
-        .unwrap_or(UNIX_EPOCH)
 }
 
 /// `live` → `previous`, then `staged` → `live`. An existing previous dir is
@@ -574,7 +600,9 @@ fn undo_swap(live: &Path, previous: &Path) -> Result<(), String> {
 /// The aside path is kept until the record write succeeds.
 fn swap_back(live: &Path, previous: &Path) -> Result<PathBuf, String> {
     let aside = live.with_file_name("package.rollback-tmp");
-    if aside.exists() {
+    // Stale residue from a finished rollback. A missing `package/` is
+    // recovered first; do not delete `package.rollback-tmp` in that case.
+    if aside.exists() && live.is_dir() {
         std::fs::remove_dir_all(&aside)
             .map_err(|err| format!("cannot remove {}: {err}", aside.display()))?;
     }

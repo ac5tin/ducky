@@ -2984,15 +2984,6 @@ fn count_previous(plugin_dir: &Path) -> usize {
         .count()
 }
 
-fn set_dir_mtime(path: &Path, when: std::time::SystemTime) {
-    std::fs::OpenOptions::new()
-        .read(true)
-        .open(path)
-        .unwrap()
-        .set_modified(when)
-        .unwrap();
-}
-
 /// `package/` was renamed to `package.previous-<version>` and the process died.
 fn kill_after_first_rename(plugin_dir: &Path, version: &str) {
     let live = plugin_dir.join("package");
@@ -3210,7 +3201,7 @@ fn rollback_restores_package_after_killed_swap() {
 }
 
 #[test]
-fn apply_names_newest_previous_when_package_is_missing() {
+fn apply_names_every_previous_when_package_is_missing() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
     versioned_package(&source, "demo-plugin", "1.0.0", "old-bytes");
@@ -3222,26 +3213,132 @@ fn apply_names_newest_previous_when_package_is_missing() {
     let older = id_dir.join("package.previous-1.0.0");
     let newer = id_dir.join("package.previous-9.9.9");
     std::fs::rename(&package, &older).unwrap();
-    std::fs::create_dir_all(&newer).unwrap();
-    std::fs::write(newer.join("marker.txt"), "newer-bytes").unwrap();
-    let now = std::time::SystemTime::now();
-    set_dir_mtime(&older, now - std::time::Duration::from_secs(7200));
-    set_dir_mtime(&newer, now);
+    write(&newer, "marker.txt", "newer-bytes");
 
     let err = apply(&mut record, &plugins, None, false).unwrap_err();
 
-    assert!(err.contains("newest"), "{err}");
-    assert!(err.contains("package.previous-9.9.9"), "{err}");
+    assert!(err.contains(&older.display().to_string()), "{err}");
+    assert!(err.contains(&newer.display().to_string()), "{err}");
+    assert!(!package.exists(), "a previous directory was restored");
+    assert!(older.is_dir());
+    assert!(newer.is_dir());
+    assert_eq!(record.version.as_deref(), Some("1.0.0"));
+}
+
+#[test]
+fn rollback_finishes_after_kill_inside_swap_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    versioned_package(&source, "demo-plugin", "1.0.0", "old-bytes");
+    let plugins = tmp.path().join("plugins");
+    let mut store = InstallStore::load(&plugins);
+    let mut record = install(&mut store, &plugins, &path_source(&source), None, None).unwrap();
+    versioned_package(&source, "demo-plugin", "1.1.0", "new-bytes");
+    apply(&mut record, &plugins, None, false).unwrap();
+    let id_dir = plugins.join(&record.id);
+    let package = id_dir.join("package");
+    let aside = id_dir.join("package.rollback-tmp");
+    std::fs::rename(&package, &aside).unwrap();
     assert_eq!(
-        std::fs::read_to_string(package.join("marker.txt")).unwrap(),
-        "newer-bytes"
+        std::fs::read_to_string(aside.join("marker.txt")).unwrap(),
+        "new-bytes"
     );
     assert_eq!(
-        std::fs::read_to_string(older.join("marker.txt")).unwrap(),
+        std::fs::read_to_string(id_dir.join("package.previous-1.0.0/marker.txt")).unwrap(),
         "old-bytes"
     );
-    assert!(!newer.exists(), "newest previous was not the one restored");
+
+    let result = rollback(&mut record, &plugins);
+
+    assert_eq!(record.version.as_deref(), Some("1.0.0"), "{result:?}");
+    assert!(result.is_ok(), "{result:?}");
+    assert!(record.previous_version.is_none());
+    assert_eq!(
+        std::fs::read_to_string(package.join("marker.txt")).unwrap(),
+        "old-bytes"
+    );
+    assert!(!aside.exists());
+    assert_eq!(count_previous(&id_dir), 0);
+    let loaded = InstallStore::load(&plugins);
+    let saved = loaded
+        .records
+        .iter()
+        .find(|item| item.id == record.id)
+        .unwrap();
+    assert_eq!(saved.version.as_deref(), Some("1.0.0"));
+    assert!(saved.previous_version.is_none());
+    assert_eq!(saved.tree_hash.as_deref(), tree_hash(&package).as_deref());
+}
+
+#[test]
+fn rollback_refuses_when_only_copy_is_rollback_source() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    versioned_package(&source, "demo-plugin", "1.0.0", "old-bytes");
+    let plugins = tmp.path().join("plugins");
+    let mut store = InstallStore::load(&plugins);
+    let mut record = install(&mut store, &plugins, &path_source(&source), None, None).unwrap();
+    versioned_package(&source, "demo-plugin", "1.1.0", "new-bytes");
+    apply(&mut record, &plugins, None, false).unwrap();
+    let id_dir = plugins.join(&record.id);
+    let package = id_dir.join("package");
+    let previous = id_dir.join("package.previous-1.0.0");
+    let held = id_dir.join("held-new");
+    std::fs::rename(&package, &held).unwrap();
+
+    let rollback_err = rollback(&mut record, &plugins).unwrap_err();
+    let apply_err = apply(&mut record, &plugins, None, false).unwrap_err();
+
+    assert!(
+        rollback_err.contains("recorded rollback source"),
+        "{rollback_err}"
+    );
+    assert!(apply_err.contains("recorded rollback source"), "{apply_err}");
+    assert!(previous.is_dir(), "rollback source was consumed");
+    assert!(!package.exists());
+    assert_eq!(record.version.as_deref(), Some("1.1.0"));
+    assert_eq!(record.previous_version.as_deref(), Some("1.0.0"));
+    let loaded = InstallStore::load(&plugins);
+    let saved = loaded
+        .records
+        .iter()
+        .find(|item| item.id == record.id)
+        .unwrap();
+    assert_eq!(saved.version.as_deref(), Some("1.1.0"));
+    assert_eq!(saved.previous_version.as_deref(), Some("1.0.0"));
+
+    std::fs::rename(&held, &package).unwrap();
+    rollback(&mut record, &plugins).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(package.join("marker.txt")).unwrap(),
+        "old-bytes"
+    );
     assert_eq!(record.version.as_deref(), Some("1.0.0"));
+    assert!(record.previous_version.is_none());
+}
+
+#[test]
+fn recover_restores_previous_when_label_differs_from_record() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    versioned_package(&source, "demo-plugin", "1.0.0", "old-bytes");
+    let plugins = tmp.path().join("plugins");
+    let mut store = InstallStore::load(&plugins);
+    let mut record = install(&mut store, &plugins, &path_source(&source), None, None).unwrap();
+    let id_dir = plugins.join(&record.id);
+    kill_after_first_rename(&id_dir, "1.0.0");
+    record.previous_version = Some("0.9.0".to_string());
+    std::fs::remove_dir_all(&source).unwrap();
+
+    let err = apply(&mut record, &plugins, None, false).unwrap_err();
+
+    assert_eq!(
+        std::fs::read_to_string(id_dir.join("package/marker.txt")).unwrap(),
+        "old-bytes",
+        "{err}"
+    );
+    assert_eq!(record.version.as_deref(), Some("1.0.0"), "{err}");
+    assert_eq!(record.previous_version.as_deref(), Some("0.9.0"));
 }
 
 #[test]
