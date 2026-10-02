@@ -1,19 +1,18 @@
 //! Update checks, atomic swap and rollback (design §7).
 //!
 //! Fetch and validate into staging before the live `package/` directory is
-//! touched. A failed record write puts that directory back, then returns, so
-//! the record still describes the revision on disk.
+//! touched. A kill between the two renames is repaired at the start of the
+//! next `apply` or `rollback`. A failed record write puts that directory back,
+//! then returns, so the record still describes the revision on disk.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use sha2::{Digest, Sha256};
-
 use super::install::{
-    fetch_to_staging, package_dir, resolve_version, AvailableUpdate, InstallRecord, InstallStore,
-    PluginStatus,
+    fetch_to_staging, package_dir, resolve_version, tree_hash, AvailableUpdate, InstallRecord,
+    InstallStore, PluginStatus,
 };
 use super::layout::discover;
 use super::manifest;
@@ -21,9 +20,6 @@ use super::marketplace::{
     git_target, join_diagnostics, parse_git_remote, Entry, PluginSource, Registry,
 };
 use crate::snapshot::GIT_ENV_TO_CLEAR;
-
-/// More files than this and the local-edit guard is skipped (design §7).
-const MAX_TREE_FILES: usize = 2000;
 
 /// Result of a successful swap. The command layer reconnects `enabled_servers`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,37 +29,6 @@ pub struct UpdateOutcome {
     pub modified_locally: bool,
     /// `plugin:<id>:<name>` ids that were enabled before the swap.
     pub enabled_servers: Vec<String>,
-}
-
-/// `sha256:<hex>` over the sorted relative paths and file bytes.
-///
-/// `None` when the tree exceeds [`MAX_TREE_FILES`] or cannot be read.
-/// ponytail: both cases return None. `apply` treats `Some(recorded) != None`
-/// as a local edit and refuses an unforced update.
-pub fn tree_hash(package: &Path) -> Option<String> {
-    let mut files = Vec::new();
-    if !collect_files(package, package, &mut files) {
-        return None;
-    }
-    files.sort();
-    let mut hasher = Sha256::new();
-    for relative in &files {
-        let full = package.join(relative);
-        let meta = std::fs::symlink_metadata(&full).ok()?;
-        hasher.update((relative.len() as u64).to_le_bytes());
-        hasher.update(relative.as_bytes());
-        if meta.file_type().is_symlink() {
-            let target = std::fs::read_link(&full).ok()?;
-            let target = target.to_string_lossy();
-            hasher.update((target.len() as u64).to_le_bytes());
-            hasher.update(target.as_bytes());
-            continue;
-        }
-        let bytes = std::fs::read(&full).ok()?;
-        hasher.update((bytes.len() as u64).to_le_bytes());
-        hasher.update(&bytes);
-    }
-    Some(format!("sha256:{:x}", hasher.finalize()))
 }
 
 /// Compare one install record with the registry, or with `git ls-remote`.
@@ -125,11 +90,14 @@ pub fn apply(
 ) -> Result<UpdateOutcome, String> {
     let plugin_dir = package_dir(plugins_dir, &record.id)?;
     let live = plugin_dir.join("package");
+    recover_missing_package(&plugin_dir, &live)?;
     let modified_locally = locally_modified(record, &live);
     if modified_locally && !force {
         record.status = PluginStatus::ModifiedLocally;
-        let _ = write_record(record, plugins_dir);
-        return Err("plugin was modified locally".to_string());
+        return Err(match write_record(record, plugins_dir) {
+            Ok(()) => "plugin was modified locally".to_string(),
+            Err(err) => format!("plugin was modified locally ({err})"),
+        });
     }
     // Know the record can be saved before the live directory moves.
     ensure_record_slot(record, plugins_dir)?;
@@ -155,8 +123,8 @@ pub fn apply(
         "package.previous-{}",
         revision_label(from.as_deref())
     ));
-    // Second rename failure puts `package/` back. The old bytes stay at
-    // `previous` until that restore, so a hole requires both renames to fail.
+    // An existing previous dir is held until the new `package/` rename
+    // succeeds. A kill between the renames is repaired on the next call.
     swap_in(&live, &previous, &staged)?;
 
     let version = resolve_version(
@@ -211,6 +179,7 @@ pub fn apply(
 pub fn rollback(record: &mut InstallRecord, plugins_dir: &Path) -> Result<(), String> {
     let plugin_dir = package_dir(plugins_dir, &record.id)?;
     let live = plugin_dir.join("package");
+    recover_missing_package(&plugin_dir, &live)?;
     let previous = plugin_dir.join(format!(
         "package.previous-{}",
         revision_label(record.previous_version.as_deref())
@@ -295,7 +264,15 @@ fn git_ls_remote(url: &str, git_ref: &str) -> Result<String, String> {
         command.env_remove(var);
     }
     command.env("GIT_TERMINAL_PROMPT", "0");
-    command.arg("ls-remote").arg(url).arg(git_ref);
+    command
+        .arg("ls-remote")
+        .arg(url)
+        .arg(format!("refs/heads/{git_ref}"))
+        .arg(format!("refs/tags/{git_ref}"))
+        .arg(format!("refs/tags/{git_ref}^{{}}"));
+    if git_ref == "HEAD" {
+        command.arg("HEAD");
+    }
     let output = command
         .output()
         .map_err(|err| format!("could not run git: {err}"))?;
@@ -307,12 +284,44 @@ fn git_ls_remote(url: &str, git_ref: &str) -> Result<String, String> {
             stderr
         });
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let sha = stdout.split_whitespace().next().unwrap_or("");
-    if sha.len() != 40 || !sha.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        return Err(format!("git ls-remote returned no commit for {git_ref}"));
+    resolve_remote_sha(&output.stdout, git_ref)
+}
+
+/// Pick one SHA. Line order is not a contract, and an annotated tag's first
+/// line is the tag object, not the commit `install` stored.
+fn resolve_remote_sha(stdout: &[u8], git_ref: &str) -> Result<String, String> {
+    let stdout = String::from_utf8_lossy(stdout);
+    let mut refs = std::collections::BTreeMap::new();
+    for line in stdout.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(sha) = parts.next() else {
+            continue;
+        };
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        if sha.len() == 40 && sha.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            refs.insert(name.to_string(), sha.to_string());
+        }
     }
-    Ok(sha.to_string())
+    let head = format!("refs/heads/{git_ref}");
+    let peeled = format!("refs/tags/{git_ref}^{{}}");
+    let tag = format!("refs/tags/{git_ref}");
+    if let Some(sha) = refs.get(&head) {
+        return Ok(sha.clone());
+    }
+    if let Some(sha) = refs.get(&peeled) {
+        return Ok(sha.clone());
+    }
+    if let Some(sha) = refs.get(&tag) {
+        return Ok(sha.clone());
+    }
+    if git_ref == "HEAD" {
+        if let Some(sha) = refs.get("HEAD") {
+            return Ok(sha.clone());
+        }
+    }
+    Err(format!("git ls-remote returned no commit for {git_ref}"))
 }
 
 fn locally_modified(record: &InstallRecord, package: &Path) -> bool {
@@ -400,8 +409,73 @@ fn load_store(plugins_dir: &Path) -> Result<InstallStore, String> {
     Ok(store)
 }
 
-/// `live` → `previous`, then `staged` → `live`. The first rename is undone
-/// when the second fails, so `package/` is not left missing.
+/// Put a killed swap back before `apply` or `rollback` does anything else.
+///
+/// Exactly one `package.previous-*` is the old `package/`. More than one is
+/// ambiguous: restore the newest and name it in the error. Do not continue.
+fn recover_missing_package(plugin_dir: &Path, live: &Path) -> Result<(), String> {
+    if live.is_dir() {
+        return Ok(());
+    }
+    let mut previous = match list_previous(plugin_dir) {
+        Ok(previous) => previous,
+        Err(_) if !plugin_dir.exists() => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    if previous.is_empty() {
+        return Ok(());
+    }
+    previous.sort_by(|left, right| {
+        dir_mtime(right).cmp(&dir_mtime(left)).then_with(|| {
+            right.file_name().cmp(&left.file_name())
+        })
+    });
+    let newest = previous.remove(0);
+    let newest_name = newest
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    std::fs::rename(&newest, live).map_err(|err| {
+        format!(
+            "cannot restore {} to {}: {err}",
+            newest.display(),
+            live.display()
+        )
+    })?;
+    if previous.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "package was missing; restored the newest previous revision {newest_name}"
+        ))
+    }
+}
+
+fn list_previous(plugin_dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let entries = std::fs::read_dir(plugin_dir)
+        .map_err(|err| format!("cannot read {}: {err}", plugin_dir.display()))?;
+    let mut found = Vec::new();
+    for entry in entries {
+        let entry =
+            entry.map_err(|err| format!("cannot read {}: {err}", plugin_dir.display()))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("package.previous-") && entry.path().is_dir() {
+            found.push(entry.path());
+        }
+    }
+    Ok(found)
+}
+
+fn dir_mtime(path: &Path) -> SystemTime {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .unwrap_or(UNIX_EPOCH)
+}
+
+/// `live` → `previous`, then `staged` → `live`. An existing previous dir is
+/// held, not deleted, until the new `package/` rename succeeds.
 fn swap_in(live: &Path, previous: &Path, staged: &Path) -> Result<(), String> {
     if !live.is_dir() {
         return Err(format!("package {} is missing", live.display()));
@@ -409,19 +483,19 @@ fn swap_in(live: &Path, previous: &Path, staged: &Path) -> Result<(), String> {
     if !staged.is_dir() {
         return Err(format!("staged package {} is missing", staged.display()));
     }
-    if previous.exists() {
-        std::fs::remove_dir_all(previous)
-            .map_err(|err| format!("cannot remove {}: {err}", previous.display()))?;
-    }
-    std::fs::rename(live, previous).map_err(|err| {
-        format!(
+    let held = hold_existing(previous)?;
+    if let Err(err) = std::fs::rename(live, previous) {
+        restore_held(held.as_deref(), previous);
+        return Err(format!(
             "cannot move {} to {}: {err}",
             live.display(),
             previous.display()
-        )
-    })?;
+        ));
+    }
     if let Err(err) = std::fs::rename(staged, live) {
-        if let Err(restore) = std::fs::rename(previous, live) {
+        let restore_err = std::fs::rename(previous, live).err();
+        restore_held(held.as_deref(), previous);
+        if let Some(restore) = restore_err {
             return Err(format!(
                 "cannot move the staged package into {}: {err} (failed to restore package: {restore})",
                 live.display()
@@ -432,7 +506,39 @@ fn swap_in(live: &Path, previous: &Path, staged: &Path) -> Result<(), String> {
             live.display()
         ));
     }
+    if let Some(held) = held {
+        let _ = std::fs::remove_dir_all(held);
+    }
     Ok(())
+}
+
+fn hold_existing(previous: &Path) -> Result<Option<PathBuf>, String> {
+    if !previous.exists() {
+        return Ok(None);
+    }
+    let held = previous.with_file_name(format!(
+        "package.held-{}-{}",
+        std::process::id(),
+        STAGING_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::rename(previous, &held).map_err(|err| {
+        format!(
+            "cannot move {} to {}: {err}",
+            previous.display(),
+            held.display()
+        )
+    })?;
+    Ok(Some(held))
+}
+
+fn restore_held(held: Option<&Path>, previous: &Path) {
+    let Some(held) = held else {
+        return;
+    };
+    if !held.exists() || previous.exists() {
+        return;
+    }
+    let _ = std::fs::rename(held, previous);
 }
 
 fn undo_swap(live: &Path, previous: &Path) -> Result<(), String> {
@@ -527,49 +633,6 @@ fn delete_other_previous(plugin_dir: &Path, keep: &Path) {
             let _ = std::fs::remove_dir_all(entry.path());
         }
     }
-}
-
-fn collect_files(dir: &Path, root: &Path, files: &mut Vec<String>) -> bool {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return false;
-    };
-    for entry in entries {
-        let Ok(entry) = entry else {
-            return false;
-        };
-        let path = entry.path();
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
-            return false;
-        };
-        let file_type = meta.file_type();
-        if file_type.is_dir() && !file_type.is_symlink() {
-            if !collect_files(&path, root, files) {
-                return false;
-            }
-            continue;
-        }
-        if !file_type.is_file() && !file_type.is_symlink() {
-            continue;
-        }
-        if files.len() == MAX_TREE_FILES {
-            return false;
-        }
-        let Ok(relative) = path.strip_prefix(root) else {
-            return false;
-        };
-        files.push(relative_key(relative));
-    }
-    true
-}
-
-fn relative_key(path: &Path) -> String {
-    path.components()
-        .filter_map(|component| match component {
-            std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 fn now() -> String {

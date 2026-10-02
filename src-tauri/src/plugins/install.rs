@@ -638,7 +638,7 @@ pub fn install(
         update_policy: derive_policy(&discovered),
         disabled_servers: Vec::new(),
         previous_version: None,
-        tree_hash: None,
+        tree_hash: tree_hash(&package_destination),
         last_checked_at: None,
         available_update: None,
         status: PluginStatus::InstalledDisabled,
@@ -715,4 +715,81 @@ fn path_fingerprint(path: &Path) -> String {
     let mut hasher = Sha256::new();
     hasher.update(canonical.to_string_lossy().as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+/// More files than this and the local-edit guard is skipped (design §7).
+const MAX_TREE_FILES: usize = 2000;
+
+/// `sha256:<hex>` over the sorted relative paths and file bytes.
+///
+/// `None` when the tree exceeds [`MAX_TREE_FILES`] or cannot be read.
+/// ponytail: both cases return None. `apply` treats a recorded hash against
+/// `None` as a local edit and refuses an unforced update.
+pub(crate) fn tree_hash(package: &Path) -> Option<String> {
+    let mut files = Vec::new();
+    if !collect_files(package, package, &mut files) {
+        return None;
+    }
+    files.sort();
+    let mut hasher = Sha256::new();
+    for relative in &files {
+        let full = package.join(relative);
+        let meta = std::fs::symlink_metadata(&full).ok()?;
+        hasher.update((relative.len() as u64).to_le_bytes());
+        hasher.update(relative.as_bytes());
+        if meta.file_type().is_symlink() {
+            let target = std::fs::read_link(&full).ok()?;
+            let target = target.to_string_lossy();
+            hasher.update((target.len() as u64).to_le_bytes());
+            hasher.update(target.as_bytes());
+            continue;
+        }
+        let bytes = std::fs::read(&full).ok()?;
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(&bytes);
+    }
+    Some(format!("sha256:{:x}", hasher.finalize()))
+}
+
+fn collect_files(dir: &Path, root: &Path, files: &mut Vec<String>) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            return false;
+        };
+        let file_type = meta.file_type();
+        if file_type.is_dir() && !file_type.is_symlink() {
+            if !collect_files(&path, root, files) {
+                return false;
+            }
+            continue;
+        }
+        if !file_type.is_file() && !file_type.is_symlink() {
+            continue;
+        }
+        if files.len() == MAX_TREE_FILES {
+            return false;
+        }
+        let Ok(relative) = path.strip_prefix(root) else {
+            return false;
+        };
+        files.push(relative_key(relative));
+    }
+    true
+}
+
+fn relative_key(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }

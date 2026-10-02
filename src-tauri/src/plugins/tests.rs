@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 
 use super::diagnostics::DiagLevel;
 use super::install::{
-    assign_id, derive_policy, fetch_to_staging, install, package_dir, resolve_version, uninstall,
-    AvailableUpdate, InstallRecord, InstallStore, PluginStatus, UpdatePolicy,
+    assign_id, derive_policy, fetch_to_staging, install, package_dir, resolve_version, tree_hash,
+    uninstall, AvailableUpdate, InstallRecord, InstallStore, PluginStatus, UpdatePolicy,
 };
 use super::layout::{discover, PluginTransport, RemoteKind};
 use super::manifest::{load, Layout};
@@ -16,7 +16,7 @@ use super::marketplace::{
     parse_git_remote, parse_registry, parse_source, refresh, Change, Entry, HttpClient,
     HttpResponse, MarketplaceRecord, MarketplaceStore, PluginSource, Registry,
 };
-use super::update::{apply, check_one, rollback, tree_hash};
+use super::update::{apply, check_one, rollback};
 
 const SPEC_100: &str = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
 
@@ -2967,5 +2967,334 @@ fn apply_reconnects_only_owned_servers() {
     assert_eq!(
         outcome.enabled_servers,
         vec![format!("plugin:{}:alpha", record.id)]
+    );
+}
+
+fn count_previous(plugin_dir: &Path) -> usize {
+    std::fs::read_dir(plugin_dir)
+        .unwrap()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("package.previous-")
+                && entry.path().is_dir()
+        })
+        .count()
+}
+
+fn set_dir_mtime(path: &Path, when: std::time::SystemTime) {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .open(path)
+        .unwrap()
+        .set_modified(when)
+        .unwrap();
+}
+
+/// `package/` was renamed to `package.previous-<version>` and the process died.
+fn kill_after_first_rename(plugin_dir: &Path, version: &str) {
+    let live = plugin_dir.join("package");
+    let previous = plugin_dir.join(format!("package.previous-{version}"));
+    std::fs::rename(&live, &previous).unwrap();
+    assert!(!live.exists(), "kill simulation left package/");
+}
+
+#[test]
+fn check_one_annotated_tag_matches_peeled_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    git_init(&repo);
+    git(&repo, &["config", "tag.gpgsign", "false"]);
+    versioned_package(&repo, "tagged-plugin", "1.0.0", "first");
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-m", "first"]);
+    git(&repo, &["tag", "-a", "v1.2.3", "-m", "annotated"]);
+    let commit = git(&repo, &["rev-parse", "v1.2.3^{}"]);
+    let tag_object = git(&repo, &["rev-parse", "v1.2.3"]);
+    assert_ne!(commit, tag_object, "fixture is not an annotated tag");
+
+    let plugins = tmp.path().join("plugins");
+    let mut store = InstallStore::load(&plugins);
+    let source = PluginSource::Git {
+        url: file_url(&repo),
+        path: None,
+        git_ref: Some("v1.2.3".to_string()),
+        sha: None,
+    };
+    let mut record = install(&mut store, &plugins, &source, None, None).unwrap();
+    assert_eq!(record.resolved_sha.as_deref(), Some(commit.as_str()));
+
+    let found = check_one(&mut record, None, &plugins).unwrap();
+    assert_eq!(found, None, "annotated tag looked like an update");
+    assert_ne!(record.status, PluginStatus::UpdateAvailable);
+
+    write(&repo, "marker.txt", "second");
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-m", "second"]);
+    git(&repo, &["tag", "-d", "v1.2.3"]);
+    git(&repo, &["tag", "-a", "v1.2.3", "-m", "moved"]);
+    let second = git(&repo, &["rev-parse", "v1.2.3^{}"]);
+    assert_ne!(second, commit);
+
+    let found = check_one(&mut record, None, &plugins).unwrap();
+    assert_eq!(
+        found.and_then(|update| update.resolved_sha).as_deref(),
+        Some(second.as_str())
+    );
+    assert_eq!(record.status, PluginStatus::UpdateAvailable);
+}
+
+#[test]
+fn check_one_prefers_branch_over_same_name_tag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    git_init(&repo);
+    git(&repo, &["config", "tag.gpgsign", "false"]);
+    versioned_package(&repo, "shared-ref", "1.0.0", "branch-bytes");
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-m", "branch"]);
+    git(&repo, &["branch", "release"]);
+    let branch = git(&repo, &["rev-parse", "refs/heads/release"]);
+    write(&repo, "marker.txt", "tag-bytes");
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-m", "tag target"]);
+    git(&repo, &["tag", "-a", "release", "-m", "collides with the branch"]);
+    let tag_commit = git(&repo, &["rev-parse", "refs/tags/release^{}"]);
+    assert_ne!(branch, tag_commit);
+
+    let plugins = tmp.path().join("plugins");
+    let mut store = InstallStore::load(&plugins);
+    let source = PluginSource::Git {
+        url: file_url(&repo),
+        path: None,
+        git_ref: Some("release".to_string()),
+        sha: None,
+    };
+    let mut record = install(&mut store, &plugins, &source, None, None).unwrap();
+    assert_eq!(
+        record.resolved_sha.as_deref(),
+        Some(branch.as_str()),
+        "install did not check out the branch"
+    );
+
+    let found = check_one(&mut record, None, &plugins).unwrap();
+    assert_eq!(found, None, "same-name tag looked like an update");
+    assert_ne!(record.status, PluginStatus::UpdateAvailable);
+}
+
+#[test]
+fn ls_remote_missing_ref_is_an_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    git_init(&repo);
+    write(&repo, "plugin.json", &agent_manifest("remote-plugin", ""));
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-m", "first"]);
+    let source = PluginSource::Git {
+        url: file_url(&repo),
+        path: None,
+        git_ref: Some("missing-ref".to_string()),
+        sha: None,
+    };
+    let mut record = install_record("remote-plugin", "remote-plugin", source);
+    record.resolved_sha = Some("a".repeat(40));
+
+    let err = check_one(&mut record, None, tmp.path()).unwrap_err();
+
+    assert!(err.contains("missing-ref"), "{err}");
+    assert_ne!(record.status, PluginStatus::UpdateAvailable);
+    assert!(record.available_update.is_none());
+}
+
+#[test]
+fn ls_remote_dead_remote_is_an_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = PluginSource::Git {
+        url: file_url(&tmp.path().join("missing-repo")),
+        path: None,
+        git_ref: Some("HEAD".to_string()),
+        sha: None,
+    };
+    let mut record = install_record("remote-plugin", "remote-plugin", source);
+
+    let err = check_one(&mut record, None, tmp.path()).unwrap_err();
+
+    assert!(!err.is_empty(), "{err}");
+    assert_ne!(record.status, PluginStatus::UpdateAvailable);
+}
+
+#[test]
+fn check_one_head_ref_tracks_the_default_branch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    git_init(&repo);
+    write(&repo, "plugin.json", &agent_manifest("remote-plugin", ""));
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-m", "first"]);
+    let first = git(&repo, &["rev-parse", "HEAD"]);
+    let source = PluginSource::Git {
+        url: file_url(&repo),
+        path: None,
+        git_ref: None,
+        sha: None,
+    };
+    let mut record = install_record("remote-plugin", "remote-plugin", source);
+    record.resolved_sha = Some(first);
+
+    assert_eq!(check_one(&mut record, None, tmp.path()).unwrap(), None);
+
+    write(&repo, "marker.txt", "second");
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-m", "second"]);
+    let second = git(&repo, &["rev-parse", "HEAD"]);
+
+    let found = check_one(&mut record, None, tmp.path()).unwrap();
+    assert_eq!(
+        found.and_then(|update| update.resolved_sha).as_deref(),
+        Some(second.as_str())
+    );
+}
+
+#[test]
+fn apply_restores_package_after_killed_swap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    versioned_package(&source, "demo-plugin", "1.0.0", "old-bytes");
+    let plugins = tmp.path().join("plugins");
+    let mut store = InstallStore::load(&plugins);
+    let mut record = install(&mut store, &plugins, &path_source(&source), None, None).unwrap();
+    let id_dir = plugins.join(&record.id);
+    kill_after_first_rename(&id_dir, "1.0.0");
+    versioned_package(&source, "demo-plugin", "1.1.0", "new-bytes");
+
+    apply(&mut record, &plugins, None, false).unwrap();
+
+    let package = id_dir.join("package");
+    assert_eq!(
+        std::fs::read_to_string(package.join("marker.txt")).unwrap(),
+        "new-bytes"
+    );
+    assert_eq!(
+        std::fs::read_to_string(id_dir.join("package.previous-1.0.0/marker.txt")).unwrap(),
+        "old-bytes"
+    );
+    assert_eq!(count_previous(&id_dir), 1);
+    assert_eq!(record.version.as_deref(), Some("1.1.0"));
+}
+
+#[test]
+fn rollback_restores_package_after_killed_swap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    versioned_package(&source, "demo-plugin", "1.0.0", "old-bytes");
+    let plugins = tmp.path().join("plugins");
+    let mut store = InstallStore::load(&plugins);
+    let mut record = install(&mut store, &plugins, &path_source(&source), None, None).unwrap();
+    let id_dir = plugins.join(&record.id);
+    let package = id_dir.join("package");
+    kill_after_first_rename(&id_dir, "1.0.0");
+
+    let result = rollback(&mut record, &plugins);
+
+    assert!(
+        package.join("marker.txt").is_file(),
+        "rollback left package missing: {result:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(package.join("marker.txt")).unwrap(),
+        "old-bytes"
+    );
+    assert_eq!(record.version.as_deref(), Some("1.0.0"));
+}
+
+#[test]
+fn apply_names_newest_previous_when_package_is_missing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    versioned_package(&source, "demo-plugin", "1.0.0", "old-bytes");
+    let plugins = tmp.path().join("plugins");
+    let mut store = InstallStore::load(&plugins);
+    let mut record = install(&mut store, &plugins, &path_source(&source), None, None).unwrap();
+    let id_dir = plugins.join(&record.id);
+    let package = id_dir.join("package");
+    let older = id_dir.join("package.previous-1.0.0");
+    let newer = id_dir.join("package.previous-9.9.9");
+    std::fs::rename(&package, &older).unwrap();
+    std::fs::create_dir_all(&newer).unwrap();
+    std::fs::write(newer.join("marker.txt"), "newer-bytes").unwrap();
+    let now = std::time::SystemTime::now();
+    set_dir_mtime(&older, now - std::time::Duration::from_secs(7200));
+    set_dir_mtime(&newer, now);
+
+    let err = apply(&mut record, &plugins, None, false).unwrap_err();
+
+    assert!(err.contains("newest"), "{err}");
+    assert!(err.contains("package.previous-9.9.9"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(package.join("marker.txt")).unwrap(),
+        "newer-bytes"
+    );
+    assert_eq!(
+        std::fs::read_to_string(older.join("marker.txt")).unwrap(),
+        "old-bytes"
+    );
+    assert!(!newer.exists(), "newest previous was not the one restored");
+    assert_eq!(record.version.as_deref(), Some("1.0.0"));
+}
+
+#[test]
+fn install_persists_tree_hash_and_blocks_local_edit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    versioned_package(&source, "demo-plugin", "1.0.0", "old-bytes");
+    let plugins = tmp.path().join("plugins");
+    let mut store = InstallStore::load(&plugins);
+    let mut record = install(&mut store, &plugins, &path_source(&source), None, None).unwrap();
+    let hash = record.tree_hash.clone().expect("install stores tree_hash");
+    assert!(hash.starts_with("sha256:"), "{hash}");
+    assert_eq!(hash.len(), "sha256:".len() + 64);
+    let loaded = InstallStore::load(&plugins);
+    assert_eq!(loaded.records[0].tree_hash.as_deref(), Some(hash.as_str()));
+
+    let package = plugins.join(&record.id).join("package");
+    std::fs::write(package.join("marker.txt"), "local-edit").unwrap();
+    versioned_package(&source, "demo-plugin", "1.1.0", "upstream");
+
+    let err = apply(&mut record, &plugins, None, false).unwrap_err();
+
+    assert!(err.contains("modified locally"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(package.join("marker.txt")).unwrap(),
+        "local-edit"
+    );
+    assert_eq!(record.status, PluginStatus::ModifiedLocally);
+    let loaded = InstallStore::load(&plugins);
+    assert_eq!(loaded.records[0].status, PluginStatus::ModifiedLocally);
+}
+
+#[test]
+fn modified_locally_returns_status_write_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    versioned_package(&source, "demo-plugin", "1.0.0", "old-bytes");
+    let plugins = tmp.path().join("plugins");
+    let mut store = InstallStore::load(&plugins);
+    let mut record = install(&mut store, &plugins, &path_source(&source), None, None).unwrap();
+    let package = plugins.join(&record.id).join("package");
+    record.tree_hash = tree_hash(&package);
+    std::fs::write(package.join("marker.txt"), "local-edit").unwrap();
+    store.records.clear();
+    store.save(&plugins).unwrap();
+
+    let err = apply(&mut record, &plugins, None, false).unwrap_err();
+
+    assert!(err.contains("modified locally"), "{err}");
+    assert!(err.contains("not in the install record"), "{err}");
+    assert_eq!(record.status, PluginStatus::ModifiedLocally);
+    assert_eq!(
+        std::fs::read_to_string(package.join("marker.txt")).unwrap(),
+        "local-edit"
     );
 }
