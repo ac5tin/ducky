@@ -618,7 +618,7 @@ async fn summarize(
     window: &Window,
     instructions: Option<&str>,
 ) -> Result<String, String> {
-let messages = build_summarizer_messages(window, instructions);
+    let messages = build_summarizer_messages(window, instructions);
     crate::providers::collect_stream_text(provider, &messages, &[], &options).await
 }
 

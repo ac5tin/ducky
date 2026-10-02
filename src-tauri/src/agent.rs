@@ -1267,86 +1267,86 @@ impl Agent {
             let mut call = std::pin::pin!(provider_call);
             loop {
                 tokio::select! {
-                    biased;
-                    _ = ct.cancelled() => {
-                        return Err("cancelled".into());
-                    }
-                    // idle watchdog: the HTTP client only bounds the connect
-                    // phase, so a stream that goes silent (dead connection,
-                    // stuck server) must fail loudly instead of hanging the
-                    // turn — and a whole subagent tree — forever
-                    ev = tokio::time::timeout(stream_idle_timeout(), rx.recv()) => {
-                        let ev = match ev {
-                            Ok(ev) => ev,
-                            Err(_) => {
-                                return Err(format!(
-                                    "The model stream stalled — no data for {} seconds. \
-                                     The connection may have died or the provider is \
-                                     overloaded; try sending again.",
-                                    stream_idle_timeout().as_secs()
-                                ));
-                            }
-                        };
-                        match ev {
-                            Some(ProviderEvent::TextDelta(t)) => {
-                                text.push_str(&t);
-                                self.emit_text_delta(conversation_id, scope, &t);
-                            }
-                            Some(ProviderEvent::ReasoningDelta(t)) => {
-                                if scope.is_main()
-                                    && self.store.config.lock().unwrap().settings.show_reasoning
-                                {
-                                    self.sink.emit(BackendEvent::ReasoningDelta {
-                                        conversation_id: conversation_id.to_string(),
-                                        text: t,
-                                    });
+                                    biased;
+                                    _ = ct.cancelled() => {
+                                        return Err("cancelled".into());
+                                    }
+                                    // idle watchdog: the HTTP client only bounds the connect
+                                    // phase, so a stream that goes silent (dead connection,
+                                    // stuck server) must fail loudly instead of hanging the
+                                    // turn — and a whole subagent tree — forever
+                                    ev = tokio::time::timeout(stream_idle_timeout(), rx.recv()) => {
+                                        let ev = match ev {
+                                            Ok(ev) => ev,
+                                            Err(_) => {
+                                                return Err(format!(
+                                                    "The model stream stalled — no data for {} seconds. \
+                                                     The connection may have died or the provider is \
+                                                     overloaded; try sending again.",
+                                                    stream_idle_timeout().as_secs()
+                                                ));
+                                            }
+                                        };
+                                        match ev {
+                                            Some(ProviderEvent::TextDelta(t)) => {
+                                                text.push_str(&t);
+                                                self.emit_text_delta(conversation_id, scope, &t);
+                                            }
+                                            Some(ProviderEvent::ReasoningDelta(t)) => {
+                                                if scope.is_main()
+                                                    && self.store.config.lock().unwrap().settings.show_reasoning
+                                                {
+                                                    self.sink.emit(BackendEvent::ReasoningDelta {
+                                                        conversation_id: conversation_id.to_string(),
+                                                        text: t,
+                                                    });
+                                                }
+                                            }
+                                            Some(ProviderEvent::ToolCallBegin { index, id, name }) => {
+                                                let entry = tool_calls
+                                                    .entry(index)
+                                                    .or_insert_with(|| (id.clone(), name.clone(), String::new()));
+                                                entry.0 = id;
+                                                entry.1 = name;
+                                            }
+                                            Some(ProviderEvent::ToolCallArgsDelta { index, fragment }) => {
+                                                tool_calls
+                                                    .entry(index)
+                                                    .or_insert_with(|| (Store::new_id(), String::new(), String::new()))
+                                                    .2
+                                                    .push_str(&fragment);
+                                            }
+                Some(ProviderEvent::Usage {
+                                                input,
+                                                output,
+                                                cached,
+                                            }) => {
+                                                // streams may split usage across events: keep
+                                                // the latest value seen per side
+                                                if input.is_some() {
+                                                    usage_input = input;
+                                                    self.set_last_input(conversation_id, input);
+                                                }
+                                                if output.is_some() {
+                                                    usage_output = output;
+                                                }
+                                                if cached.is_some() {
+                                                    usage_cached = cached;
+                                                }
+                                                self.sink.emit(BackendEvent::Usage {
+                                                    conversation_id: conversation_id.to_string(),
+                                                    input,
+                                                    output,
+                                                    cached,
+                                                });
+                                            }
+                                            None => break,
+                                        }
+                                    }
+                                    result = &mut call => {
+                                        stop = Some(result.map_err(|e| e.to_string())?);
+                                    }
                                 }
-                            }
-                            Some(ProviderEvent::ToolCallBegin { index, id, name }) => {
-                                let entry = tool_calls
-                                    .entry(index)
-                                    .or_insert_with(|| (id.clone(), name.clone(), String::new()));
-                                entry.0 = id;
-                                entry.1 = name;
-                            }
-                            Some(ProviderEvent::ToolCallArgsDelta { index, fragment }) => {
-                                tool_calls
-                                    .entry(index)
-                                    .or_insert_with(|| (Store::new_id(), String::new(), String::new()))
-                                    .2
-                                    .push_str(&fragment);
-                            }
-Some(ProviderEvent::Usage {
-                                input,
-                                output,
-                                cached,
-                            }) => {
-                                // streams may split usage across events: keep
-                                // the latest value seen per side
-                                if input.is_some() {
-                                    usage_input = input;
-                                    self.set_last_input(conversation_id, input);
-                                }
-                                if output.is_some() {
-                                    usage_output = output;
-                                }
-                                if cached.is_some() {
-                                    usage_cached = cached;
-                                }
-                                self.sink.emit(BackendEvent::Usage {
-                                    conversation_id: conversation_id.to_string(),
-                                    input,
-                                    output,
-                                    cached,
-                                });
-                            }
-                            None => break,
-                        }
-                    }
-                    result = &mut call => {
-                        stop = Some(result.map_err(|e| e.to_string())?);
-                    }
-                }
             }
             // drain remaining events
             while let Ok(ev) = rx.try_recv() {
@@ -1355,7 +1355,7 @@ Some(ProviderEvent::Usage {
                         text.push_str(&t);
                         self.emit_text_delta(conversation_id, scope, &t);
                     }
-ProviderEvent::Usage {
+                    ProviderEvent::Usage {
                         input,
                         output,
                         cached,
