@@ -1760,7 +1760,11 @@ fn id_collision_appends_fingerprint() {
 #[test]
 fn policy_is_auto_for_skills_only() {
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "plugin.json", &agent_manifest("skills-only", ""));
+    write(
+        tmp.path(),
+        "plugin.json",
+        &agent_manifest("skills-only", ""),
+    );
     write_skill(tmp.path(), "skills/demo", "demo");
 
     let manifest = load(tmp.path()).unwrap();
@@ -1785,7 +1789,11 @@ fn policy_is_manual_with_mcp() {
 #[test]
 fn policy_is_manual_with_extensions() {
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "plugin.json", &agent_manifest("with-subagent", ""));
+    write(
+        tmp.path(),
+        "plugin.json",
+        &agent_manifest("with-subagent", ""),
+    );
     write(
         tmp.path(),
         "app.ducky/subagents/reviewer.md",
@@ -1812,7 +1820,10 @@ fn install_writes_record_disabled() {
     assert!(!record.enabled);
     assert_eq!(record.status, PluginStatus::InstalledDisabled);
     assert_eq!(record.id, "demo-plugin");
-    assert!(plugins.join(&record.id).join("package/plugin.json").is_file());
+    assert!(plugins
+        .join(&record.id)
+        .join("package/plugin.json")
+        .is_file());
 
     let staging = plugins.join(".staging");
     assert!(
@@ -1929,7 +1940,10 @@ fn install_from_source_without_marketplace() {
     assert_eq!(record.marketplace, None);
     assert_eq!(record.version.as_deref(), Some("1.2.0"));
     assert_eq!(record.resolved_sha.as_deref(), Some(head.as_str()));
-    assert!(plugins.join(&record.id).join("package/plugin.json").is_file());
+    assert!(plugins
+        .join(&record.id)
+        .join("package/plugin.json")
+        .is_file());
     assert!(
         !plugins.join(&record.id).join("package/.git").exists(),
         "the installed package kept a git checkout"
@@ -2021,7 +2035,11 @@ fn fetch_to_staging_takes_git_subdir() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
     git_init(&repo);
-    write(&repo, "packages/plug/plugin.json", &agent_manifest("sub", ""));
+    write(
+        &repo,
+        "packages/plug/plugin.json",
+        &agent_manifest("sub", ""),
+    );
     write(&repo, "README.md", "not the package");
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-m", "plugin"]);
@@ -2063,7 +2081,10 @@ fn status_and_policy_serialise_to_the_pinned_strings() {
         assert_eq!(serde_json::to_value(status).unwrap(), expected);
     }
     assert_eq!(serde_json::to_value(UpdatePolicy::Auto).unwrap(), "auto");
-    assert_eq!(serde_json::to_value(UpdatePolicy::Manual).unwrap(), "manual");
+    assert_eq!(
+        serde_json::to_value(UpdatePolicy::Manual).unwrap(),
+        "manual"
+    );
 }
 
 #[test]
@@ -2074,7 +2095,10 @@ fn corrupt_install_store_keeps_the_file() {
     let store = InstallStore::load(tmp.path());
 
     assert!(store.records.is_empty());
-    assert!(store.diagnostics.iter().any(|d| d.level == DiagLevel::Error));
+    assert!(store
+        .diagnostics
+        .iter()
+        .any(|d| d.level == DiagLevel::Error));
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("installed.json")).unwrap(),
         "{ not json",
@@ -2140,7 +2164,11 @@ fn concurrent_record_writes_never_corrupt() {
     stop.store(true, Ordering::Relaxed);
     reader.join().unwrap();
 
-    assert_eq!(failed.load(Ordering::Relaxed), 0, "a concurrent save failed");
+    assert_eq!(
+        failed.load(Ordering::Relaxed),
+        0,
+        "a concurrent save failed"
+    );
     assert_eq!(
         unparsable.load(Ordering::Relaxed),
         0,
@@ -2148,11 +2176,19 @@ fn concurrent_record_writes_never_corrupt() {
     );
     let text = std::fs::read_to_string(dir.join("installed.json")).unwrap();
     let store: InstallStore = serde_json::from_str(&text).expect("final file parses");
-    let mut ids: Vec<_> = store.records.iter().map(|record| record.id.clone()).collect();
+    let mut ids: Vec<_> = store
+        .records
+        .iter()
+        .map(|record| record.id.clone())
+        .collect();
     let count = ids.len();
     ids.sort();
     ids.dedup();
-    assert_eq!(ids.len(), count, "duplicate records after concurrent writes");
+    assert_eq!(
+        ids.len(),
+        count,
+        "duplicate records after concurrent writes"
+    );
     for record in &store.records {
         assert!(!record.id.is_empty());
         assert!(matches!(&record.source, PluginSource::Git { .. }));

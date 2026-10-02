@@ -199,8 +199,7 @@ pub fn resolve_version(
     resolved_sha: Option<&str>,
     resolved_sha256: Option<&str>,
 ) -> Option<String> {
-    let present =
-        |value: Option<&str>| value.filter(|value| !value.is_empty()).map(str::to_string);
+    let present = |value: Option<&str>| value.filter(|value| !value.is_empty()).map(str::to_string);
     present(manifest_version)
         .or_else(|| present(entry_version))
         .or_else(|| present(resolved_sha).map(|sha| truncate12(&sha)))
@@ -444,8 +443,7 @@ fn copy_tree(source: &Path, target: &Path) -> Result<(), String> {
         let entries = std::fs::read_dir(source)
             .map_err(|err| format!("cannot read {}: {err}", source.display()))?;
         for entry in entries {
-            let entry =
-                entry.map_err(|err| format!("cannot read {}: {err}", source.display()))?;
+            let entry = entry.map_err(|err| format!("cannot read {}: {err}", source.display()))?;
             copy_tree(&entry.path(), &target.join(entry.file_name()))?;
         }
         return Ok(());
@@ -498,7 +496,9 @@ pub fn install(
     }
 
     let staging = staging_root(plugins_dir);
-    let _guard = StagingGuard { root: staging.clone() };
+    let _guard = StagingGuard {
+        root: staging.clone(),
+    };
     let package = staging.join("package");
 
     let mut resolved_sha = None;
@@ -521,7 +521,12 @@ pub fn install(
             PluginSource::Path { path } => path_fingerprint(Path::new(path)),
             _ => String::new(),
         });
-    let id = assign_id(&manifest.name, manifest.layout, &store.records, &fingerprint);
+    let id = assign_id(
+        &manifest.name,
+        manifest.layout,
+        &store.records,
+        &fingerprint,
+    );
     let version = resolve_version(
         manifest.version.as_deref(),
         entry.and_then(|entry| entry.version.as_deref()),

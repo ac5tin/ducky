@@ -850,7 +850,9 @@ fn refresh_git(
 }
 
 /// The clone URL, optional subdirectory and optional ref of a git source.
-pub(crate) fn git_target(source: &PluginSource) -> Result<(String, Option<String>, Option<String>), String> {
+pub(crate) fn git_target(
+    source: &PluginSource,
+) -> Result<(String, Option<String>, Option<String>), String> {
     match source {
         PluginSource::Github {
             repo,
