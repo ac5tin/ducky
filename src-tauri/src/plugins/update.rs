@@ -417,12 +417,15 @@ fn load_store(plugins_dir: &Path) -> Result<InstallStore, String> {
 ///
 /// 1. Missing `package/` and `package.rollback-tmp` → that dir is the new
 ///    bytes. Rename it to `package/` and leave every other dir alone.
-/// 2. Any `package.held-*` → the parked rollback source. If `package/` is
-///    missing, the `package.previous-*` dir for `previous_version` holds the
-///    live tree: rename it back first. Then rename the single held dir to
-///    that same name. The suffix is `previous_dir_suffix` of
-///    `previous_version`. More than one held dir, or an existing
-///    destination, is named and left in place.
+/// 2. Any `package.held-*`. If `package/` and the matching
+///    `package.previous-*` both exist, that previous dir is the recorded
+///    rollback source. Every held dir is superseded residue: remove it, or
+///    rename it to `package.superseded-*`, then continue. Do not rename a
+///    held dir onto that previous dir. Otherwise one held dir is the
+///    rollback source. If `package/` is missing, rename the matching
+///    previous dir back to `package/` first, then rename the held dir to
+///    that name. More than one held dir, and no matching previous beside a
+///    live package, is named and left in place.
 /// 3. One `package.previous-*` whose suffix differs → mid-apply kill.
 ///    Rename it to `package/`.
 /// 4. One matching suffix and no held dir → the recorded rollback source.
@@ -534,14 +537,26 @@ fn list_prefixed(plugin_dir: &Path, prefix: &str) -> Result<Vec<PathBuf>, String
     Ok(found)
 }
 
-/// `held` is the dir `hold_existing` parked. Put it back at the
-/// `package.previous-*` dir for `previous_version`. Never delete that dir.
+/// `held` is the dir `hold_existing` parked. If the matching
+/// `package.previous-*` already sits beside `package/`, it is the recorded
+/// rollback source and every held dir is residue. Otherwise put the single
+/// held dir back at that previous path. Never delete a `package.previous-*`.
 fn restore_held_rollback_source(
     plugin_dir: &Path,
     live: &Path,
     record: &InstallRecord,
     held: &[PathBuf],
 ) -> Result<(), String> {
+    let suffix = previous_dir_suffix(record.previous_version.as_deref().unwrap_or("unknown"));
+    let previous = plugin_dir.join(format!("package.previous-{suffix}"));
+    // A matching previous dir beside the live package is the record's
+    // rollback source. Held dirs are older residue. Do not rename onto it.
+    if live.is_dir() && previous.is_dir() {
+        for path in held {
+            discard_superseded(path)?;
+        }
+        return Ok(());
+    }
     if held.len() != 1 {
         let names = held
             .iter()
@@ -554,8 +569,6 @@ fn restore_held_rollback_source(
         ));
     }
     let held = &held[0];
-    let suffix = previous_dir_suffix(record.previous_version.as_deref().unwrap_or("unknown"));
-    let previous = plugin_dir.join(format!("package.previous-{suffix}"));
     if !live.is_dir() {
         if !previous.is_dir() {
             return Err(format!(
@@ -572,13 +585,6 @@ fn restore_held_rollback_source(
             )
         })?;
     }
-    if previous.exists() {
-        return Err(format!(
-            "will not overwrite {}; {} left in place",
-            previous.display(),
-            held.display()
-        ));
-    }
     std::fs::rename(held, &previous).map_err(|err| {
         format!(
             "cannot restore {} to {}: {err}",
@@ -588,8 +594,32 @@ fn restore_held_rollback_source(
     })
 }
 
+/// Remove a superseded held dir. If the delete fails, park it under a name
+/// that recovery does not treat as a rollback source.
+fn discard_superseded(held: &Path) -> Result<(), String> {
+    if std::fs::remove_dir_all(held).is_ok() || !held.exists() {
+        return Ok(());
+    }
+    let parked = held.with_file_name(format!(
+        "package.superseded-{}-{}",
+        std::process::id(),
+        STAGING_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    // ponytail: if the parent is not writable, the rename fails and the
+    // residue still blocks. No third strategy.
+    std::fs::rename(held, &parked).map_err(|err| {
+        format!(
+            "cannot remove superseded {} or move it to {}: {err}",
+            held.display(),
+            parked.display()
+        )
+    })
+}
+
 /// `live` → `previous`, then `staged` → `live`. An existing previous dir is
-/// held, not deleted, until the new `package/` rename succeeds.
+/// held until the new `package/` rename succeeds, then removed. A delete
+/// that fails is parked as `package.superseded-*`. Do not return `Ok` while
+/// that dir is still `package.held-*`.
 fn swap_in(live: &Path, previous: &Path, staged: &Path) -> Result<(), String> {
     if !live.is_dir() {
         return Err(format!("package {} is missing", live.display()));
@@ -621,7 +651,7 @@ fn swap_in(live: &Path, previous: &Path, staged: &Path) -> Result<(), String> {
         ));
     }
     if let Some(held) = held {
-        let _ = std::fs::remove_dir_all(held);
+        discard_superseded(&held)?;
     }
     Ok(())
 }

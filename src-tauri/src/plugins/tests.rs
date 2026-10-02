@@ -3512,6 +3512,40 @@ fn park_rollback_in_held(root: &Path) -> (std::path::PathBuf, InstallRecord) {
     (plugins, record)
 }
 
+/// Kill after `staged` → `package/` and before the held delete.
+/// `package/` is the unrecorded new tree. `package.previous-unknown` is the
+/// recorded live tree. `package.held-99-1` is the older rollback source.
+/// The suffix matches `previous_version`.
+fn collision_kill_after_staged(root: &Path) -> (std::path::PathBuf, InstallRecord) {
+    let source = root.join("source");
+    unversioned_package(&source, "demo-plugin", "old-bytes");
+    let plugins = root.join("plugins");
+    let mut store = InstallStore::load(&plugins);
+    let mut record = install(&mut store, &plugins, &path_source(&source), None, None).unwrap();
+    unversioned_package(&source, "demo-plugin", "live-bytes");
+    apply(&mut record, &plugins, None, false).unwrap();
+    let id_dir = plugins.join(&record.id);
+    let package = id_dir.join("package");
+    let previous = id_dir.join("package.previous-unknown");
+    let held = id_dir.join("package.held-99-1");
+    assert_eq!(record.version.as_deref(), Some("unknown"));
+    assert_eq!(record.previous_version.as_deref(), Some("unknown"));
+    std::fs::rename(&previous, &held).unwrap();
+    std::fs::rename(&package, &previous).unwrap();
+    let staged = root.join("killed-staged");
+    unversioned_package(&staged, "demo-plugin", "new-bytes");
+    std::fs::rename(&staged, &package).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(previous.join("marker.txt")).unwrap(),
+        "live-bytes"
+    );
+    assert_eq!(
+        std::fs::read_to_string(held.join("marker.txt")).unwrap(),
+        "old-bytes"
+    );
+    (plugins, record)
+}
+
 fn saved_plugin<'a>(id: &str, store: &'a InstallStore) -> &'a InstallRecord {
     store.records.iter().find(|item| item.id == id).unwrap()
 }
@@ -3552,10 +3586,7 @@ fn recovery_restores_live_tree_when_unknown_suffixes_collide() {
 
     let err = apply(&mut record, &plugins, None, false).unwrap_err();
 
-    assert!(
-        !err.contains("recorded rollback source"),
-        "{err}"
-    );
+    assert!(!err.contains("recorded rollback source"), "{err}");
     assert_eq!(
         std::fs::read_to_string(package.join("marker.txt")).unwrap(),
         "new-bytes",
@@ -3689,9 +3720,11 @@ fn rollback_tmp_wins_over_held_and_previous() {
     assert_eq!(record.previous_version.as_deref(), Some("1.0.0"), "{err}");
 }
 
-/// A held dir must not replace an existing `package.previous-<suffix>`.
+/// A leftover held dir beside the matching previous dir is residue.
+/// Recovery removes it. It does not replace that previous dir, and it does
+/// not block `apply` or `rollback`.
 #[test]
-fn recovery_refuses_overwrite_when_previous_dir_exists() {
+fn recovery_drops_held_when_matching_previous_exists() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
     versioned_package(&source, "demo-plugin", "1.0.0", "old-bytes");
@@ -3703,26 +3736,213 @@ fn recovery_refuses_overwrite_when_previous_dir_exists() {
     let id_dir = plugins.join(&record.id);
     let package = id_dir.join("package");
     let previous = id_dir.join("package.previous-1.0.0");
-    let held = id_dir.join("package.held-7-3");
-    write(&held, "marker.txt", "stranded");
+    let held_a = id_dir.join("package.held-7-3");
+    let held_b = id_dir.join("package.held-8-1");
+    write(&held_a, "marker.txt", "stranded");
+    write(&held_b, "marker.txt", "also-stranded");
+    std::fs::remove_dir_all(&source).unwrap();
+    let version = record.version.clone();
+    let previous_version = record.previous_version.clone();
 
-    let err = rollback(&mut record, &plugins).unwrap_err();
+    let err = apply(&mut record, &plugins, None, false).unwrap_err();
 
-    assert!(err.contains("will not overwrite"), "{err}");
+    assert!(!err.contains("will not overwrite"), "{err}");
+    assert!(!err.contains("more than one held"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(package.join("marker.txt")).unwrap(),
+        "new-bytes",
+        "{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(previous.join("marker.txt")).unwrap(),
+        "old-bytes",
+        "{err}"
+    );
+    assert!(!held_a.exists(), "{err}");
+    assert!(!held_b.exists(), "{err}");
+    assert_eq!(count_held(&id_dir), 0, "{err}");
+    assert_eq!(record.version, version, "{err}");
+    assert_eq!(record.previous_version, previous_version, "{err}");
+
+    rollback(&mut record, &plugins).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(package.join("marker.txt")).unwrap(),
+        "old-bytes"
+    );
+    assert!(!previous.exists());
+    assert_eq!(record.version.as_deref(), Some("1.0.0"));
+    assert!(record.previous_version.is_none());
+}
+
+/// Collision kill after `staged` → `package/` and before the held delete.
+/// Recovery drops the stale held dir and leaves the other two trees.
+/// `apply` then continues. `force` is set because the killed `package/`
+/// does not match `tree_hash` (design §7).
+#[test]
+fn apply_heals_collision_kill_before_held_delete() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (plugins, mut record) = collision_kill_after_staged(tmp.path());
+    let id_dir = plugins.join(&record.id);
+    let package = id_dir.join("package");
+    let previous = id_dir.join("package.previous-unknown");
+    let held = id_dir.join("package.held-99-1");
+    std::fs::remove_dir_all(tmp.path().join("source")).unwrap();
+    let version = record.version.clone();
+    let previous_version = record.previous_version.clone();
+
+    let err = apply(&mut record, &plugins, None, true).unwrap_err();
+
+    assert!(!err.contains("will not overwrite"), "{err}");
+    assert!(!err.contains("recorded rollback source"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(package.join("marker.txt")).unwrap(),
+        "new-bytes",
+        "{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(previous.join("marker.txt")).unwrap(),
+        "live-bytes",
+        "{err}"
+    );
+    assert!(!held.exists(), "{err}");
+    assert_eq!(count_held(&id_dir), 0, "{err}");
+    assert_eq!(count_prefixed(&id_dir, "package.superseded-"), 0, "{err}");
+    assert_eq!(record.version, version, "{err}");
+    assert_eq!(record.previous_version, previous_version, "{err}");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (plugins, mut record) = collision_kill_after_staged(tmp.path());
+    let id_dir = plugins.join(&record.id);
+    let err = apply(&mut record, &plugins, None, false).unwrap_err();
+    assert!(err.contains("modified locally"), "{err}");
+    assert!(!err.contains("will not overwrite"), "{err}");
+    assert_eq!(count_held(&id_dir), 0, "{err}");
+    assert_eq!(
+        std::fs::read_to_string(id_dir.join("package/marker.txt")).unwrap(),
+        "new-bytes",
+        "{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(id_dir.join("package.previous-unknown/marker.txt")).unwrap(),
+        "live-bytes",
+        "{err}"
+    );
+    unversioned_package(&tmp.path().join("source"), "demo-plugin", "fetched-bytes");
+
+    apply(&mut record, &plugins, None, true).unwrap();
+
+    assert_eq!(count_held(&id_dir), 0);
+    assert!(!id_dir.join("package.held-99-1").exists());
+    assert_eq!(
+        std::fs::read_to_string(id_dir.join("package/marker.txt")).unwrap(),
+        "fetched-bytes"
+    );
+    assert_eq!(
+        std::fs::read_to_string(id_dir.join("package.previous-unknown/marker.txt")).unwrap(),
+        "new-bytes"
+    );
+    rollback(&mut record, &plugins).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(id_dir.join("package/marker.txt")).unwrap(),
+        "new-bytes"
+    );
+}
+
+/// Same three-tree kill. `rollback` continues and restores the previous
+/// tree, not the held bytes.
+#[test]
+fn rollback_heals_collision_kill_before_held_delete() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (plugins, mut record) = collision_kill_after_staged(tmp.path());
+    let id_dir = plugins.join(&record.id);
+    let package = id_dir.join("package");
+    let previous = id_dir.join("package.previous-unknown");
+    let held = id_dir.join("package.held-99-1");
+
+    rollback(&mut record, &plugins).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(package.join("marker.txt")).unwrap(),
+        "live-bytes"
+    );
+    assert!(!previous.exists());
+    assert!(!held.exists());
+    assert_eq!(count_held(&id_dir), 0);
+    assert_eq!(record.version.as_deref(), Some("unknown"));
+    assert!(record.previous_version.is_none());
+    let loaded = InstallStore::load(&plugins);
+    let saved = saved_plugin(&record.id, &loaded);
+    assert_eq!(saved.version.as_deref(), Some("unknown"));
+    assert!(saved.previous_version.is_none());
+}
+
+/// A collision update whose held delete fails must still finish, and later
+/// `apply` and `rollback` must work. Mode `0o555` makes `remove_dir_all` fail.
+#[cfg(unix)]
+#[test]
+fn collision_update_parks_undeletable_held() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    unversioned_package(&source, "demo-plugin", "old-bytes");
+    let plugins = tmp.path().join("plugins");
+    let mut store = InstallStore::load(&plugins);
+    let mut record = install(&mut store, &plugins, &path_source(&source), None, None).unwrap();
+    unversioned_package(&source, "demo-plugin", "live-bytes");
+    apply(&mut record, &plugins, None, false).unwrap();
+    let id_dir = plugins.join(&record.id);
+    let previous = id_dir.join("package.previous-unknown");
+    std::fs::set_permissions(&previous, std::fs::Permissions::from_mode(0o555)).unwrap();
+    unversioned_package(&source, "demo-plugin", "new-bytes");
+
+    apply(&mut record, &plugins, None, false).unwrap();
+
+    let package = id_dir.join("package");
+    let previous = id_dir.join("package.previous-unknown");
     assert_eq!(
         std::fs::read_to_string(package.join("marker.txt")).unwrap(),
         "new-bytes"
     );
     assert_eq!(
         std::fs::read_to_string(previous.join("marker.txt")).unwrap(),
+        "live-bytes"
+    );
+    assert_eq!(count_held(&id_dir), 0);
+    assert_eq!(record.version.as_deref(), Some("unknown"));
+    assert_eq!(record.previous_version.as_deref(), Some("unknown"));
+    let superseded = std::fs::read_dir(&id_dir)
+        .unwrap()
+        .flatten()
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("package.superseded-")
+                && entry.path().is_dir()
+        })
+        .map(|entry| entry.path())
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(superseded.join("marker.txt")).unwrap(),
         "old-bytes"
     );
+
+    rollback(&mut record, &plugins).unwrap();
     assert_eq!(
-        std::fs::read_to_string(held.join("marker.txt")).unwrap(),
-        "stranded"
+        std::fs::read_to_string(package.join("marker.txt")).unwrap(),
+        "live-bytes"
     );
-    assert_eq!(record.version.as_deref(), Some("1.1.0"));
-    assert_eq!(record.previous_version.as_deref(), Some("1.0.0"));
+    assert!(record.previous_version.is_none());
+
+    unversioned_package(&source, "demo-plugin", "again-bytes");
+    apply(&mut record, &plugins, None, false).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(package.join("marker.txt")).unwrap(),
+        "again-bytes"
+    );
+    assert_eq!(count_held(&id_dir), 0);
+    let _ = std::fs::set_permissions(&superseded, std::fs::Permissions::from_mode(0o755));
 }
 
 #[test]
