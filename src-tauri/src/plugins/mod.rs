@@ -31,9 +31,11 @@ pub mod layout;
 pub mod manifest;
 pub mod marketplace;
 pub mod path;
+pub mod update;
 
 pub use install::{AvailableUpdate, InstallRecord, InstallStore, PluginStatus, UpdatePolicy};
 pub use marketplace::MarketplaceRecord;
+pub use update::UpdateOutcome;
 
 #[cfg(test)]
 mod tests;

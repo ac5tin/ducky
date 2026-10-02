@@ -8,14 +8,15 @@ use std::sync::{Arc, Mutex};
 use super::diagnostics::DiagLevel;
 use super::install::{
     assign_id, derive_policy, fetch_to_staging, install, package_dir, resolve_version, uninstall,
-    InstallRecord, InstallStore, PluginStatus, UpdatePolicy,
+    AvailableUpdate, InstallRecord, InstallStore, PluginStatus, UpdatePolicy,
 };
 use super::layout::{discover, PluginTransport, RemoteKind};
 use super::manifest::{load, Layout};
 use super::marketplace::{
-    parse_git_remote, parse_registry, parse_source, refresh, Change, HttpClient, HttpResponse,
-    MarketplaceRecord, MarketplaceStore, PluginSource,
+    parse_git_remote, parse_registry, parse_source, refresh, Change, Entry, HttpClient,
+    HttpResponse, MarketplaceRecord, MarketplaceStore, PluginSource, Registry,
 };
+use super::update::{apply, check_one, rollback, tree_hash};
 
 const SPEC_100: &str = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
 
@@ -2585,5 +2586,386 @@ fn install_keeps_in_root_symlink() {
             .file_type()
             .is_symlink(),
         "in-root link was copied as a file"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Update engine (design §7)
+// ---------------------------------------------------------------------------
+
+/// A local package whose manifest version and marker file the update tests read.
+fn versioned_package(root: &Path, name: &str, version: &str, marker: &str) {
+    write(
+        root,
+        "plugin.json",
+        &agent_manifest(name, &format!(r#", "version": "{version}""#)),
+    );
+    write_skill(root, "skills/demo", "demo");
+    write(root, "marker.txt", marker);
+}
+
+fn test_entry(name: &str, version: Option<&str>, source: PluginSource) -> Entry {
+    Entry {
+        name: name.to_string(),
+        display_name: None,
+        description: None,
+        version: version.map(str::to_string),
+        category: None,
+        tags: Vec::new(),
+        author: None,
+        homepage: None,
+        icon: None,
+        keywords: Vec::new(),
+        source,
+        available: true,
+        reason: None,
+    }
+}
+
+fn test_registry(entry: Entry) -> Registry {
+    Registry {
+        name: "test".to_string(),
+        description: None,
+        owner: None,
+        entries: vec![entry],
+        registry_path: std::path::PathBuf::new(),
+    }
+}
+
+#[test]
+fn tree_hash_stable_and_detects_edit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let package = tmp.path();
+    write(package, "nested/a.txt", "alpha");
+    write(package, "b.txt", "beta");
+
+    let first = tree_hash(package).expect("hash");
+    assert!(first.starts_with("sha256:"));
+    assert_eq!(first.len(), "sha256:".len() + 64);
+    assert!(first["sha256:".len()..]
+        .chars()
+        .all(|c| c.is_ascii_hexdigit()));
+    assert_eq!(tree_hash(package).as_deref(), Some(first.as_str()));
+
+    std::fs::write(package.join("nested/a.txt"), "changed").unwrap();
+    assert_ne!(tree_hash(package).as_deref(), Some(first.as_str()));
+}
+
+#[test]
+fn tree_hash_none_when_too_large() {
+    let tmp = tempfile::tempdir().unwrap();
+    for index in 0..2000 {
+        write(tmp.path(), &format!("f{index}.txt"), "x");
+    }
+    assert!(tree_hash(tmp.path()).is_some(), "2000 files still hash");
+
+    write(tmp.path(), "f2000.txt", "x");
+    assert_eq!(tree_hash(tmp.path()), None);
+}
+
+#[test]
+fn update_detected_on_registry_version_bump() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut record = install_record("demo", "demo", path_source(tmp.path()));
+    record.version = Some("1.0.0".to_string());
+    let registry = test_registry(test_entry("demo", Some("1.1.0"), path_source(tmp.path())));
+
+    let found = check_one(&mut record, Some(&registry), tmp.path()).unwrap();
+
+    assert_eq!(
+        found.and_then(|update| update.version).as_deref(),
+        Some("1.1.0")
+    );
+    assert_eq!(record.status, PluginStatus::UpdateAvailable);
+    assert_eq!(
+        record
+            .available_update
+            .as_ref()
+            .and_then(|update| update.version.as_deref()),
+        Some("1.1.0")
+    );
+    assert!(record.last_checked_at.is_some());
+}
+
+#[test]
+fn no_update_when_versions_equal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut record = install_record("demo", "demo", path_source(tmp.path()));
+    record.version = Some("1.0.0".to_string());
+    record.status = PluginStatus::UpdateAvailable;
+    record.available_update = Some(AvailableUpdate {
+        version: Some("0.9.0".to_string()),
+        resolved_sha: None,
+    });
+    let registry = test_registry(test_entry("demo", Some("1.0.0"), path_source(tmp.path())));
+
+    let found = check_one(&mut record, Some(&registry), tmp.path()).unwrap();
+
+    assert_eq!(found, None);
+    assert_eq!(record.available_update, None);
+    assert_ne!(record.status, PluginStatus::UpdateAvailable);
+}
+
+#[test]
+fn update_detected_by_ls_remote_sha() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    git_init(&repo);
+    write(&repo, "plugin.json", &agent_manifest("remote-plugin", ""));
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-m", "first"]);
+    let first = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["checkout", "-b", "update"]);
+    write(&repo, "marker.txt", "second");
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-m", "second"]);
+    let second = git(&repo, &["rev-parse", "HEAD"]);
+    git(&repo, &["checkout", "main"]);
+
+    let source = PluginSource::Git {
+        url: file_url(&repo),
+        path: None,
+        git_ref: Some("update".to_string()),
+        sha: None,
+    };
+    let mut record = install_record("remote-plugin", "remote-plugin", source);
+    record.version = Some(first.chars().take(12).collect());
+    record.resolved_sha = Some(first);
+
+    let found = check_one(&mut record, None, tmp.path()).unwrap();
+
+    let sha = found.and_then(|update| update.resolved_sha).expect("sha");
+    assert_eq!(sha, second);
+    assert_eq!(sha.len(), 40);
+    assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+    assert_eq!(record.status, PluginStatus::UpdateAvailable);
+    assert_eq!(
+        record
+            .available_update
+            .as_ref()
+            .and_then(|update| update.resolved_sha.as_deref()),
+        Some(sha.as_str())
+    );
+}
+
+#[test]
+fn apply_swaps_and_keeps_previous() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    versioned_package(&source, "demo-plugin", "1.0.0", "old-bytes");
+    let plugins = tmp.path().join("plugins");
+    let mut store = InstallStore::load(&plugins);
+    let mut record = install(&mut store, &plugins, &path_source(&source), None, None).unwrap();
+    let id_dir = plugins.join(&record.id);
+    let package = id_dir.join("package");
+    let before = tree_hash(&package);
+    record.tree_hash = before.clone();
+    write(&id_dir.join("package.previous-0.9.0"), "stale.txt", "stale");
+    versioned_package(&source, "demo-plugin", "1.1.0", "new-bytes");
+
+    let outcome = apply(&mut record, &plugins, None, false).unwrap();
+
+    assert_eq!(outcome.from.as_deref(), Some("1.0.0"));
+    assert_eq!(outcome.to.as_deref(), Some("1.1.0"));
+    assert!(!outcome.modified_locally);
+    assert_eq!(
+        std::fs::read_to_string(package.join("marker.txt")).unwrap(),
+        "new-bytes"
+    );
+    assert_eq!(
+        std::fs::read_to_string(id_dir.join("package.previous-1.0.0/marker.txt")).unwrap(),
+        "old-bytes"
+    );
+    assert!(!id_dir.join("package.previous-0.9.0").exists());
+    let refreshed = record.tree_hash.clone().expect("tree_hash refreshed");
+    assert!(refreshed.starts_with("sha256:"));
+    assert_ne!(Some(refreshed.clone()), before);
+    assert_eq!(tree_hash(&package).as_deref(), Some(refreshed.as_str()));
+    assert_eq!(record.version.as_deref(), Some("1.1.0"));
+    assert_eq!(record.previous_version.as_deref(), Some("1.0.0"));
+    let loaded = InstallStore::load(&plugins);
+    let saved = loaded
+        .records
+        .iter()
+        .find(|item| item.id == record.id)
+        .unwrap();
+    assert_eq!(saved.version.as_deref(), Some("1.1.0"));
+    assert_eq!(saved.previous_version.as_deref(), Some("1.0.0"));
+    assert_eq!(saved.tree_hash.as_deref(), Some(refreshed.as_str()));
+}
+
+#[test]
+fn apply_is_atomic_on_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    versioned_package(&source, "demo-plugin", "1.0.0", "old-bytes");
+    let plugins = tmp.path().join("plugins");
+    let mut store = InstallStore::load(&plugins);
+    let mut record = install(&mut store, &plugins, &path_source(&source), None, None).unwrap();
+    let package = plugins.join(&record.id).join("package");
+    record.tree_hash = tree_hash(&package);
+    let before_version = record.version.clone();
+    let before_sha = record.resolved_sha.clone();
+    let bad = tmp.path().join("bad");
+    std::fs::create_dir_all(&bad).unwrap();
+    let entry = test_entry("demo-plugin", Some("9.9.9"), path_source(&bad));
+
+    let err = apply(&mut record, &plugins, Some(&entry), false).unwrap_err();
+
+    assert!(!err.is_empty(), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(package.join("marker.txt")).unwrap(),
+        "old-bytes"
+    );
+    assert!(!plugins
+        .join(&record.id)
+        .join("package.previous-1.0.0")
+        .exists());
+    assert_eq!(record.version, before_version);
+    assert_eq!(record.resolved_sha, before_sha);
+    assert_eq!(record.previous_version, None);
+    let loaded = InstallStore::load(&plugins);
+    assert_eq!(loaded.records[0].version.as_deref(), Some("1.0.0"));
+}
+
+#[test]
+fn apply_blocked_when_modified_locally() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    versioned_package(&source, "demo-plugin", "1.0.0", "old-bytes");
+    let plugins = tmp.path().join("plugins");
+    let mut store = InstallStore::load(&plugins);
+    let mut record = install(&mut store, &plugins, &path_source(&source), None, None).unwrap();
+    let package = plugins.join(&record.id).join("package");
+    record.tree_hash = tree_hash(&package);
+    record.update_policy = UpdatePolicy::Auto;
+    std::fs::write(package.join("marker.txt"), "local-edit").unwrap();
+    versioned_package(&source, "demo-plugin", "1.1.0", "upstream");
+
+    let err = apply(&mut record, &plugins, None, false).unwrap_err();
+
+    assert!(err.contains("modified locally"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(package.join("marker.txt")).unwrap(),
+        "local-edit"
+    );
+    assert_eq!(record.status, PluginStatus::ModifiedLocally);
+    assert_eq!(record.version.as_deref(), Some("1.0.0"));
+    assert!(!plugins
+        .join(&record.id)
+        .join("package.previous-1.0.0")
+        .exists());
+}
+
+#[test]
+fn apply_overwrites_when_forced() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    versioned_package(&source, "demo-plugin", "1.0.0", "old-bytes");
+    let plugins = tmp.path().join("plugins");
+    let mut store = InstallStore::load(&plugins);
+    let mut record = install(&mut store, &plugins, &path_source(&source), None, None).unwrap();
+    let package = plugins.join(&record.id).join("package");
+    record.tree_hash = tree_hash(&package);
+    record.update_policy = UpdatePolicy::Auto;
+    std::fs::write(package.join("marker.txt"), "local-edit").unwrap();
+    versioned_package(&source, "demo-plugin", "1.1.0", "upstream");
+
+    let outcome = apply(&mut record, &plugins, None, true).unwrap();
+
+    assert!(outcome.modified_locally);
+    assert_eq!(
+        std::fs::read_to_string(package.join("marker.txt")).unwrap(),
+        "upstream"
+    );
+    assert_eq!(
+        std::fs::read_to_string(
+            plugins
+                .join(&record.id)
+                .join("package.previous-1.0.0/marker.txt")
+        )
+        .unwrap(),
+        "local-edit"
+    );
+}
+
+#[test]
+fn rollback_restores_previous() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    versioned_package(&source, "demo-plugin", "1.0.0", "old-bytes");
+    let plugins = tmp.path().join("plugins");
+    let mut store = InstallStore::load(&plugins);
+    let mut record = install(&mut store, &plugins, &path_source(&source), None, None).unwrap();
+    let id_dir = plugins.join(&record.id);
+    let package = id_dir.join("package");
+    record.tree_hash = tree_hash(&package);
+    versioned_package(&source, "demo-plugin", "1.1.0", "new-bytes");
+    apply(&mut record, &plugins, None, false).unwrap();
+
+    rollback(&mut record, &plugins).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(package.join("marker.txt")).unwrap(),
+        "old-bytes"
+    );
+    assert_eq!(record.version.as_deref(), Some("1.0.0"));
+    assert_eq!(record.previous_version, None);
+    assert!(!id_dir.join("package.previous-1.0.0").exists());
+    let loaded = InstallStore::load(&plugins);
+    assert_eq!(loaded.records[0].version.as_deref(), Some("1.0.0"));
+    assert_eq!(loaded.records[0].previous_version, None);
+}
+
+#[test]
+fn rollback_without_previous_is_a_clear_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    versioned_package(&source, "demo-plugin", "1.0.0", "old-bytes");
+    let plugins = tmp.path().join("plugins");
+    let mut store = InstallStore::load(&plugins);
+    let mut record = install(&mut store, &plugins, &path_source(&source), None, None).unwrap();
+    let package = plugins.join(&record.id).join("package");
+
+    let err = rollback(&mut record, &plugins).unwrap_err();
+
+    assert!(err.to_lowercase().contains("previous"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(package.join("marker.txt")).unwrap(),
+        "old-bytes"
+    );
+    assert_eq!(record.version.as_deref(), Some("1.0.0"));
+    assert_eq!(record.previous_version, None);
+}
+
+#[test]
+fn apply_reconnects_only_owned_servers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    versioned_package(&source, "with-server", "1.0.0", "old");
+    write(
+        &source,
+        "mcp.json",
+        &format!(
+            r#"{{"$schema": "{SPEC_100}", "mcpServers": {{"alpha": {{"type": "stdio", "command": "node"}}, "beta": {{"type": "stdio", "command": "node"}}}}}}"#
+        ),
+    );
+    let plugins = tmp.path().join("plugins");
+    let mut store = InstallStore::load(&plugins);
+    let mut record = install(&mut store, &plugins, &path_source(&source), None, None).unwrap();
+    record.disabled_servers = vec!["beta".to_string(), "not-owned".to_string()];
+    write(
+        &source,
+        "mcp.json",
+        &format!(
+            r#"{{"$schema": "{SPEC_100}", "mcpServers": {{"gamma": {{"type": "stdio", "command": "node"}}}}}}"#
+        ),
+    );
+
+    let outcome = apply(&mut record, &plugins, None, false).unwrap();
+
+    assert_eq!(
+        outcome.enabled_servers,
+        vec![format!("plugin:{}:alpha", record.id)]
     );
 }
