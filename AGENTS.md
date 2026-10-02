@@ -36,7 +36,7 @@ Rust 1.85+ required (`rust-version` in Cargo.toml). Linux builds need `webkit2gt
   `docs/adr/0004-trust-mcp-readonly-hint-for-readonly-modes.md`.
 - `src-tauri/src/mcp/` — `manager.rs` (one rmcp client per server, caches, subscriptions), `handler.rs` (client capabilities: elicitation/sampling/roots), `bridge.rs` (interactive approvals ↔ UI events), `tests.rs`.
 - `src-tauri/src/providers/` — `openai.rs` + `anthropic.rs` adapters.
-- Also: `config.rs` (AppConfig + secrets), `oauth.rs` (OAuth 2.1 for remote MCP servers), `terminal.rs` (portable-pty), `builtin/` (built-in fs/html/web tools), `catalog.rs`, `title.rs`, `compact.rs` (`/compact` + auto-compaction summarisation — see ADR-0007), `snapshot.rs` (hidden git repos backing `/undo` — see ADR-0002).
+- Also: `config.rs` (AppConfig + secrets), `oauth.rs` (OAuth 2.1 for remote MCP servers), `terminal.rs` (portable-pty), `builtin/` (built-in fs/html/web tools), `catalog.rs`, `title.rs`, `compact.rs` (`/compact` + auto-compaction summarisation — see ADR-0008), `snapshot.rs` (hidden git repos backing `/undo` — see ADR-0002).
 - Slash commands (`/compact`, `/undo`, `/init`) are parsed in `src/slashCommands.ts` and routed in `store.ts` `send()` before the busy-queue branch; their design is in `docs/adr/0002-slash-commands-undo-compact.md`.
 
 ## Rules & gotchas

@@ -1,4 +1,4 @@
-# ADR-0007: Auto-compaction at a context-window threshold
+# ADR-0008: Auto-compaction at a context-window threshold
 
 - **Status:** Accepted
 - **Date:** 2026-10-01

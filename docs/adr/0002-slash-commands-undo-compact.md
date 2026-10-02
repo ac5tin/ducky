@@ -90,7 +90,7 @@ conversation file). `chat_send`, `conversation_compact`, and
 
 ## Revisit when
 
-- Auto-compaction at a token threshold — **done in ADR-0007** (2026-10-01).
+- Auto-compaction at a token threshold — **done in ADR-0008** (2026-10-01).
   That ADR also replaced the summary shape and the cut: the newest user turn
   now stays, and file paths, preferences and unresolved errors are produced by
   code instead of by the model.
