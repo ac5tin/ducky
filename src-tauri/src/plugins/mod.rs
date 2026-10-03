@@ -28,6 +28,7 @@ pub use diagnostics::{DiagLevel, Diagnostic};
 
 pub mod install;
 pub mod layout;
+pub mod manager;
 pub mod manifest;
 pub mod marketplace;
 pub mod path;

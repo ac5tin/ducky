@@ -702,7 +702,7 @@ async fn refresh_inner(
 /// Re-read a local registry in place; nothing is copied or fetched.
 fn refresh_path(record: &mut MarketplaceRecord, source: &Path) -> Result<RefreshOutcome, String> {
     let registry = if source.is_file() {
-        parse_snapshot(source)?
+        parse_registry_file(source)?
     } else {
         parse_registry(source).map_err(join_diagnostics)?
     };
@@ -734,7 +734,7 @@ async fn refresh_url(
     let snapshot = snapshot_dir.join("registry.json");
     // Validators only help while the cached body is readable; a missing or
     // corrupt snapshot refetches in full instead of answering 304 forever.
-    let cached = parse_snapshot(&snapshot).ok();
+    let cached = parse_registry_file(&snapshot).ok();
     let meta = if cached.is_some() {
         load_meta(&snapshot_dir.join("registry.meta.json"))
     } else {
@@ -787,7 +787,11 @@ async fn refresh_url(
     })
 }
 
-fn parse_snapshot(path: &Path) -> Result<Registry, String> {
+/// Parse a registry JSON file at an exact path.
+///
+/// The probe order applies to directories; a `Path` marketplace source that
+/// is a file, a URL snapshot and the bundled resource are read exactly here.
+pub(crate) fn parse_registry_file(path: &Path) -> Result<Registry, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
     parse_registry_text(&text, &path.display().to_string(), path.to_path_buf())

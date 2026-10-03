@@ -245,6 +245,50 @@ fn default_update_check_interval_hours() -> u32 {
     6
 }
 
+/// Default policy for newly installed plugins (design §3).
+///
+/// `Content` keeps the content-derived policy of `install::derive_policy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PolicyDefault {
+    #[default]
+    Content,
+    Auto,
+    Manual,
+}
+
+/// Plugin settings (design §3). Every field defaults; there is no migration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PluginSettings {
+    /// Master switch for the skills block in the system prompt and the skill tools.
+    #[serde(default = "default_true")]
+    pub skills_enabled: bool,
+    /// Default policy for newly installed plugins.
+    #[serde(default)]
+    pub policy_default: PolicyDefault,
+    /// 0 = never refresh automatically.
+    #[serde(default = "default_plugin_hours")]
+    pub marketplace_refresh_hours: u32,
+    /// 0 = never check automatically.
+    #[serde(default = "default_plugin_hours")]
+    pub update_check_hours: u32,
+}
+
+fn default_plugin_hours() -> u32 {
+    6
+}
+
+impl Default for PluginSettings {
+    fn default() -> Self {
+        Self {
+            skills_enabled: true,
+            policy_default: PolicyDefault::Content,
+            marketplace_refresh_hours: default_plugin_hours(),
+            update_check_hours: default_plugin_hours(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     pub theme: Theme,
@@ -301,6 +345,9 @@ pub struct AppSettings {
     /// conversation, so changing it never affects existing chats.
     #[serde(default)]
     pub default_mode: AgentMode,
+    /// Plugin settings (design §3).
+    #[serde(default)]
+    pub plugins: PluginSettings,
 }
 
 impl Default for AppSettings {
@@ -325,6 +372,7 @@ impl Default for AppSettings {
             update_check_interval_hours: default_update_check_interval_hours(),
             system_prompt: String::new(),
             default_mode: AgentMode::Default,
+            plugins: PluginSettings::default(),
         }
     }
 }

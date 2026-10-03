@@ -16,7 +16,10 @@ use super::marketplace::{
     parse_git_remote, parse_registry, parse_source, refresh, Change, Entry, HttpClient,
     HttpResponse, MarketplaceRecord, MarketplaceStore, PluginSource, Registry,
 };
+use super::manager::{MarketplaceInput, PluginManager};
 use super::update::{apply, check_one, rollback};
+use crate::config::{PluginSettings, PolicyDefault};
+use crate::events::{BackendEvent, CollectingSink};
 
 const SPEC_100: &str = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
 
@@ -4023,4 +4026,430 @@ fn modified_locally_returns_status_write_error() {
         std::fs::read_to_string(package.join("marker.txt")).unwrap(),
         "local-edit"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Plugin manager: index, marketplaces and settings (design §3, §5, §11)
+// ---------------------------------------------------------------------------
+
+/// A manager rooted at `tmp` with a collecting sink.
+fn test_manager(tmp: &Path, sink: Arc<CollectingSink>) -> Arc<PluginManager> {
+    PluginManager::with_sink(tmp, tmp, None, sink)
+}
+
+/// Install `source` as a package under `tmp/plugins`; the record starts disabled.
+fn seed_installed(tmp: &Path, source: &Path) -> InstallRecord {
+    let plugins_dir = tmp.join("plugins");
+    let mut store = InstallStore::load(&plugins_dir);
+    let record = install(&mut store, &plugins_dir, &path_source(source), None, None).unwrap();
+    store.save(&plugins_dir).unwrap();
+    record
+}
+
+/// Change one field of an install record on disk.
+fn edit_record(tmp: &Path, id: &str, edit: impl FnOnce(&mut InstallRecord)) {
+    let plugins_dir = tmp.join("plugins");
+    let mut store = InstallStore::load(&plugins_dir);
+    edit(store.records.iter_mut().find(|r| r.id == id).unwrap());
+    store.save(&plugins_dir).unwrap();
+}
+
+/// A `mcp.json` declaring one stdio server named `demo`.
+fn write_demo_server(root: &Path) {
+    write(
+        root,
+        "mcp.json",
+        &format!(
+            r#"{{"$schema": "{SPEC_100}", "mcpServers": {{"demo": {{"type": "stdio", "command": "node"}}}}}}"#
+        ),
+    );
+}
+
+#[tokio::test]
+async fn reload_scans_records_into_index() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    plugin_package(&source, "demo-plugin");
+    write_demo_server(&source);
+    let record = seed_installed(tmp.path(), &source);
+    edit_record(tmp.path(), &record.id, |r| r.enabled = true);
+
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+    manager.reload().unwrap();
+
+    let index = manager.index();
+    assert_eq!(index.plugins.len(), 1);
+    assert_eq!(index.plugins[0].id, record.id);
+    assert!(index.plugins[0].enabled);
+    assert_eq!(index.skills.len(), 1);
+    assert_eq!(index.skills[0].name, "demo");
+    assert_eq!(index.servers.len(), 1);
+    assert_eq!(index.servers[0].id, format!("plugin:{}:demo", record.id));
+    assert!(index.subagents.is_empty());
+}
+
+#[tokio::test]
+async fn missing_package_reports_error_status() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    plugin_package(&source, "demo-plugin");
+    let record = seed_installed(tmp.path(), &source);
+    std::fs::remove_dir_all(tmp.path().join("plugins").join(&record.id)).unwrap();
+
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+    manager.reload().unwrap();
+
+    let list = manager.list();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].status, PluginStatus::Error);
+    assert!(
+        list[0]
+            .diagnostics
+            .iter()
+            .any(|d| d.message.to_lowercase().contains("missing")),
+        "{:?}",
+        list[0].diagnostics
+    );
+    let store = InstallStore::load(&tmp.path().join("plugins"));
+    assert_eq!(store.records.len(), 1);
+    assert_eq!(store.records[0].id, record.id);
+}
+
+#[tokio::test]
+async fn disabled_plugin_skills_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    plugin_package(&source, "demo-plugin");
+    seed_installed(tmp.path(), &source);
+
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+    manager.reload().unwrap();
+
+    let index = manager.index();
+    assert_eq!(index.plugins.len(), 1);
+    assert!(!index.plugins[0].enabled);
+    assert!(index.skills.is_empty());
+    assert_eq!(index.plugins[0].skills.len(), 1);
+    assert_eq!(index.plugins[0].skills[0].name, "demo");
+}
+
+#[tokio::test]
+async fn disabled_server_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    plugin_package(&source, "demo-plugin");
+    write_demo_server(&source);
+    let record = seed_installed(tmp.path(), &source);
+    edit_record(tmp.path(), &record.id, |r| {
+        r.enabled = true;
+        r.disabled_servers = vec!["demo".to_string()];
+    });
+
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+    manager.reload().unwrap();
+
+    let index = manager.index();
+    assert!(index.servers.is_empty());
+    assert_eq!(index.plugins[0].servers.len(), 1);
+    assert!(!index.plugins[0].servers[0].enabled);
+}
+
+#[tokio::test]
+async fn debris_in_plugins_dir_is_ignored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    plugin_package(&source, "demo-plugin");
+    seed_installed(tmp.path(), &source);
+    write(tmp.path(), "plugins/stray.txt", "junk");
+    std::fs::create_dir_all(tmp.path().join("plugins/unknown-dir")).unwrap();
+
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+    manager.reload().unwrap();
+
+    assert_eq!(manager.list().len(), 1);
+}
+
+#[tokio::test]
+async fn add_marketplace_local_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let market = tmp.path().join("market");
+    write(
+        &market,
+        ".claude-plugin/marketplace.json",
+        r#"{"name": "Acme", "plugins": [{"name": "demo", "source": "./demo"}]}"#,
+    );
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+
+    let summary = manager
+        .add_marketplace(
+            MarketplaceInput {
+                source: market.display().to_string(),
+            },
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(summary.id, "market");
+    assert_eq!(summary.name, "Acme");
+    assert!(tmp.path().join("marketplaces/marketplaces.json").is_file());
+
+    let catalog = manager.catalog(None).unwrap();
+    assert_eq!(catalog.len(), 1);
+    assert_eq!(catalog[0].name, "demo");
+    assert_eq!(catalog[0].marketplace_id, "market");
+    assert_eq!(catalog[0].source_kind, "path");
+    assert!(catalog[0].installed.is_none());
+    assert!(!catalog[0].update_available);
+}
+
+#[tokio::test]
+async fn install_from_marketplace_resolves_relative_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let market = tmp.path().join("market");
+    write(
+        &market,
+        ".claude-plugin/marketplace.json",
+        r#"{"name": "Acme", "plugins": [{"name": "demo-entry", "source": "./packages/demo"}]}"#,
+    );
+    plugin_package(&market.join("packages/demo"), "demo-plugin");
+
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+    manager
+        .add_marketplace(
+            MarketplaceInput {
+                source: market.display().to_string(),
+            },
+            None,
+        )
+        .unwrap();
+
+    let id = manager
+        .install(
+            Some("market"),
+            Some("demo-entry"),
+            None,
+            PolicyDefault::Content,
+        )
+        .unwrap();
+
+    assert_eq!(id, "demo-plugin");
+    let list = manager.list();
+    assert_eq!(list.len(), 1);
+    match &list[0].source {
+        PluginSource::Path { path } => {
+            assert!(Path::new(path).is_absolute(), "{path}");
+            assert!(path.contains("packages"), "{path}");
+        }
+        other => panic!("expected a path source, got {other:?}"),
+    }
+    assert!(tmp
+        .path()
+        .join("plugins/demo-plugin/package/plugin.json")
+        .is_file());
+}
+
+#[tokio::test]
+async fn add_marketplace_rejects_bundled_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+
+    let err = manager
+        .add_marketplace(
+            MarketplaceInput {
+                source: "acme/tools".to_string(),
+            },
+            Some("ducky-official".to_string()),
+        )
+        .unwrap_err();
+
+    assert!(err.contains("ducky-official"), "{err}");
+    assert!(manager.marketplaces().is_empty());
+}
+
+#[tokio::test]
+async fn remove_marketplace_requires_confirm() {
+    let tmp = tempfile::tempdir().unwrap();
+    let market = tmp.path().join("market");
+    write(
+        &market,
+        "marketplace.json",
+        r#"{"name": "Acme", "plugins": []}"#,
+    );
+
+    // The manager loads its stores at construction: seed the installed plugin
+    // from this marketplace first.
+    let source = tmp.path().join("source");
+    plugin_package(&source, "demo-plugin");
+    let plugins_dir = tmp.path().join("plugins");
+    let mut store = InstallStore::load(&plugins_dir);
+    install(
+        &mut store,
+        &plugins_dir,
+        &path_source(&source),
+        None,
+        Some("market"),
+    )
+    .unwrap();
+    store.save(&plugins_dir).unwrap();
+
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+    let summary = manager
+        .add_marketplace(
+            MarketplaceInput {
+                source: market.display().to_string(),
+            },
+            None,
+        )
+        .unwrap();
+
+    let err = manager.remove_marketplace(&summary.id, false).unwrap_err();
+    assert!(err.contains("confirm"), "{err}");
+    assert_eq!(manager.marketplaces().len(), 1);
+
+    manager.remove_marketplace(&summary.id, true).unwrap();
+    assert!(manager.marketplaces().is_empty());
+}
+
+#[tokio::test]
+async fn bundled_marketplace_cannot_be_removed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = MarketplaceStore::load(&tmp.path().join("marketplaces"));
+    store.records.push(MarketplaceRecord {
+        id: "ducky-official".to_string(),
+        name: "Ducky Official".to_string(),
+        source: PluginSource::Path {
+            path: tmp.path().join("bundled.json").display().to_string(),
+        },
+        registry_path: "bundled.json".to_string(),
+        auto_refresh: false,
+        last_refreshed_at: None,
+        resolved_sha: None,
+        bundled: true,
+        hidden: false,
+        error: None,
+        extra: Default::default(),
+    });
+    store.save(&tmp.path().join("marketplaces")).unwrap();
+
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+    let err = manager
+        .remove_marketplace("ducky-official", true)
+        .unwrap_err();
+    assert!(err.contains("bundled"), "{err}");
+    assert_eq!(manager.marketplaces().len(), 1);
+}
+
+#[tokio::test]
+async fn settings_round_trip() {
+    let defaults = PluginSettings::default();
+    assert!(defaults.skills_enabled);
+    assert_eq!(defaults.policy_default, PolicyDefault::Content);
+    assert_eq!(defaults.marketplace_refresh_hours, 6);
+    assert_eq!(defaults.update_check_hours, 6);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = crate::config::Store::new(tmp.path(), tmp.path().to_path_buf()).unwrap();
+    {
+        let mut cfg = store.config.lock().unwrap();
+        cfg.settings.plugins.skills_enabled = false;
+        cfg.settings.plugins.policy_default = PolicyDefault::Manual;
+        cfg.settings.plugins.marketplace_refresh_hours = 0;
+        cfg.settings.plugins.update_check_hours = 12;
+    }
+    store.save_config().unwrap();
+
+    let reloaded = crate::config::Store::new(tmp.path(), tmp.path().to_path_buf()).unwrap();
+    let plugins = reloaded.config.lock().unwrap().settings.plugins.clone();
+    assert!(!plugins.skills_enabled);
+    assert_eq!(plugins.policy_default, PolicyDefault::Manual);
+    assert_eq!(plugins.marketplace_refresh_hours, 0);
+    assert_eq!(plugins.update_check_hours, 12);
+}
+
+#[tokio::test]
+async fn install_emits_progress_and_keeps_servers_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    plugin_package(&source, "demo-plugin");
+    write_demo_server(&source);
+    let sink = Arc::new(CollectingSink::default());
+    let manager = test_manager(tmp.path(), sink.clone());
+
+    let id = manager
+        .install(
+            None,
+            None,
+            Some(&path_source(&source)),
+            PolicyDefault::Content,
+        )
+        .unwrap();
+    assert_eq!(id, "demo-plugin");
+
+    let events = sink.events.lock().unwrap().clone();
+    let phases: Vec<String> = events
+        .iter()
+        .filter_map(|event| match event {
+            BackendEvent::PluginProgress { phase, .. } => Some(phase.clone()),
+            _ => None,
+        })
+        .collect();
+    for phase in ["fetch", "validate", "place"] {
+        assert!(phases.iter().any(|p| p == phase), "{phases:?}");
+    }
+    assert!(events.iter().any(
+        |event| matches!(event, BackendEvent::PluginsChanged { reason } if reason == "install")
+    ));
+
+    let list = manager.list();
+    assert_eq!(list.len(), 1);
+    assert!(!list[0].enabled);
+    assert!(list[0].disabled_servers.contains(&"demo".to_string()));
+}
+
+/// A server the new revision adds is off until the user consents; a server
+/// the user already enabled stays enabled (design §6).
+#[tokio::test]
+async fn update_switches_new_servers_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    plugin_package(&source, "demo-plugin");
+    write_demo_server(&source);
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+
+    let id = manager
+        .install(
+            None,
+            None,
+            Some(&path_source(&source)),
+            PolicyDefault::Content,
+        )
+        .unwrap();
+    manager.set_enabled(&id, true).unwrap();
+    manager.set_server_enabled(&id, "demo", true).unwrap();
+
+    // The new revision adds "added".
+    write(
+        &source,
+        "mcp.json",
+        &format!(
+            r#"{{"$schema": "{SPEC_100}", "mcpServers": {{"demo": {{"type": "stdio", "command": "node"}}, "added": {{"type": "stdio", "command": "node"}}}}}}"#
+        ),
+    );
+    manager.update(&id, false).unwrap();
+
+    let list = manager.list();
+    assert!(
+        !list[0].disabled_servers.contains(&"demo".to_string()),
+        "{:?}",
+        list[0].disabled_servers
+    );
+    assert!(
+        list[0].disabled_servers.contains(&"added".to_string()),
+        "{:?}",
+        list[0].disabled_servers
+    );
+
+    let index = manager.index();
+    assert_eq!(index.servers.len(), 1, "{:?}", index.servers);
+    assert!(index.servers[0].id.ends_with(":demo"), "{}", index.servers[0].id);
 }

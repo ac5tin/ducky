@@ -13,6 +13,12 @@ use crate::config::{
     Store, SubagentConfig, Theme, ToolRule, UndoRecord,
 };
 use crate::mcp::bridge::{ApprovalDecision, PlanDecision};
+use crate::plugins::manager::{
+    CatalogEntry, MarketplaceInput, MarketplaceSummary, PluginDetail, PluginSummary,
+    PluginUpdateInfo,
+};
+use crate::plugins::marketplace::PluginSource;
+use crate::plugins::UpdatePolicy;
 use crate::providers::Msg;
 use crate::state::AppState;
 
@@ -420,6 +426,9 @@ pub async fn settings_set(
         if let Some(v) = settings.default_mode {
             c.settings.default_mode = v;
         }
+        if let Some(v) = settings.plugins {
+            c.settings.plugins = v;
+        }
     }
     state.store.save_config().map_err(|e| e.to_string())?;
 
@@ -470,6 +479,7 @@ pub struct AppSettingsPatch {
     pub update_check_interval_hours: Option<u32>,
     pub system_prompt: Option<String>,
     pub default_mode: Option<config::AgentMode>,
+    pub plugins: Option<config::PluginSettings>,
 }
 
 #[tauri::command]
@@ -1779,6 +1789,183 @@ pub fn mcp_set_oauth_config(
                 .filter(|s| !s.is_empty()),
         )
         .map_err(|e| e.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Plugins
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn plugins_list(state: State<'_, Arc<AppState>>) -> Vec<PluginSummary> {
+    state.plugins.list()
+}
+
+#[tauri::command]
+pub fn plugin_detail(state: State<'_, Arc<AppState>>, id: String) -> Option<PluginDetail> {
+    state.plugins.detail(&id)
+}
+
+/// Install from a marketplace entry (`marketplace` + `name`) or from a direct
+/// `source`. The command layer applies `PluginSettings.policy_default` on top
+/// of the content-derived policy (ruling R18).
+///
+/// `async` keeps the fetch off the main thread, so the UI stays responsive and
+/// receives the progress events.
+#[tauri::command(async)]
+pub fn plugin_install(
+    state: State<'_, Arc<AppState>>,
+    marketplace: Option<String>,
+    name: Option<String>,
+    source: Option<PluginSource>,
+) -> Result<PluginDetail, String> {
+    let policy_default = state.store.config.lock().unwrap().settings.plugins.policy_default;
+    let id = state.plugins.install(
+        marketplace.as_deref(),
+        name.as_deref(),
+        source.as_ref(),
+        policy_default,
+    )?;
+    state
+        .plugins
+        .detail(&id)
+        .ok_or_else(|| format!("plugin `{id}` is not in the index"))
+}
+
+/// Returns the `plugin:<id>:<server>` ids the package owned; Task 8's MCP
+/// layer disconnects them.
+#[tauri::command(async)]
+pub fn plugin_uninstall(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    delete_data: bool,
+) -> Result<Vec<String>, String> {
+    state.plugins.uninstall(&id, delete_data)
+}
+
+#[tauri::command]
+pub fn plugin_set_enabled(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    state.plugins.set_enabled(&id, enabled)
+}
+
+#[tauri::command]
+pub fn plugin_set_server_enabled(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    server: String,
+    enabled: bool,
+) -> Result<(), String> {
+    state.plugins.set_server_enabled(&id, &server, enabled)
+}
+
+#[tauri::command]
+pub fn plugin_set_update_policy(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    policy: UpdatePolicy,
+) -> Result<(), String> {
+    state.plugins.set_policy(&id, policy)
+}
+
+#[tauri::command]
+pub async fn plugin_check_updates(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<PluginUpdateInfo>, String> {
+    state.plugins.check_updates().await
+}
+
+#[tauri::command(async)]
+pub fn plugin_update(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    force: Option<bool>,
+) -> Result<PluginUpdateInfo, String> {
+    state.plugins.update(&id, force.unwrap_or(false))
+}
+
+#[tauri::command(async)]
+pub fn plugin_update_all(
+    state: State<'_, Arc<AppState>>,
+    force: Option<bool>,
+) -> Result<Vec<PluginUpdateInfo>, String> {
+    state.plugins.update_all(force.unwrap_or(false))
+}
+
+#[tauri::command(async)]
+pub fn plugin_rollback(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<PluginUpdateInfo, String> {
+    state.plugins.rollback(&id)
+}
+
+/// Reveal the package (`which = "package"`, the default) or data directory.
+#[tauri::command]
+pub fn plugin_open_folder(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    which: Option<String>,
+) -> Result<(), String> {
+    let path = state.plugins.folder(&id, which.as_deref())?;
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .reveal_item_in_dir(path)
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn marketplaces_list(state: State<'_, Arc<AppState>>) -> Vec<MarketplaceSummary> {
+    state.plugins.marketplaces()
+}
+
+#[tauri::command]
+pub fn marketplace_add(
+    state: State<'_, Arc<AppState>>,
+    input: MarketplaceInput,
+    name: Option<String>,
+) -> Result<MarketplaceSummary, String> {
+    state.plugins.add_marketplace(input, name)
+}
+
+#[tauri::command]
+pub fn marketplace_remove(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    confirm: Option<bool>,
+) -> Result<(), String> {
+    state.plugins.remove_marketplace(&id, confirm.unwrap_or(false))
+}
+
+#[tauri::command]
+pub async fn marketplace_refresh(
+    state: State<'_, Arc<AppState>>,
+    id: Option<String>,
+) -> Result<Vec<MarketplaceSummary>, String> {
+    let manager = state.plugins.clone();
+    tauri::async_runtime::spawn(async move { manager.refresh_marketplace(id.as_deref()).await })
+        .await
+        .map_err(|err| format!("marketplace refresh task failed: {err}"))?
+}
+
+#[tauri::command]
+pub fn marketplace_set_auto_refresh(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    state.plugins.set_marketplace_auto_refresh(&id, enabled)
+}
+
+#[tauri::command]
+pub fn marketplace_catalog(
+    state: State<'_, Arc<AppState>>,
+    marketplace: Option<String>,
+) -> Result<Vec<CatalogEntry>, String> {
+    state.plugins.catalog(marketplace.as_deref())
 }
 
 // App version for the About panel

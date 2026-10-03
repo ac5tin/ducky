@@ -178,6 +178,26 @@ pub enum BackendEvent {
         conversation_id: String,
         title: String,
     },
+    /// The plugin index changed (install, enable, disable, update, uninstall).
+    PluginsChanged { reason: String },
+    /// An update check found a newer revision of an installed plugin.
+    PluginUpdateAvailable {
+        plugin_id: String,
+        from: Option<String>,
+        to: Option<String>,
+    },
+    /// Progress of a plugin operation; `phase` is one of `fetch`, `validate`,
+    /// `place`.
+    PluginProgress {
+        plugin_id: String,
+        phase: String,
+        detail: String,
+    },
+    /// One marketplace refresh finished; `error` is set when it failed.
+    MarketplaceRefreshed {
+        marketplace_id: String,
+        error: Option<String>,
+    },
 }
 
 /// Abstraction over the Tauri event emitter so the MCP layer can be tested.

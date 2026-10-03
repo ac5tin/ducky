@@ -10,6 +10,8 @@ use crate::config::Store;
 use crate::events::{BackendEvent, EventSink};
 use crate::mcp::bridge::InteractiveBridge;
 use crate::mcp::manager::McpManager;
+use crate::plugins::manager::PluginManager;
+use crate::plugins::marketplace::ReqwestClient;
 
 /// Emits backend events to the webview over the `backend://event` channel.
 pub struct TauriSink {
@@ -40,6 +42,8 @@ pub struct AppState {
     pub compacting: Mutex<HashSet<String>>,
     /// Per-conversation PTY terminals (one shell per chat session).
     pub terminals: crate::terminal::TerminalMap,
+    /// Installed plugins, marketplaces and the derived component index.
+    pub plugins: Arc<PluginManager>,
 }
 
 impl AppState {
@@ -47,6 +51,7 @@ impl AppState {
         store: Arc<Store>,
         sink: Arc<dyn EventSink>,
         data_dir: &std::path::Path,
+        resource_dir: Option<&std::path::Path>,
     ) -> Arc<Self> {
         let bridge = Arc::new(InteractiveBridge::new(sink.clone(), store.clone()));
         let manager = Arc::new(McpManager::new(store.clone(), bridge.clone(), sink.clone()));
@@ -57,6 +62,13 @@ impl AppState {
             sink: sink.clone(),
         });
         let catalog = crate::catalog::Catalog::new(&data_dir.join("models-dev.json"));
+        let plugins = PluginManager::with_http(
+            data_dir,
+            &store.home_dir,
+            resource_dir,
+            sink.clone(),
+            Arc::new(ReqwestClient::new()),
+        );
         Arc::new(Self {
             store,
             sink,
@@ -68,6 +80,7 @@ impl AppState {
             title_runtimes: Mutex::new(HashMap::new()),
             compacting: Mutex::new(HashSet::new()),
             terminals: Arc::new(Mutex::new(HashMap::new())),
+            plugins,
         })
     }
 }

@@ -54,7 +54,12 @@ pub fn run() {
             let sink: Arc<dyn events::EventSink> = Arc::new(state::TauriSink {
                 app: handle.clone(),
             });
-            let app_state = state::AppState::build(store, sink, &data_dir);
+            let app_state = state::AppState::build(
+                store,
+                sink,
+                &data_dir,
+                handle.path().resource_dir().ok().as_deref(),
+            );
             app.manage(app_state.clone());
 
             // Auto-connect enabled MCP servers in the background.
@@ -139,6 +144,24 @@ pub fn run() {
             commands::mcp_has_auth,
             commands::mcp_set_oauth_config,
             commands::app_info,
+            commands::plugins_list,
+            commands::plugin_detail,
+            commands::plugin_install,
+            commands::plugin_uninstall,
+            commands::plugin_set_enabled,
+            commands::plugin_set_server_enabled,
+            commands::plugin_set_update_policy,
+            commands::plugin_check_updates,
+            commands::plugin_update,
+            commands::plugin_update_all,
+            commands::plugin_rollback,
+            commands::plugin_open_folder,
+            commands::marketplaces_list,
+            commands::marketplace_add,
+            commands::marketplace_remove,
+            commands::marketplace_refresh,
+            commands::marketplace_set_auto_refresh,
+            commands::marketplace_catalog,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Ducky");

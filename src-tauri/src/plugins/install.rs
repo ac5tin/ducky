@@ -256,7 +256,7 @@ pub fn assign_id(
 }
 
 /// Lowercase a compat manifest name and collapse unsupported runs to `-`.
-fn slug(name: &str) -> String {
+pub(crate) fn slug(name: &str) -> String {
     let mapped: String = name
         .chars()
         .map(|ch| {
