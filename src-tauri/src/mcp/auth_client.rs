@@ -233,7 +233,10 @@ fn http_client() -> reqwest::Client {
                     && origin.port_or_known_default() == attempt.url().port_or_known_default()
             });
             if same_origin {
-                attempt.follow()
+                // A custom policy replaces reqwest's default 10-hop cap, so
+                // delegate the same-origin case to it: a redirect loop must
+                // stop instead of following forever.
+                reqwest::redirect::Policy::limited(10).redirect(attempt)
             } else {
                 attempt.stop()
             }
@@ -574,6 +577,40 @@ mod tests {
                 .lines()
                 .any(|line| line.to_ascii_lowercase().starts_with("x-tenant:")),
             "the configured header must survive a same-origin redirect:\n{request}"
+        );
+    }
+
+    /// A same-origin redirect loop must hit reqwest's 10-hop cap and fail
+    /// closed; without the cap the request would follow forever.
+    #[tokio::test]
+    async fn same_origin_redirect_loop_stops_at_the_hop_cap() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let _ = read_request(&mut sock).await;
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://{addr}/mcp\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("http://{addr}/mcp");
+        let client = client_for(&url, dir.path());
+        let message: ClientJsonRpcMessage =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#).unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.post_message(url.into(), message, None, None, x_tenant_headers()),
+        )
+        .await
+        .expect("a same-origin redirect loop must hit the hop cap, not hang");
+        assert!(
+            result.is_err(),
+            "exceeding the hop cap must surface as an error: {result:?}"
         );
     }
 
