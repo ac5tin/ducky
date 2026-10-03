@@ -329,30 +329,36 @@ impl PluginManager {
         Ok(())
     }
 
-    /// One plugin's full trust detail; `None` when it is not installed.
-    pub fn detail(&self, id: &str) -> Option<PluginDetail> {
+    /// One plugin's full trust detail; `Ok(None)` when it is not installed.
+    /// An unsafe record id is an error: no path is built from it.
+    pub fn detail(&self, id: &str) -> Result<Option<PluginDetail>, String> {
         let plugin = {
             let index = self.index.read().unwrap();
-            index.plugins.iter().find(|plugin| plugin.id == id)?.clone()
+            match index.plugins.iter().find(|plugin| plugin.id == id) {
+                Some(plugin) => plugin.clone(),
+                None => return Ok(None),
+            }
         };
-        let (description, author, homepage, license) =
-            match manifest::load(Path::new(&plugin.package_dir)) {
-                Ok(manifest) => (
-                    manifest.description,
-                    manifest.author.as_ref().and_then(author_name),
-                    manifest.homepage,
-                    manifest.license,
-                ),
-                Err(_) => (None, None, None, None),
-            };
-        Some(PluginDetail {
+        // Never join a hand-edited id first: an unsafe id must be refused
+        // before the package path is built (Task 5 containment).
+        let package = install::package_dir(&self.plugins_dir, id)?.join("package");
+        let (description, author, homepage, license) = match manifest::load(&package) {
+            Ok(manifest) => (
+                manifest.description,
+                manifest.author.as_ref().and_then(author_name),
+                manifest.homepage,
+                manifest.license,
+            ),
+            Err(_) => (None, None, None, None),
+        };
+        Ok(Some(PluginDetail {
             plugin,
             description,
             author,
             homepage,
             license,
             trust_warning: TRUST_WARNING.to_string(),
-        })
+        }))
     }
 
     /// Every registry entry of every marketplace (or of one), with the install
@@ -452,15 +458,6 @@ impl PluginManager {
                 )
             }
         };
-        let label = entry
-            .as_ref()
-            .map(|entry| entry.name.clone())
-            .or_else(|| name.map(str::to_string))
-            .unwrap_or_else(|| source_name(&resolved));
-        // `install::install` fetches, validates and places in one call; the
-        // later phases are reported as the call completes, so the row shows
-        // `fetch` for the whole operation.
-        self.progress(&label, "fetch", "fetching the plugin source");
         let id;
         {
             let mut store = self.install.lock().unwrap();
@@ -485,6 +482,11 @@ impl PluginManager {
                 .save(&self.plugins_dir)
                 .map_err(|err| format!("cannot write the install record: {err}"))?;
         }
+        // `install::install` fetches, validates and places in one call, so the
+        // three phases are reported once it returns. Every phase carries the
+        // record's real id: the UI attaches them to one row by id, and the
+        // source name is not the id.
+        self.progress(&id, "fetch", "fetching the plugin source");
         self.progress(&id, "validate", "manifest and components validated");
         self.progress(
             &id,
@@ -650,35 +652,47 @@ impl PluginManager {
     /// UI asks first and passes `true` only after confirmation.
     pub fn update(&self, id: &str, force: bool) -> Result<PluginUpdateInfo, String> {
         let entry = self.marketplace_entry(id)?;
-        let (from, to);
+        let result;
         {
             let mut store = self.install.lock().unwrap();
             // Flush anything unsaved before `apply` reads the store from disk.
             store
                 .save(&self.plugins_dir)
                 .map_err(|err| format!("cannot write the install record: {err}"))?;
-            from = record_ref(&store, id)?.version.clone();
+            let from = record_ref(&store, id)?.version.clone();
             // An update must not silently consent to servers the new version
             // adds; compare the old package with the new one (design §6).
             let before = owned_servers(&self.plugins_dir, id);
-            to = {
+            let applied = {
                 let record = record_mut(&mut store, id)?;
-                let outcome = update::apply(record, &self.plugins_dir, entry.as_ref(), force)?;
-                let after = owned_servers(&self.plugins_dir, id);
-                seed_new_servers(record, &before, &after);
-                outcome.to
+                update::apply(record, &self.plugins_dir, entry.as_ref(), force)
             };
-            store
-                .save(&self.plugins_dir)
-                .map_err(|err| format!("cannot write the install record: {err}"))?;
+            result = match applied {
+                Ok(outcome) => {
+                    let after = owned_servers(&self.plugins_dir, id);
+                    {
+                        let record = record_mut(&mut store, id)?;
+                        seed_new_servers(record, &before, &after);
+                    }
+                    match store.save(&self.plugins_dir) {
+                        Ok(()) => Ok(PluginUpdateInfo {
+                            plugin_id: id.to_string(),
+                            from,
+                            to: outcome.to,
+                        }),
+                        Err(err) => Err(format!("cannot write the install record: {err}")),
+                    }
+                }
+                // `apply` marks the record `ModifiedLocally` and writes it
+                // before it fails, so the index is rebuilt on this path too;
+                // otherwise `plugins_list` serves the old status until the
+                // app restarts.
+                Err(err) => Err(err),
+            };
         }
         self.reload()?;
         self.changed("update");
-        Ok(PluginUpdateInfo {
-            plugin_id: id.to_string(),
-            from,
-            to,
-        })
+        result
     }
 
     /// Apply every cached update. One plugin's failure never stops the rest.
@@ -733,9 +747,11 @@ impl PluginManager {
             let store = self.install.lock().unwrap();
             record_ref(&store, id)?;
         }
+        // Build every path through `package_dir`: an unsafe hand-edited id is
+        // refused before any join (Task 5 containment).
         let path = match which.unwrap_or("package") {
-            "package" => self.plugins_dir.join(id).join("package"),
-            "data" => self.plugin_data_dir.join(id),
+            "package" => install::package_dir(&self.plugins_dir, id)?.join("package"),
+            "data" => install::package_dir(&self.plugin_data_dir, id)?,
             other => return Err(format!("unknown plugin folder `{other}`")),
         };
         if !path.exists() {
@@ -829,10 +845,10 @@ impl PluginManager {
         let Some(index) = store.records.iter().position(|record| record.id == id) else {
             return Err(format!("marketplace `{id}` is not known"));
         };
-        if store.records[index].bundled {
-            return Err(format!(
-                "the bundled marketplace `{id}` cannot be removed"
-            ));
+        // The reserved id is never removable, even when a hand-edited record
+        // clears the `bundled` flag (design §5).
+        if store.records[index].bundled || id == BUNDLED_MARKETPLACE_ID {
+            return Err(format!("the bundled marketplace `{id}` cannot be removed"));
         }
         let users = {
             let install = self.install.lock().unwrap();
@@ -981,6 +997,14 @@ impl PluginManager {
         diagnostics: Vec<Diagnostic>,
         discovered: &Discovered,
     ) -> InstalledPlugin {
+        // An unsafe record id is refused before any join (Task 5 containment),
+        // so the view never publishes a path outside the plugins directory.
+        let package_dir = install::package_dir(&self.plugins_dir, &record.id)
+            .map(|dir| dir.join("package").display().to_string())
+            .unwrap_or_default();
+        let data_dir = install::package_dir(&self.plugin_data_dir, &record.id)
+            .map(|dir| dir.display().to_string())
+            .unwrap_or_default();
         InstalledPlugin {
             id: record.id.clone(),
             name: record.name.clone(),
@@ -1000,13 +1024,8 @@ impl PluginManager {
             last_checked_at: record.last_checked_at.clone(),
             installed_at: record.installed_at.clone(),
             tree_hash: record.tree_hash.clone(),
-            package_dir: self
-                .plugins_dir
-                .join(&record.id)
-                .join("package")
-                .display()
-                .to_string(),
-            data_dir: self.plugin_data_dir.join(&record.id).display().to_string(),
+            package_dir,
+            data_dir,
             skills: discovered
                 .skills
                 .iter()
@@ -1053,7 +1072,9 @@ impl PluginManager {
                     RemoteKind::Sse => "sse".to_string(),
                     RemoteKind::StreamableHttp => "streamable-http".to_string(),
                 };
-                view.url = Some(url.clone());
+                // The trust sheet shows the host, never the full URL: a query
+                // string can carry a token (design §6).
+                view.url = Some(display_host(url));
             }
         }
         view
@@ -1290,6 +1311,20 @@ fn author_name(author: &Author) -> Option<String> {
         .clone()
         .or_else(|| author.email.clone())
         .or_else(|| author.url.clone())
+}
+
+/// The host (with an explicit port) of a remote server URL, for the trust
+/// sheet. The full URL is never shown: a query string can carry a token
+/// (design §6). A URL that cannot be parsed yields no host at all.
+pub(super) fn display_host(url: &str) -> String {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return String::new();
+    };
+    match (parsed.host_str(), parsed.port()) {
+        (Some(host), Some(port)) => format!("{host}:{port}"),
+        (Some(host), None) => host.to_string(),
+        (None, _) => String::new(),
+    }
 }
 
 fn source_kind(source: &PluginSource) -> &'static str {

@@ -16,7 +16,7 @@ use super::marketplace::{
     parse_git_remote, parse_registry, parse_source, refresh, Change, Entry, HttpClient,
     HttpResponse, MarketplaceRecord, MarketplaceStore, PluginSource, Registry,
 };
-use super::manager::{MarketplaceInput, PluginManager};
+use super::manager::{display_host, MarketplaceInput, PluginManager};
 use super::update::{apply, check_one, rollback};
 use crate::config::{PluginSettings, PolicyDefault};
 use crate::events::{BackendEvent, CollectingSink};
@@ -4310,26 +4310,46 @@ async fn remove_marketplace_requires_confirm() {
     assert!(manager.marketplaces().is_empty());
 }
 
-#[tokio::test]
-async fn bundled_marketplace_cannot_be_removed() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut store = MarketplaceStore::load(&tmp.path().join("marketplaces"));
+/// Hand-seed one marketplace record before the manager loads its stores.
+fn seed_marketplace(tmp: &Path, id: &str, bundled: bool) {
+    let mut store = MarketplaceStore::load(&tmp.join("marketplaces"));
     store.records.push(MarketplaceRecord {
-        id: "ducky-official".to_string(),
+        id: id.to_string(),
         name: "Ducky Official".to_string(),
         source: PluginSource::Path {
-            path: tmp.path().join("bundled.json").display().to_string(),
+            path: tmp.join("bundled.json").display().to_string(),
         },
         registry_path: "bundled.json".to_string(),
         auto_refresh: false,
         last_refreshed_at: None,
         resolved_sha: None,
-        bundled: true,
+        bundled,
         hidden: false,
         error: None,
         extra: Default::default(),
     });
-    store.save(&tmp.path().join("marketplaces")).unwrap();
+    store.save(&tmp.join("marketplaces")).unwrap();
+}
+
+#[tokio::test]
+async fn bundled_marketplace_cannot_be_removed() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_marketplace(tmp.path(), "ducky-official", true);
+
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+    let err = manager
+        .remove_marketplace("ducky-official", true)
+        .unwrap_err();
+    assert!(err.contains("bundled"), "{err}");
+    assert_eq!(manager.marketplaces().len(), 1);
+}
+
+/// The reserved id is refused even when a hand-edited record clears the
+/// `bundled` flag (design §5, review fix round 1).
+#[tokio::test]
+async fn reserved_marketplace_id_cannot_be_removed() {
+    let tmp = tempfile::tempdir().unwrap();
+    seed_marketplace(tmp.path(), "ducky-official", false);
 
     let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
     let err = manager
@@ -4386,15 +4406,21 @@ async fn install_emits_progress_and_keeps_servers_off() {
     assert_eq!(id, "demo-plugin");
 
     let events = sink.events.lock().unwrap().clone();
-    let phases: Vec<String> = events
+    // Every phase of one install carries the record's real id, so the UI can
+    // attach all three to one row.
+    let phases: Vec<(String, String)> = events
         .iter()
         .filter_map(|event| match event {
-            BackendEvent::PluginProgress { phase, .. } => Some(phase.clone()),
+            BackendEvent::PluginProgress {
+                plugin_id, phase, ..
+            } => Some((plugin_id.clone(), phase.clone())),
             _ => None,
         })
         .collect();
     for phase in ["fetch", "validate", "place"] {
-        assert!(phases.iter().any(|p| p == phase), "{phases:?}");
+        let found = phases.iter().find(|(_, name)| name == phase);
+        let (found_id, _) = found.unwrap_or_else(|| panic!("phase `{phase}`: {phases:?}"));
+        assert_eq!(found_id, &id, "phase `{phase}`: {phases:?}");
     }
     assert!(events.iter().any(
         |event| matches!(event, BackendEvent::PluginsChanged { reason } if reason == "install")
@@ -4452,4 +4478,142 @@ async fn update_switches_new_servers_off() {
     let index = manager.index();
     assert_eq!(index.servers.len(), 1, "{:?}", index.servers);
     assert!(index.servers[0].id.ends_with(":demo"), "{}", index.servers[0].id);
+}
+
+/// A local-edit refusal writes `ModifiedLocally` to the record before it
+/// fails; the index is rebuilt before the error goes out, so the UI sees the
+/// new status without a restart (review fix round 1).
+#[tokio::test]
+async fn local_edit_update_error_is_visible_without_a_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    versioned_package(&source, "demo-plugin", "1.0.0", "old-bytes");
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+
+    let id = manager
+        .install(
+            None,
+            None,
+            Some(&path_source(&source)),
+            PolicyDefault::Content,
+        )
+        .unwrap();
+    let package = tmp.path().join("plugins").join(&id).join("package");
+    write(&package, "marker.txt", "local-edit");
+    versioned_package(&source, "demo-plugin", "1.1.0", "upstream");
+    assert_eq!(manager.list()[0].status, PluginStatus::InstalledDisabled);
+
+    let err = manager.update(&id, false).unwrap_err();
+    assert!(err.contains("modified locally"), "{err}");
+
+    assert_eq!(manager.list()[0].status, PluginStatus::ModifiedLocally);
+    let store = InstallStore::load(&tmp.path().join("plugins"));
+    assert_eq!(store.records[0].status, PluginStatus::ModifiedLocally);
+    assert_eq!(
+        std::fs::read_to_string(package.join("marker.txt")).unwrap(),
+        "local-edit"
+    );
+}
+
+/// A hand-edited unsafe id must not publish or reveal a path outside the
+/// plugins directory, and must not break the other records (Task 5 class,
+/// review fix round 1).
+#[tokio::test]
+async fn unsafe_id_is_refused_by_detail_folder_and_the_view() {
+    for id in ["..", ".. "] {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        plugin_package(&source, "demo-plugin");
+        let keeper = seed_installed(tmp.path(), &source);
+        let plugins_dir = tmp.path().join("plugins");
+        let mut store = InstallStore::load(&plugins_dir);
+        store
+            .records
+            .push(install_record(id, "bad", path_source(&source)));
+        store.save(&plugins_dir).unwrap();
+        // `plugins/../package` exists, so revealing it would be visible.
+        std::fs::create_dir_all(tmp.path().join("package")).unwrap();
+
+        let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+        let list = manager.list();
+        assert_eq!(list.len(), 2, "id `{id}`");
+        let bad = list.iter().find(|plugin| plugin.id == id).unwrap();
+        assert_eq!(bad.status, PluginStatus::Error, "id `{id}`");
+        assert!(
+            bad.diagnostics
+                .iter()
+                .any(|diag| diag.message.contains("not a safe directory name")),
+            "id `{id}`: {:?}",
+            bad.diagnostics
+        );
+        assert!(bad.package_dir.is_empty(), "id `{id}`: {}", bad.package_dir);
+        assert!(bad.data_dir.is_empty(), "id `{id}`: {}", bad.data_dir);
+
+        assert!(manager.detail(id).is_err(), "id `{id}`");
+        assert!(manager.folder(id, None).is_err(), "id `{id}`");
+        assert!(manager.folder(id, Some("data")).is_err(), "id `{id}`");
+
+        // The other records stay intact and useful.
+        let row = list.iter().find(|plugin| plugin.id == keeper.id).unwrap();
+        assert_eq!(row.status, PluginStatus::InstalledDisabled, "id `{id}`");
+        assert!(
+            Path::new(&row.package_dir).join("plugin.json").is_file(),
+            "id `{id}`: {}",
+            row.package_dir
+        );
+        assert!(
+            manager.detail(&keeper.id).unwrap().is_some(),
+            "id `{id}`"
+        );
+        assert!(manager.folder(&keeper.id, None).is_ok(), "id `{id}`");
+    }
+}
+
+/// §6: the trust sheet shows a remote server's host, never the full URL — a
+/// query string can carry a token.
+#[tokio::test]
+async fn remote_server_view_shows_host_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    plugin_package(&source, "demo-plugin");
+    write(
+        &source,
+        "mcp.json",
+        &format!(
+            r#"{{"$schema": "{SPEC_100}", "mcpServers": {{"remote": {{"type": "streamable-http", "url": "https://mcp.example.com:8443/mcp?token=secret"}}}}}}"#
+        ),
+    );
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+    manager
+        .install(
+            None,
+            None,
+            Some(&path_source(&source)),
+            PolicyDefault::Content,
+        )
+        .unwrap();
+
+    let list = manager.list();
+    let server = list[0]
+        .servers
+        .iter()
+        .find(|server| server.name == "remote")
+        .unwrap();
+    assert_eq!(server.url.as_deref(), Some("mcp.example.com:8443"));
+    let url = server.url.as_deref().unwrap();
+    assert!(!url.contains("token") && !url.contains("secret"), "{url}");
+}
+
+/// The layout rejects a URL with userinfo before it can reach a view; the
+/// host helper itself must still drop userinfo and the query.
+#[test]
+fn display_host_never_includes_userinfo_or_query() {
+    assert_eq!(
+        display_host("https://user:pass@mcp.example.com/mcp?token=secret#frag"),
+        "mcp.example.com"
+    );
+    assert_eq!(
+        display_host("https://user:pass@mcp.example.com:8443/mcp?token=secret"),
+        "mcp.example.com:8443"
+    );
 }

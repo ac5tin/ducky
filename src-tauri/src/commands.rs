@@ -1801,7 +1801,10 @@ pub fn plugins_list(state: State<'_, Arc<AppState>>) -> Vec<PluginSummary> {
 }
 
 #[tauri::command]
-pub fn plugin_detail(state: State<'_, Arc<AppState>>, id: String) -> Option<PluginDetail> {
+pub fn plugin_detail(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<Option<PluginDetail>, String> {
     state.plugins.detail(&id)
 }
 
@@ -1827,7 +1830,7 @@ pub fn plugin_install(
     )?;
     state
         .plugins
-        .detail(&id)
+        .detail(&id)?
         .ok_or_else(|| format!("plugin `{id}` is not in the index"))
 }
 
