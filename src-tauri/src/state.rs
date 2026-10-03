@@ -54,14 +54,6 @@ impl AppState {
         resource_dir: Option<&std::path::Path>,
     ) -> Arc<Self> {
         let bridge = Arc::new(InteractiveBridge::new(sink.clone(), store.clone()));
-        let manager = Arc::new(McpManager::new(store.clone(), bridge.clone(), sink.clone()));
-        let agent = Arc::new(Agent {
-            store: store.clone(),
-            manager: manager.clone(),
-            bridge: bridge.clone(),
-            sink: sink.clone(),
-        });
-        let catalog = crate::catalog::Catalog::new(&data_dir.join("models-dev.json"));
         let plugins = PluginManager::with_http(
             data_dir,
             &store.home_dir,
@@ -69,6 +61,19 @@ impl AppState {
             sink.clone(),
             Arc::new(ReqwestClient::new()),
         );
+        let manager = Arc::new(McpManager::new(
+            store.clone(),
+            bridge.clone(),
+            sink.clone(),
+            plugins.clone(),
+        ));
+        let agent = Arc::new(Agent {
+            store: store.clone(),
+            manager: manager.clone(),
+            bridge: bridge.clone(),
+            sink: sink.clone(),
+        });
+        let catalog = crate::catalog::Catalog::new(&data_dir.join("models-dev.json"));
         Arc::new(Self {
             store,
             sink,

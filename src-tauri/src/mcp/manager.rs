@@ -2,7 +2,8 @@
 //! a cached view of each server's tools/resources/prompts, and exposes
 //! operations to the rest of the app.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -32,6 +33,8 @@ use super::bridge::InteractiveBridge;
 use super::handler::DuckyClientHandler;
 use crate::config::{HttpAuth, McpServerConfig, McpTransport, Store};
 use crate::events::{BackendEvent, EventSink};
+use crate::plugins::layout::PluginTransport;
+use crate::plugins::manager::{PluginIndex, PluginManager};
 
 // ---------------------------------------------------------------------------
 // Public view types (serialised to the webview)
@@ -77,6 +80,61 @@ pub enum ServerStatus {
     },
 }
 
+/// Where a server row comes from: the user's own config or an enabled plugin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerOriginKind {
+    User,
+    Plugin,
+}
+
+/// The plugin a server came from; both fields are `None` for user servers
+/// (design §9). Task 13 badges rows from this.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ServerOrigin {
+    pub kind: ServerOriginKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin_name: Option<String>,
+}
+
+impl ServerOrigin {
+    fn user() -> Self {
+        Self {
+            kind: ServerOriginKind::User,
+            plugin_id: None,
+            plugin_name: None,
+        }
+    }
+}
+
+/// A user server, or one contributed by an enabled plugin (design §9).
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedServer {
+    pub config: McpServerConfig,
+    pub origin: ServerOrigin,
+    pub launch: Option<PluginLaunch>,
+}
+
+/// What a plugin stdio server needs beyond its config: the package and data
+/// roots, plus the manifest's raw, still-unexpanded `cwd` (design §2).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PluginLaunch {
+    pub root: PathBuf,
+    pub data: PathBuf,
+    pub cwd: Option<String>,
+}
+
+/// A fully resolved plugin stdio launch (design §2/§9).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CommandSpec {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub cwd: PathBuf,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolEntry {
     pub server_id: String,
@@ -109,6 +167,8 @@ pub struct ServerSummary {
     pub protocol_version: Option<String>,
     pub capabilities: Option<serde_json::Value>,
     pub logs: Vec<String>,
+    /// User config or plugin-provided (design §9).
+    pub origin: ServerOrigin,
 }
 
 /// Progress snapshot of a server-side task (MCP tasks extension), surfaced
@@ -492,6 +552,8 @@ pub struct McpManager {
     store: Arc<Store>,
     bridge: Arc<InteractiveBridge>,
     sink: Arc<dyn EventSink>,
+    /// Source of the plugin index and of the plugin package/data roots.
+    plugins: Arc<PluginManager>,
     handles: Mutex<HashMap<String, Arc<ServerHandle>>>,
     statuses: Arc<Mutex<HashMap<String, ServerStatus>>>,
     auth: Arc<AuthCoordinator>,
@@ -514,6 +576,7 @@ impl McpManager {
         store: Arc<Store>,
         bridge: Arc<InteractiveBridge>,
         sink: Arc<dyn EventSink>,
+        plugins: Arc<PluginManager>,
     ) -> Self {
         let statuses = Arc::new(Mutex::new(HashMap::new()));
         let auth = Arc::new(AuthCoordinator {
@@ -525,6 +588,7 @@ impl McpManager {
             store,
             bridge,
             sink,
+            plugins,
             handles: Mutex::new(HashMap::new()),
             statuses,
             auth,
@@ -624,17 +688,15 @@ impl McpManager {
     /// outcomes (needs auth, error) are reported via status events; the
     /// returned status mirrors what was reported.
     pub async fn connect(&self, server_id: &str) -> Result<ServerStatus, String> {
-        let cfg = {
-            let cfg_guard = self.store.config.lock().unwrap();
-            cfg_guard
-                .mcp_servers
-                .iter()
-                .find(|s| s.id == server_id)
-                .cloned()
-        };
-        let Some(cfg) = cfg else {
+        // User servers ∪ the enabled plugin servers (design §9).
+        let resolved = self
+            .resolved_servers()
+            .into_iter()
+            .find(|server| server.config.id == server_id);
+        let Some(resolved) = resolved else {
             return Err("Unknown server id".into());
         };
+        let cfg = &resolved.config;
 
         // Drop any existing connection first.
         self.disconnect(server_id).await;
@@ -648,7 +710,7 @@ impl McpManager {
                 // Missing OAuth tokens are valid for lazy authentication. If a
                 // session exists, refresh it before connecting as before.
                 if self.store.oauth_tokens(server_id).is_some() {
-                    if let Err(e) = crate::oauth::ensure_fresh_token(&self.store, &cfg).await {
+                    if let Err(e) = crate::oauth::ensure_fresh_token(&self.store, cfg).await {
                         match e {
                             crate::oauth::AuthFailure::ReauthRequired(detail) => {
                                 self.set_status(
@@ -672,7 +734,7 @@ impl McpManager {
 
         let handler = DuckyClientHandler {
             server_id: Arc::from(server_id),
-            server_name: Arc::from(Self::server_slug(&cfg).as_str()),
+            server_name: Arc::from(Self::server_slug(cfg).as_str()),
             server_title: Arc::from(cfg.name.as_str()),
             bridge: self.bridge.clone(),
             store: self.store.clone(),
@@ -680,7 +742,7 @@ impl McpManager {
         };
 
         let ct = CancellationToken::new();
-        let (built, stderr_tail) = match self.build_transport(&cfg) {
+        let (built, stderr_tail) = match self.build_transport(&resolved) {
             Ok(t) => t,
             Err(e) => {
                 self.set_status(server_id, ServerStatus::Error { message: e });
@@ -857,33 +919,67 @@ impl McpManager {
         self.statuses.lock().unwrap().remove(server_id);
     }
 
-    /// Connect every enabled server that is not already connected.
+    /// Connect every enabled server that is not already connected: user
+    /// servers plus the enabled plugin servers (design §9, ruling 10).
     pub async fn connect_enabled(&self) {
-        let ids: Vec<(String, bool)> = {
-            let cfg = self.store.config.lock().unwrap();
-            cfg.mcp_servers
-                .iter()
-                .map(|s| (s.id.clone(), s.enabled && s.auto_start))
-                .collect()
-        };
-        for (id, should) in ids {
-            if should
-                && !matches!(
-                    self.status(&id),
-                    ServerStatus::Connected | ServerStatus::Connecting
-                )
-            {
+        let ids: Vec<String> = self
+            .resolved_servers()
+            .into_iter()
+            .filter(|server| server.config.enabled && server.config.auto_start)
+            .map(|server| server.config.id)
+            .collect();
+        for id in ids {
+            if !matches!(
+                self.status(&id),
+                ServerStatus::Connected | ServerStatus::Connecting
+            ) {
                 let _ = self.connect(&id).await;
             }
         }
     }
 
+    /// User servers ∪ enabled plugin servers, resolved fresh from config and
+    /// the live plugin index (design §9).
+    fn resolved_servers(&self) -> Vec<ResolvedServer> {
+        // Snapshot the user config before touching the plugin index: never
+        // hold the config lock while cloning the (large) plugin index.
+        let user: Vec<McpServerConfig> = {
+            let config = self.store.config.lock().unwrap();
+            config.mcp_servers.clone()
+        };
+        merge_servers(&user, &self.plugins.index(), &self.plugins.data_dir)
+    }
+
     fn build_transport(
         &self,
-        cfg: &McpServerConfig,
+        resolved: &ResolvedServer,
     ) -> Result<(BuiltTransport, Option<StderrTail>), String> {
+        let cfg = &resolved.config;
         match &cfg.transport {
             McpTransport::Stdio { command, args, env } => {
+                if let Some(launch) = &resolved.launch {
+                    // Plugin servers get their own launch rules (design §2/§9):
+                    // placeholder expansion, the plugin root as the cwd
+                    // default, and no login-shell PATH augmentation.
+                    let env: BTreeMap<String, String> =
+                        env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                    let spec = spawn_spec(
+                        command,
+                        args,
+                        &env,
+                        launch.cwd.as_deref(),
+                        &launch.root,
+                        &launch.data,
+                    )?;
+                    let mut cmd = tokio::process::Command::new(&spec.program);
+                    cmd.args(&spec.args);
+                    for (key, value) in &spec.env {
+                        cmd.env(key, value);
+                    }
+                    cmd.current_dir(&spec.cwd);
+                    return self.spawn_stdio(cmd, command, &cfg.id);
+                }
+
                 let cwd = self
                     .store
                     .config
@@ -905,38 +1001,7 @@ impl McpManager {
                 if !env.contains_key("PATH") {
                     augment_command_path(&mut cmd);
                 }
-                let (child, stderr) = TokioChildProcess::builder(cmd)
-                    .stderr(std::process::Stdio::piped())
-                    .spawn()
-                    .map_err(|e| {
-                        format!("Could not start `{command}`: {e}.{}", spawn_hint(command))
-                    })?;
-                // keep a tail of the server's stderr so a failed handshake can
-                // quote it (npm 404s, missing-runtime errors, crash traces)
-                let tail: StderrTail = Arc::new(Mutex::new(VecDeque::new()));
-                if let Some(stderr) = stderr {
-                    let server_id = cfg.id.clone();
-                    let sink = self.sink.clone();
-                    let tail = tail.clone();
-                    tokio::spawn(async move {
-                        use tokio::io::AsyncBufReadExt;
-                        let mut lines = tokio::io::BufReader::new(stderr).lines();
-                        while let Ok(Some(line)) = lines.next_line().await {
-                            // forward server logs as an event the UI
-                            // can render in the connector detail view
-                            sink.emit(BackendEvent::ServerDataChanged {
-                                server_id: server_id.clone(),
-                                what: format!("log:{line}"),
-                            });
-                            let mut t = tail.lock().unwrap();
-                            t.push_back(line);
-                            while t.len() > 300 {
-                                t.pop_front();
-                            }
-                        }
-                    });
-                }
-                Ok((BuiltTransport::Stdio(child), Some(tail)))
+                self.spawn_stdio(cmd, command, &cfg.id)
             }
             McpTransport::Http { url, headers } => {
                 let mut config = StreamableHttpClientTransportConfig::with_uri(url.clone());
@@ -970,6 +1035,46 @@ impl McpManager {
                 ))
             }
         }
+    }
+
+    /// Spawn a stdio child, keep a tail of its stderr for failure diagnostics
+    /// and forward the lines as events. Shared by the user and plugin paths.
+    fn spawn_stdio(
+        &self,
+        cmd: tokio::process::Command,
+        command: &str,
+        server_id: &str,
+    ) -> Result<(BuiltTransport, Option<StderrTail>), String> {
+        let (child, stderr) = TokioChildProcess::builder(cmd)
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Could not start `{command}`: {e}.{}", spawn_hint(command)))?;
+        // keep a tail of the server's stderr so a failed handshake can
+        // quote it (npm 404s, missing-runtime errors, crash traces)
+        let tail: StderrTail = Arc::new(Mutex::new(VecDeque::new()));
+        if let Some(stderr) = stderr {
+            let server_id = server_id.to_string();
+            let sink = self.sink.clone();
+            let tail = tail.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncBufReadExt;
+                let mut lines = tokio::io::BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    // forward server logs as an event the UI
+                    // can render in the connector detail view
+                    sink.emit(BackendEvent::ServerDataChanged {
+                        server_id: server_id.clone(),
+                        what: format!("log:{line}"),
+                    });
+                    let mut t = tail.lock().unwrap();
+                    t.push_back(line);
+                    while t.len() > 300 {
+                        t.pop_front();
+                    }
+                }
+            });
+        }
+        Ok((BuiltTransport::Stdio(child), Some(tail)))
     }
 
     fn spawn_list_changed_subscription(&self, handle: Arc<ServerHandle>) {
@@ -1273,30 +1378,44 @@ impl McpManager {
 
     /// Human-readable view of one server for the UI.
     pub fn summary(&self, server_id: &str) -> ServerSummary {
-        let cfg = {
-            let cfg = self.store.config.lock().unwrap();
-            cfg.mcp_servers.iter().find(|s| s.id == server_id).cloned()
-        };
-        let (name, enabled, transport_kind, detail) = match &cfg {
-            Some(c) => (
-                c.name.clone(),
-                c.enabled,
-                match &c.transport {
-                    McpTransport::Stdio { .. } => "stdio".to_string(),
-                    McpTransport::Http { .. } => "http".to_string(),
-                },
-                match &c.transport {
-                    McpTransport::Stdio { command, args, .. } => {
-                        if args.is_empty() {
-                            command.clone()
-                        } else {
-                            format!("{command} {}", args.join(" "))
+        let resolved = self.resolved_servers();
+        let found = resolved
+            .iter()
+            .find(|server| server.config.id == server_id);
+        self.summary_of(found, server_id)
+    }
+
+    fn summary_of(&self, resolved: Option<&ResolvedServer>, server_id: &str) -> ServerSummary {
+        let (name, enabled, transport_kind, detail, origin) = match resolved {
+            Some(server) => {
+                let c = &server.config;
+                (
+                    c.name.clone(),
+                    c.enabled,
+                    match &c.transport {
+                        McpTransport::Stdio { .. } => "stdio".to_string(),
+                        McpTransport::Http { .. } => "http".to_string(),
+                    },
+                    match &c.transport {
+                        McpTransport::Stdio { command, args, .. } => {
+                            if args.is_empty() {
+                                command.clone()
+                            } else {
+                                format!("{command} {}", args.join(" "))
+                            }
                         }
-                    }
-                    McpTransport::Http { url, .. } => url.clone(),
-                },
+                        McpTransport::Http { url, .. } => url.clone(),
+                    },
+                    server.origin.clone(),
+                )
+            }
+            None => (
+                "unknown".into(),
+                false,
+                "stdio".into(),
+                String::new(),
+                ServerOrigin::user(),
             ),
-            None => ("unknown".into(), false, "stdio".into(), String::new()),
         };
 
         let (tools, resources, templates, prompts, info, instructions, version, caps, logs) =
@@ -1356,15 +1475,16 @@ impl McpManager {
             protocol_version: version,
             capabilities: caps,
             logs,
+            origin,
         }
     }
 
     pub fn summaries(&self) -> Vec<ServerSummary> {
-        let ids: Vec<String> = {
-            let cfg = self.store.config.lock().unwrap();
-            cfg.mcp_servers.iter().map(|s| s.id.clone()).collect()
-        };
-        ids.into_iter().map(|id| self.summary(&id)).collect()
+        let resolved = self.resolved_servers();
+        resolved
+            .iter()
+            .map(|server| self.summary_of(Some(server), &server.config.id))
+            .collect()
     }
 
     /// All tools from all connected & enabled servers, qualified for the model.
@@ -1415,6 +1535,253 @@ fn serialize_all<T: Serialize>(items: &[T]) -> Vec<serde_json::Value> {
         .iter()
         .map(|i| serde_json::to_value(i).unwrap_or_default())
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Plugin server resolution and launch (design §2/§9, rulings R4/R12)
+// ---------------------------------------------------------------------------
+
+/// User servers ∪ the enabled plugin servers (design §9).
+///
+/// A user server always wins a display-name collision (the plugin server is
+/// shadowed here, with a warning); ids never collide because plugin ids carry
+/// the `plugin:<plugin-id>:` prefix. A plugin whose record id is not a safe
+/// directory name is skipped rather than path-joined (Task 5 containment).
+pub(crate) fn merge_servers(
+    user: &[McpServerConfig],
+    index: &PluginIndex,
+    data_dir: &Path,
+) -> Vec<ResolvedServer> {
+    let mut resolved: Vec<ResolvedServer> = user
+        .iter()
+        .map(|config| ResolvedServer {
+            config: config.clone(),
+            origin: ServerOrigin::user(),
+            launch: None,
+        })
+        .collect();
+
+    for server_ref in &index.servers {
+        let package =
+            crate::plugins::install::package_dir(&data_dir.join("plugins"), &server_ref.plugin_id)
+                .ok()
+                .map(|dir| dir.join("package"));
+        let data = crate::plugins::install::package_dir(
+            &data_dir.join("plugin-data"),
+            &server_ref.plugin_id,
+        );
+        let (Some(root), Ok(data)) = (package, data) else {
+            tracing::warn!(
+                server = %server_ref.id,
+                "skipping a plugin server whose plugin id is not a safe directory name"
+            );
+            continue;
+        };
+
+        let shadowed = resolved.iter().any(|known| {
+            known.config.id == server_ref.id
+                || known
+                    .config
+                    .name
+                    .eq_ignore_ascii_case(&server_ref.server.name)
+        });
+        if shadowed {
+            tracing::warn!(
+                server = %server_ref.id,
+                "plugin server is shadowed by a user server with the same id or name"
+            );
+            continue;
+        }
+
+        let (transport, cwd) = match &server_ref.server.transport {
+            PluginTransport::Stdio {
+                command,
+                args,
+                env,
+                cwd,
+            } => (
+                McpTransport::Stdio {
+                    command: command.clone(),
+                    args: args.clone(),
+                    env: env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                },
+                cwd.clone(),
+            ),
+            // Both remote kinds reuse the existing client: rmcp negotiates the
+            // legacy SSE fallback on the same transport (design §9).
+            PluginTransport::Remote { url, headers, .. } => (
+                McpTransport::Http {
+                    url: url.clone(),
+                    headers: headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                },
+                None,
+            ),
+        };
+        let plugin_name = index
+            .plugins
+            .iter()
+            .find(|plugin| plugin.id == server_ref.plugin_id)
+            .map(|plugin| plugin.name.clone())
+            .unwrap_or_else(|| server_ref.plugin_id.clone());
+
+        resolved.push(ResolvedServer {
+            config: McpServerConfig {
+                id: server_ref.id.clone(),
+                name: server_ref.server.name.clone(),
+                transport,
+                // Plugin servers never carry user OAuth/Bearer state.
+                auth: HttpAuth::None,
+                // Presence in `index.servers` already means enabled and
+                // consented, so the runtime treats it like an enabled user
+                // server (ruling 10: it auto-connects at launch).
+                enabled: true,
+                auto_start: true,
+                oauth_client_id: None,
+                oauth_redirect_port: None,
+                created_at: String::new(),
+            },
+            origin: ServerOrigin {
+                kind: ServerOriginKind::Plugin,
+                plugin_id: Some(server_ref.plugin_id.clone()),
+                plugin_name: Some(plugin_name),
+            },
+            launch: Some(PluginLaunch { root, data, cwd }),
+        });
+    }
+    resolved
+}
+
+/// Single non-recursive textual replacement of the two spec placeholders
+/// (design §2). Nothing else is expanded, unknown spellings stay literal, and
+/// text introduced by a replacement is never rescanned.
+pub(crate) fn expand_placeholders(value: &str, root: &Path, data: &Path) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let tail = &rest[start..];
+        if let Some(after) = tail.strip_prefix("${PLUGIN_ROOT}") {
+            out.push_str(&root.to_string_lossy());
+            rest = after;
+        } else if let Some(after) = tail.strip_prefix("${PLUGIN_DATA}") {
+            out.push_str(&data.to_string_lossy());
+            rest = after;
+        } else {
+            out.push('$');
+            rest = &tail[1..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn is_reserved_env_key(key: &str) -> bool {
+    key.eq_ignore_ascii_case("PLUGIN_ROOT") || key.eq_ignore_ascii_case("PLUGIN_DATA")
+}
+
+/// `command` is one executable token (design §2): a `./` path resolves inside
+/// the plugin root, a bare name is left to the platform's executable search.
+fn resolve_program(command: &str, root: &Path) -> Result<PathBuf, String> {
+    if let Some(rest) = command.strip_prefix("./") {
+        if rest.is_empty() {
+            return Err("command must be a bare name or a `./` path inside the plugin root".into());
+        }
+        return crate::plugins::path::resolve_within_maybe_missing(root, &root.join(rest))
+            .ok_or_else(|| format!("command `{command}` escapes the plugin root"));
+    }
+    if command.is_empty()
+        || command.contains('/')
+        || command.contains('\\')
+        || command.chars().any(char::is_whitespace)
+    {
+        return Err("command must be a bare name or a `./` path inside the plugin root".into());
+    }
+    Ok(PathBuf::from(command))
+}
+
+/// Resolve a plugin server's stdio launch (design §2, rulings R4/R12).
+///
+/// The parse-time checks in `plugins::layout` are syntactic only: the
+/// containment proof for `cwd` is made here, after `PLUGIN_DATA` exists and
+/// the expanded result is canonicalized, so a symlink inside the data
+/// directory cannot lead the launch outside it.
+pub(crate) fn spawn_spec(
+    command: &str,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+    cwd: Option<&str>,
+    root: &Path,
+    data: &Path,
+) -> Result<CommandSpec, String> {
+    // Reserved names are refused in any casing, on every platform (ruling R8),
+    // before any filesystem work.
+    for key in env.keys() {
+        if is_reserved_env_key(key) {
+            return Err(format!(
+                "`{key}` is reserved: Ducky sets PLUGIN_ROOT and PLUGIN_DATA for plugin servers"
+            ));
+        }
+    }
+
+    // §9.1: the data directory exists before spawn; it is the containment root
+    // for a `${PLUGIN_DATA}` cwd.
+    std::fs::create_dir_all(data).map_err(|err| {
+        format!(
+            "cannot create the plugin data directory {}: {err}",
+            data.display()
+        )
+    })?;
+
+    let program = resolve_program(command, root)?;
+    let args: Vec<String> = args
+        .iter()
+        .map(|arg| expand_placeholders(arg, root, data))
+        .collect();
+
+    // The server env overlays the inherited environment; the two reserved
+    // variables are set last, replacing any same-named entry.
+    let mut env_out: Vec<(String, String)> = env
+        .iter()
+        .filter(|(key, _)| !is_reserved_env_key(key))
+        .map(|(key, value)| (key.clone(), expand_placeholders(value, root, data)))
+        .collect();
+    env_out.push(("PLUGIN_ROOT".to_string(), root.to_string_lossy().into_owned()));
+    env_out.push(("PLUGIN_DATA".to_string(), data.to_string_lossy().into_owned()));
+
+    let data_rooted = cwd.is_some_and(|raw| raw.starts_with("${PLUGIN_DATA}"));
+    let containment_root = if data_rooted { data } else { root };
+    let expanded_cwd = match cwd {
+        Some(raw) => PathBuf::from(expand_placeholders(raw, root, data)),
+        None => root.to_path_buf(),
+    };
+    let canonical_root = std::fs::canonicalize(containment_root).map_err(|err| {
+        format!("cannot resolve {}: {err}", containment_root.display())
+    })?;
+    let resolved_cwd =
+        crate::plugins::path::resolve_within_maybe_missing(&canonical_root, &expanded_cwd)
+            .ok_or_else(|| {
+                format!(
+                    "the server's `cwd` {} escapes the plugin directory",
+                    expanded_cwd.display()
+                )
+            })?;
+    // A data-rooted cwd is Ducky's to provide, so create it; a plugin-rooted
+    // one must already exist in the (read-only) package.
+    if data_rooted {
+        std::fs::create_dir_all(&resolved_cwd).map_err(|err| {
+            format!(
+                "cannot create the server working directory {}: {err}",
+                resolved_cwd.display()
+            )
+        })?;
+    }
+
+    Ok(CommandSpec {
+        program,
+        args,
+        env: env_out,
+        cwd: resolved_cwd,
+    })
 }
 
 fn summarise_challenge(challenge: &str) -> (String, AuthReason) {

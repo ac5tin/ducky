@@ -277,7 +277,13 @@ fn test_agent_full(
     }
     let sink = Arc::new(CollectingSink::default());
     let bridge = Arc::new(InteractiveBridge::new(sink.clone(), store.clone()));
-    let manager = Arc::new(McpManager::new(store.clone(), bridge.clone(), sink.clone()));
+    let plugins = crate::plugins::manager::PluginManager::new(&dir, &dir, None);
+    let manager = Arc::new(McpManager::new(
+        store.clone(),
+        bridge.clone(),
+        sink.clone(),
+        plugins,
+    ));
     let agent = Arc::new(Agent {
         store: store.clone(),
         manager,
