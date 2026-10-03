@@ -1316,7 +1316,7 @@ fn author_name(author: &Author) -> Option<String> {
 /// The host (with an explicit port) of a remote server URL, for the trust
 /// sheet. The full URL is never shown: a query string can carry a token
 /// (design §6). A URL that cannot be parsed yields no host at all.
-pub(super) fn display_host(url: &str) -> String {
+pub(crate) fn display_host(url: &str) -> String {
     let Ok(parsed) = url::Url::parse(url) else {
         return String::new();
     };

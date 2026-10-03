@@ -1396,16 +1396,7 @@ impl McpManager {
                         McpTransport::Stdio { .. } => "stdio".to_string(),
                         McpTransport::Http { .. } => "http".to_string(),
                     },
-                    match &c.transport {
-                        McpTransport::Stdio { command, args, .. } => {
-                            if args.is_empty() {
-                                command.clone()
-                            } else {
-                                format!("{command} {}", args.join(" "))
-                            }
-                        }
-                        McpTransport::Http { url, .. } => url.clone(),
-                    },
+                    summary_detail(server),
                     server.origin.clone(),
                 )
             }
@@ -1578,17 +1569,23 @@ pub(crate) fn merge_servers(
             continue;
         };
 
-        let shadowed = resolved.iter().any(|known| {
+        let shadowed = resolved.iter().find(|known| {
             known.config.id == server_ref.id
-                || known
-                    .config
-                    .name
-                    .eq_ignore_ascii_case(&server_ref.server.name)
+                || (known.origin.kind == ServerOriginKind::User
+                    && known
+                        .config
+                        .name
+                        .eq_ignore_ascii_case(&server_ref.server.name))
         });
-        if shadowed {
+        if let Some(known) = shadowed {
+            let shadowed_by = match known.origin.kind {
+                ServerOriginKind::User => "user server",
+                ServerOriginKind::Plugin => "plugin server",
+            };
             tracing::warn!(
                 server = %server_ref.id,
-                "plugin server is shadowed by a user server with the same id or name"
+                shadowed_by = %known.config.id,
+                "plugin server is shadowed by a {shadowed_by} with the same id or name"
             );
             continue;
         }
@@ -1751,7 +1748,17 @@ pub(crate) fn spawn_spec(
     let data_rooted = cwd.is_some_and(|raw| raw.starts_with("${PLUGIN_DATA}"));
     let containment_root = if data_rooted { data } else { root };
     let expanded_cwd = match cwd {
-        Some(raw) => PathBuf::from(expand_placeholders(raw, root, data)),
+        Some(raw) => {
+            let expanded = PathBuf::from(expand_placeholders(raw, root, data));
+            if expanded.is_absolute() {
+                expanded
+            } else {
+                // A `./` cwd joins the plugin root, exactly like a `./`
+                // program in `resolve_program` (design §2). It must never
+                // resolve against the process working directory.
+                root.join(expanded)
+            }
+        }
         None => root.to_path_buf(),
     };
     let canonical_root = std::fs::canonicalize(containment_root).map_err(|err| {
@@ -1782,6 +1789,25 @@ pub(crate) fn spawn_spec(
         env: env_out,
         cwd: resolved_cwd,
     })
+}
+
+/// The subtitle a server row shows. A plugin-provided URL can carry a
+/// query-string token, so - like the plugin view (design §6) - it shows only
+/// the host; a user's own URL stays as configured.
+pub(crate) fn summary_detail(server: &ResolvedServer) -> String {
+    match &server.config.transport {
+        McpTransport::Stdio { command, args, .. } => {
+            if args.is_empty() {
+                command.clone()
+            } else {
+                format!("{command} {}", args.join(" "))
+            }
+        }
+        McpTransport::Http { url, .. } => match server.origin.kind {
+            ServerOriginKind::Plugin => crate::plugins::manager::display_host(url),
+            ServerOriginKind::User => url.clone(),
+        },
+    }
 }
 
 fn summarise_challenge(challenge: &str) -> (String, AuthReason) {
