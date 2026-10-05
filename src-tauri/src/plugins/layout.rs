@@ -11,6 +11,7 @@ use serde_json::Value;
 use super::diagnostics::{DiagLevel, Diagnostic};
 use super::manifest::{Layout, PluginManifest, SUPPORTED_SCHEMA};
 use super::path::{resolve_within, resolve_within_maybe_missing};
+use crate::config::{EffortLevel, SubagentConfig};
 
 /// Everything discovered in one plugin package.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -62,13 +63,22 @@ pub enum RemoteKind {
     Sse,
 }
 
-/// One plugin subagent, frontmatter only; task 10 maps it to `SubagentConfig`.
+/// One plugin subagent, parsed from frontmatter/body or an inline manifest
+/// entry; task 10 maps it to `SubagentConfig`.
+///
+/// `plugin_id` is empty at discovery time — discovery is id-agnostic — and is
+/// stamped by `PluginManager::reload` when the entry enters the index.
+/// `source_path` is the plugin-relative source file, empty for inline entries.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PluginSubagent {
+    pub plugin_id: String,
     pub name: String,
     pub description: String,
-    pub frontmatter: BTreeMap<String, String>,
-    pub body: String,
+    pub system_prompt: String,
+    pub model: Option<String>,
+    pub effort: Option<EffortLevel>,
+    pub tools: Option<Vec<String>>,
+    pub source_path: PathBuf,
 }
 
 /// Discover the components of one plugin package (design §2).
@@ -643,21 +653,9 @@ fn subagent_files(root: &Path, manifest: &PluginManifest, out: &mut Discovered) 
                 .push(warning(&target, "no YAML frontmatter; subagent skipped"));
             continue;
         };
-        let name = frontmatter.get("name").filter(|n| !n.is_empty());
-        let description = frontmatter.get("description").filter(|d| !d.is_empty());
-        let (Some(name), Some(description)) = (name, description) else {
-            out.diagnostics.push(warning(
-                &target,
-                "subagent needs a non-empty `name` and `description`; subagent skipped",
-            ));
-            continue;
-        };
-        out.subagents.push(PluginSubagent {
-            name: name.clone(),
-            description: description.clone(),
-            frontmatter,
-            body,
-        });
+        if let Some(subagent) = parse_subagent(&frontmatter, &body, PathBuf::from(&target), out) {
+            out.subagents.push(subagent);
+        }
     }
 }
 
@@ -692,22 +690,173 @@ fn subagent_inline(manifest: &PluginManifest, out: &mut Discovered) {
                 }
             }
         }
-        let name = frontmatter.get("name").filter(|n| !n.is_empty());
-        let description = frontmatter.get("description").filter(|d| !d.is_empty());
-        let (Some(name), Some(description)) = (name, description) else {
-            out.diagnostics.push(warning(
-                "subagents",
-                "inline subagent needs a non-empty `name` and `description`; subagent skipped",
-            ));
-            continue;
-        };
-        out.subagents.push(PluginSubagent {
-            name: name.clone(),
-            description: description.clone(),
-            frontmatter,
-            body: String::new(),
+        let system_prompt = object
+            .get("system_prompt")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if let Some(subagent) =
+            parse_subagent(&frontmatter, &system_prompt, PathBuf::new(), out)
+        {
+            out.subagents.push(subagent);
+        }
+    }
+}
+
+/// Turn parsed frontmatter plus a body/inline prompt into the typed shape.
+/// The required name and description come from the frontmatter; an unusable
+/// `effort` is a warning that falls back to inheriting, and an absent `tools`
+/// stays `None` (every tool).
+fn parse_subagent(
+    frontmatter: &BTreeMap<String, String>,
+    body: &str,
+    source_path: PathBuf,
+    out: &mut Discovered,
+) -> Option<PluginSubagent> {
+    let target = if source_path.as_os_str().is_empty() {
+        "subagents".to_string()
+    } else {
+        source_path.display().to_string()
+    };
+    let name = frontmatter.get("name").filter(|n| !n.is_empty());
+    let description = frontmatter.get("description").filter(|d| !d.is_empty());
+    let (Some(name), Some(description)) = (name, description) else {
+        out.diagnostics.push(warning(
+            &target,
+            "subagent needs a non-empty `name` and `description`; subagent skipped",
+        ));
+        return None;
+    };
+    let effort = match frontmatter.get("effort").filter(|e| !e.is_empty()) {
+        None => None,
+        Some(raw) => match parse_effort(raw) {
+            Some(level) => Some(level),
+            None => {
+                out.diagnostics.push(warning(
+                    &target,
+                    format!(
+                        "unknown `effort` value `{raw}`; inheriting the conversation's effort"
+                    ),
+                ));
+                None
+            }
+        },
+    };
+    Some(PluginSubagent {
+        plugin_id: String::new(),
+        name: name.clone(),
+        description: description.clone(),
+        system_prompt: body.trim().to_string(),
+        model: frontmatter
+            .get("model")
+            .map(|m| m.trim())
+            .filter(|m| !m.is_empty() && !m.eq_ignore_ascii_case("inherit"))
+            .map(str::to_string),
+        effort,
+        tools: frontmatter.get("tools").map(|raw| parse_tool_list(raw)),
+        source_path,
+    })
+}
+
+/// One `effort` frontmatter value, or `None` when it names no known level.
+fn parse_effort(raw: &str) -> Option<EffortLevel> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "none" => Some(EffortLevel::None),
+        "minimal" => Some(EffortLevel::Minimal),
+        "low" => Some(EffortLevel::Low),
+        "medium" => Some(EffortLevel::Medium),
+        "high" => Some(EffortLevel::High),
+        "xhigh" => Some(EffortLevel::XHigh),
+        "max" => Some(EffortLevel::Max),
+        _ => None,
+    }
+}
+
+/// A `tools` list from either dialect: `Read, Grep`, `[Read, Grep]` and
+/// `["Read", "Grep"]` all parse to `["Read", "Grep"]`. Entries are validated
+/// against the live registry later, in [`to_subagent_config`].
+fn parse_tool_list(raw: &str) -> Vec<String> {
+    let raw = raw.trim();
+    let raw = raw
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(raw);
+    raw.split(',')
+        .map(|entry| unquote(entry.trim()))
+        .filter(|entry| !entry.is_empty())
+        .collect()
+}
+
+/// Map one discovered plugin subagent to a runnable definition (design §10).
+///
+/// The id is `plugin:<plugin-id>:<slug(name)>` and the name itself is the slug,
+/// so `validate_subagent` checks exactly what the model will see. `tools`
+/// entries are filtered against the live registry (`builtin_tools` plus
+/// qualified `mcp_tools`): an unknown entry is dropped with a warning, the two
+/// main-scope control tools are refused, and an allowlist that ends up empty
+/// stays `Some(vec![])` — "no tools", never "all tools". A definition that
+/// fails validation is reported at `DiagLevel::Error` for the caller to drop.
+/// `model` overrides are ignored: a plugin cannot name a provider the user
+/// configured, so the subagent inherits the conversation's model.
+pub fn to_subagent_config(
+    sub: &PluginSubagent,
+    builtin_tools: &[String],
+    mcp_tools: &[String],
+) -> (SubagentConfig, Vec<Diagnostic>) {
+    let slug = super::install::slug(&sub.name);
+    let target = if sub.source_path.as_os_str().is_empty() {
+        slug.clone()
+    } else {
+        sub.source_path.display().to_string()
+    };
+    let mut diagnostics = Vec::new();
+    let tools = sub.tools.as_ref().map(|entries| {
+        let mut kept = Vec::new();
+        for entry in entries {
+            let entry = entry.trim();
+            if crate::builtin::is_control(entry) {
+                diagnostics.push(warning(
+                    &target,
+                    format!("`{entry}` is a main-scope control tool; refused"),
+                ));
+            } else if builtin_tools.iter().any(|known| known == entry)
+                || mcp_tools.iter().any(|known| known == entry)
+            {
+                kept.push(entry.to_string());
+            } else {
+                diagnostics.push(warning(&target, format!("unknown tool `{entry}`; dropped")));
+            }
+        }
+        kept
+    });
+    if sub.model.is_some() {
+        diagnostics.push(Diagnostic {
+            level: DiagLevel::Info,
+            target: target.clone(),
+            message: format!(
+                "`model` overrides are ignored for plugin subagents; `{slug}` inherits the conversation's model"
+            ),
         });
     }
+    let def = SubagentConfig {
+        id: format!("plugin:{}:{slug}", sub.plugin_id),
+        name: slug,
+        description: sub.description.clone(),
+        system_prompt: sub.system_prompt.clone(),
+        provider_id: None,
+        model: None,
+        effort: sub.effort,
+        tools,
+        created_at: String::new(),
+    };
+    if let Err(message) = crate::config::validate_subagent(&def, &[], &[]) {
+        diagnostics.push(Diagnostic {
+            level: DiagLevel::Error,
+            target,
+            message,
+        });
+    }
+    (def, diagnostics)
 }
 
 // --- Frontmatter (R11: shared reader; task 9 relocates it to skills.rs) ---

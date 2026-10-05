@@ -174,6 +174,68 @@ pub fn subagent_restore_defaults(state: State<'_, Arc<AppState>>) -> Result<usiz
     Ok(added)
 }
 
+/// The reusable core of `subagent_clone_from_plugin`: map the plugin
+/// definition, give it a fresh user id and append it to the user's subagents.
+/// The caller owns saving the config.
+fn clone_plugin_subagent(
+    cfg: &mut config::AppConfig,
+    sub: &crate::plugins::layout::PluginSubagent,
+    builtin_tools: &[String],
+    mcp_tools: &[String],
+    now: &str,
+) -> Result<SubagentConfig, String> {
+    let (def, diagnostics) =
+        crate::plugins::layout::to_subagent_config(sub, builtin_tools, mcp_tools);
+    if let Some(error) = diagnostics
+        .iter()
+        .find(|diag| diag.level == crate::plugins::DiagLevel::Error)
+    {
+        return Err(error.message.clone());
+    }
+    let def = SubagentConfig {
+        id: uuid(),
+        created_at: now.to_string(),
+        ..def
+    };
+    config::validate_subagent(&def, &cfg.providers, &cfg.subagents)?;
+    cfg.subagents.push(def.clone());
+    Ok(def)
+}
+
+/// Copy one plugin-provided subagent into the user's own definitions. The
+/// clone gets a fresh user id (never the `plugin:` one), so it survives the
+/// plugin being disabled or uninstalled and is editable like any other.
+#[tauri::command]
+pub fn subagent_clone_from_plugin(
+    state: State<'_, Arc<AppState>>,
+    plugin_id: String,
+    name: String,
+) -> Result<SubagentConfig, String> {
+    let builtin_tools: Vec<String> = crate::builtin::tools()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    let mcp_tools: Vec<String> = state
+        .manager
+        .aggregated_tools()
+        .iter()
+        .map(|t| t.qualified_name.clone())
+        .collect();
+    let sub = state
+        .plugins
+        .index()
+        .subagents
+        .into_iter()
+        .find(|sub| sub.plugin_id == plugin_id && sub.name == name)
+        .ok_or_else(|| format!("plugin `{plugin_id}` has no subagent named `{name}`"))?;
+    let created = {
+        let mut c = state.store.config.lock().unwrap();
+        clone_plugin_subagent(&mut c, &sub, &builtin_tools, &mcp_tools, &now())?
+    };
+    state.store.save_config().map_err(|e| e.to_string())?;
+    Ok(created)
+}
+
 // ---------------------------------------------------------------------------
 // Onboarding & providers
 // ---------------------------------------------------------------------------
@@ -2109,6 +2171,40 @@ mod tests {
         assert_eq!(result.truncated, 2);
         assert_eq!(result.kept_messages, messages[..2]);
         assert_eq!(result.kept_records, vec![first]);
+    }
+
+    #[test]
+    fn clone_creates_user_subagent() {
+        let mut cfg = config::AppConfig::default();
+        let sub = crate::plugins::layout::PluginSubagent {
+            plugin_id: "acme".into(),
+            name: "reviewer".into(),
+            description: "reviews diffs".into(),
+            system_prompt: "You review.".into(),
+            model: None,
+            effort: Some(config::EffortLevel::High),
+            tools: Some(vec!["ducky__fs_read".into()]),
+            source_path: std::path::PathBuf::from("subagents/reviewer.md"),
+        };
+        let builtin: Vec<String> = crate::builtin::tools()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+
+        let created = clone_plugin_subagent(&mut cfg, &sub, &builtin, &[], "t").unwrap();
+
+        assert!(!created.id.starts_with("plugin:"), "{}", created.id);
+        assert!(
+            ::uuid::Uuid::parse_str(&created.id).is_ok(),
+            "the clone needs a fresh id: {}",
+            created.id
+        );
+        assert_eq!(created.name, "reviewer");
+        assert_eq!(created.created_at, "t");
+        assert_eq!(created.effort, Some(config::EffortLevel::High));
+        assert_eq!(created.tools, Some(vec!["ducky__fs_read".to_string()]));
+        assert_eq!(cfg.subagents.len(), 1);
+        assert_eq!(cfg.subagents[0].id, created.id);
     }
 
     fn steer(id: &str, text: &str) -> crate::agent::PendingSteer {

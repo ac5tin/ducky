@@ -10,7 +10,7 @@ use super::install::{
     assign_id, derive_policy, fetch_to_staging, install, package_dir, resolve_version, tree_hash,
     uninstall, AvailableUpdate, InstallRecord, InstallStore, PluginStatus, UpdatePolicy,
 };
-use super::layout::{discover, PluginTransport, RemoteKind};
+use super::layout::{discover, to_subagent_config, PluginSubagent, PluginTransport, RemoteKind};
 use super::manifest::{load, Layout};
 use super::marketplace::{
     parse_git_remote, parse_registry, parse_source, refresh, Change, Entry, HttpClient,
@@ -19,7 +19,7 @@ use super::marketplace::{
 use super::manager::{display_host, MarketplaceInput, PluginIndex, PluginManager};
 use super::skills::{collect, load_body, prompt_block, summarize, ResolvedSkill, SkillOrigin};
 use super::update::{apply, check_one, rollback};
-use crate::config::{PluginSettings, PolicyDefault};
+use crate::config::{EffortLevel, PluginSettings, PolicyDefault};
 use crate::events::{BackendEvent, CollectingSink};
 
 const SPEC_100: &str = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
@@ -1810,6 +1810,183 @@ fn policy_is_manual_with_extensions() {
 
     assert_eq!(discovered.subagents.len(), 1);
     assert_eq!(derive_policy(&discovered), UpdatePolicy::Manual);
+}
+
+// --- Plugin subagents (design §10, task 10) ---
+
+/// A plugin subagent as discovery hands it to the mapper, with sane defaults.
+fn plugin_subagent(name: &str) -> PluginSubagent {
+    PluginSubagent {
+        plugin_id: "acme".into(),
+        name: name.into(),
+        description: "reviews code".into(),
+        system_prompt: "Review.".into(),
+        model: None,
+        effort: None,
+        tools: None,
+        source_path: std::path::PathBuf::from("subagents/reviewer.md"),
+    }
+}
+
+/// The live builtin registry's names, as `to_subagent_config` expects them.
+fn builtin_tool_names() -> Vec<String> {
+    crate::builtin::tools()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect()
+}
+
+#[test]
+fn parses_app_ducky_subagents_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "plugin.json", &agent_manifest("with-subagent", ""));
+    write(
+        tmp.path(),
+        "app.ducky/subagents/reviewer.md",
+        "---\nname: reviewer\ndescription: reviews code\nmodel: claude-sonnet-4\neffort: high\ntools: ducky__fs_read, ducky__fs_search\n---\nYou review code.",
+    );
+
+    let manifest = load(tmp.path()).unwrap();
+    let found = discover(tmp.path(), &manifest);
+
+    assert_eq!(found.subagents.len(), 1, "{:?}", found.diagnostics);
+    let sub = &found.subagents[0];
+    assert_eq!(sub.name, "reviewer");
+    assert_eq!(sub.description, "reviews code");
+    assert_eq!(sub.system_prompt, "You review code.");
+    assert_eq!(sub.model.as_deref(), Some("claude-sonnet-4"));
+    assert_eq!(sub.effort, Some(EffortLevel::High));
+    assert_eq!(
+        sub.tools,
+        Some(vec![
+            "ducky__fs_read".to_string(),
+            "ducky__fs_search".to_string()
+        ])
+    );
+    assert!(
+        sub.source_path.ends_with("app.ducky/subagents/reviewer.md"),
+        "{:?}",
+        sub.source_path
+    );
+}
+
+#[test]
+fn parses_inline_extension_subagents() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "plugin.json",
+        &agent_manifest(
+            "inline-subagents",
+            r#", "extensions": {"app.ducky": {"subagents": [{"name": "reviewer", "description": "reviews code", "system_prompt": "Review.", "effort": "low", "tools": ["ducky__fs_read"]}]}}"#,
+        ),
+    );
+
+    let manifest = load(tmp.path()).unwrap();
+    let found = discover(tmp.path(), &manifest);
+
+    assert_eq!(found.subagents.len(), 1, "{:?}", found.diagnostics);
+    let sub = &found.subagents[0];
+    assert_eq!(sub.name, "reviewer");
+    assert_eq!(sub.description, "reviews code");
+    assert_eq!(sub.system_prompt, "Review.");
+    assert_eq!(sub.effort, Some(EffortLevel::Low));
+    assert_eq!(sub.tools, Some(vec!["ducky__fs_read".to_string()]));
+    assert!(
+        sub.source_path.as_os_str().is_empty(),
+        "inline subagents have no file: {:?}",
+        sub.source_path
+    );
+}
+
+#[test]
+fn parses_claude_agents_md() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        ".claude-plugin/plugin.json",
+        r#"{"name": "legacy-plugin"}"#,
+    );
+    write(
+        tmp.path(),
+        "agents/reviewer.md",
+        "---\nname: reviewer\ndescription: reviews code\ntools: Read, Grep\n---\nReview.",
+    );
+
+    let manifest = load(tmp.path()).unwrap();
+    assert_eq!(manifest.layout, Layout::ClaudeCode);
+    let found = discover(tmp.path(), &manifest);
+
+    assert_eq!(found.subagents.len(), 1, "{:?}", found.diagnostics);
+    assert_eq!(
+        found.subagents[0].tools,
+        Some(vec!["Read".to_string(), "Grep".to_string()])
+    );
+}
+
+#[test]
+fn unknown_tool_dropped_with_diagnostic() {
+    let mut sub = plugin_subagent("reviewer");
+    sub.tools = Some(vec!["ducky__nope".into(), "ducky__fs_read".into()]);
+
+    let (def, diagnostics) = to_subagent_config(&sub, &builtin_tool_names(), &[]);
+
+    assert_eq!(def.tools, Some(vec!["ducky__fs_read".to_string()]));
+    assert!(
+        diagnostics.iter().any(|d| {
+            d.level == DiagLevel::Warning && d.message.contains("ducky__nope")
+        }),
+        "{diagnostics:?}"
+    );
+}
+
+#[test]
+fn empty_after_filter_means_no_tools() {
+    let mut sub = plugin_subagent("reviewer");
+    sub.tools = Some(vec!["ducky__nope".into()]);
+
+    let (def, _diagnostics) = to_subagent_config(&sub, &builtin_tool_names(), &[]);
+
+    assert_eq!(def.tools, Some(Vec::new()), "empty must not become None");
+}
+
+#[test]
+fn control_tools_are_refused() {
+    let mut sub = plugin_subagent("reviewer");
+    sub.tools = Some(vec![
+        crate::builtin::PRESENT_PLAN.to_string(),
+        crate::builtin::SET_MODE.to_string(),
+        "ducky__fs_read".to_string(),
+    ]);
+
+    let (def, diagnostics) = to_subagent_config(&sub, &builtin_tool_names(), &[]);
+
+    assert_eq!(def.tools, Some(vec!["ducky__fs_read".to_string()]));
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains(crate::builtin::PRESENT_PLAN)),
+        "{diagnostics:?}"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains(crate::builtin::SET_MODE)),
+        "{diagnostics:?}"
+    );
+}
+
+#[test]
+fn id_is_namespaced() {
+    let (def, diagnostics) = to_subagent_config(&plugin_subagent("reviewer"), &builtin_tool_names(), &[]);
+    assert_eq!(def.id, "plugin:acme:reviewer");
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+    let mut spaced = plugin_subagent("Code Reviewer");
+    spaced.plugin_id = "acme/tools".into();
+    let (def, _diagnostics) = to_subagent_config(&spaced, &builtin_tool_names(), &[]);
+    assert_eq!(def.id, "plugin:acme/tools:code-reviewer");
+    assert_eq!(def.name, "code-reviewer");
 }
 
 #[test]
@@ -4087,6 +4264,40 @@ async fn reload_scans_records_into_index() {
     assert_eq!(index.servers.len(), 1);
     assert_eq!(index.servers[0].id, format!("plugin:{}:demo", record.id));
     assert!(index.subagents.is_empty());
+}
+
+#[tokio::test]
+async fn disabled_plugin_subagent_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    plugin_package(&source, "demo-plugin");
+    write(
+        &source,
+        "app.ducky/subagents/reviewer.md",
+        "---\nname: reviewer\ndescription: reviews code\n---\nReview.",
+    );
+    let record = seed_installed(tmp.path(), &source);
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+
+    // installed disabled: no plugin subagents reach the registry
+    manager.reload().unwrap();
+    assert!(manager.index().subagents.is_empty());
+
+    edit_record(tmp.path(), &record.id, |r| r.enabled = true);
+    // `reload` re-scans the in-memory records loaded at construction, so a
+    // fresh manager reads the edited one (same pattern as the other tests).
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+    manager.reload().unwrap();
+    let index = manager.index();
+    assert_eq!(index.subagents.len(), 1);
+    assert_eq!(index.subagents[0].name, "reviewer");
+    assert_eq!(index.subagents[0].plugin_id, record.id);
+
+    let (defs, diagnostics) = manager.resolved_subagents(&builtin_tool_names(), &[]);
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    assert_eq!(defs.len(), 1);
+    assert_eq!(defs[0].id, format!("plugin:{}:reviewer", record.id));
+    assert_eq!(defs[0].name, "reviewer");
 }
 
 #[tokio::test]

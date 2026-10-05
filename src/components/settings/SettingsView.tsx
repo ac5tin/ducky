@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useStore } from "../../store";
 import * as api from "../../api";
@@ -1015,9 +1015,17 @@ function SystemPromptSection() {
 function SubagentsSection() {
   const config = useStore((s) => s.config);
   const refreshConfig = useStore((s) => s.refreshConfig);
+  const plugins = useStore((s) => s.plugins);
+  const refreshPlugins = useStore((s) => s.refreshPlugins);
   const toast = useStore((s) => s.toast);
   const [editing, setEditing] = useState<SubagentConfig | null>(null);
   const [adding, setAdding] = useState(false);
+
+  // plugin contributions live outside the config payload, so this section
+  // loads them itself (the plugins view refreshes its own copy)
+  useEffect(() => {
+    void refreshPlugins().catch(() => undefined);
+  }, [refreshPlugins]);
 
   if (!config) return null;
 
@@ -1027,11 +1035,31 @@ function SubagentsSection() {
   const missingDefaults = DEFAULT_SUBAGENT_NAMES.filter(
     (n) => !present.has(n.toLowerCase()),
   );
+  const pluginSubagents = plugins
+    .filter((p) => p.enabled)
+    .flatMap((p) =>
+      (p.subagents ?? []).map((sub) => ({
+        ...sub,
+        pluginId: p.id,
+        pluginName: p.name,
+        shadowed: present.has(sub.name.trim().toLowerCase()),
+      })),
+    );
 
   const remove = async (id: string) => {
     try {
       await api.subagentRemove(id);
       await refreshConfig();
+    } catch (e) {
+      toast("error", `${e}`);
+    }
+  };
+
+  const clone = async (pluginId: string, name: string) => {
+    try {
+      await api.subagentCloneFromPlugin(pluginId, name);
+      await refreshConfig();
+      toast("success", `Cloned ${name} to your subagents.`);
     } catch (e) {
       toast("error", `${e}`);
     }
@@ -1093,6 +1121,48 @@ function SubagentsSection() {
           </div>
         );
       })}
+      {pluginSubagents.length > 0 && (
+        <div className="pt-1 text-xs font-medium tracking-wide text-slate-400 uppercase">
+          From plugins
+        </div>
+      )}
+      {pluginSubagents.map((sub) => (
+        <div
+          key={`${sub.pluginId}:${sub.name}`}
+          className="flex items-center justify-between gap-3 rounded-xl border border-dashed border-slate-200 p-3.5 dark:border-slate-700"
+        >
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="font-semibold">{sub.name}</span>
+              <span className={chipClass()}>Plugin</span>
+              {sub.shadowed && (
+                <span className={chipClass()}>Shadowed by yours</span>
+              )}
+            </div>
+            <div className="truncate text-xs text-slate-400">
+              {sub.description}
+            </div>
+            <div className="mt-1.5 text-xs text-slate-400">
+              From {sub.pluginName}
+            </div>
+          </div>
+          <div className="flex shrink-0 gap-1.5">
+            <Button
+              variant="secondary"
+              disabled
+              title="Plugin subagents are read-only — clone one to edit it"
+            >
+              Edit
+            </Button>
+            <Button
+              variant="secondary"
+              onClick={() => void clone(sub.pluginId, sub.name)}
+            >
+              Clone to my subagents
+            </Button>
+          </div>
+        </div>
+      ))}
       <div className="flex gap-2">
         <Button variant="secondary" onClick={() => setAdding(true)}>
           <Icon name="plus" className="h-4 w-4" />

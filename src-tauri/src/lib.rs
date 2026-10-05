@@ -82,6 +82,7 @@ pub fn run() {
             commands::subagent_update,
             commands::subagent_remove,
             commands::subagent_restore_defaults,
+            commands::subagent_clone_from_plugin,
             commands::provider_add,
             commands::provider_update,
             commands::provider_delete,

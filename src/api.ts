@@ -128,6 +128,10 @@ export const subagentRemove = (id: string) =>
 export const subagentRestoreDefaults = () =>
   invoke<number>("subagent_restore_defaults");
 
+/** Copy one plugin-provided subagent into the user's own definitions. */
+export const subagentCloneFromPlugin = (pluginId: string, name: string) =>
+  invoke<SubagentConfig>("subagent_clone_from_plugin", { pluginId, name });
+
 // ---------------------------------------------------------------------------
 // Conversations & chat
 // ---------------------------------------------------------------------------

@@ -81,6 +81,39 @@ fn tool_allowed(allow: &[String], server_id: &str, qualified_name: &str) -> bool
     })
 }
 
+/// Merge the user's subagent definitions with the plugin-provided ones:
+/// user definitions first, plugin definitions after. The first definition with
+/// a name is the one `ducky__subagent` resolves, so a user definition wins a
+/// name collision; the shadowed plugin definition stays listed but is
+/// reported. Returns the registry and one diagnostic per shadowed plugin
+/// subagent.
+pub(crate) fn merge_subagent_defs(
+    mut user: Vec<crate::config::SubagentConfig>,
+    plugin: Vec<crate::config::SubagentConfig>,
+) -> (
+    Vec<crate::config::SubagentConfig>,
+    Vec<crate::plugins::Diagnostic>,
+) {
+    let mut diagnostics = Vec::new();
+    for def in plugin {
+        if let Some(winner) = user
+            .iter()
+            .find(|known| known.name.trim().eq_ignore_ascii_case(def.name.trim()))
+        {
+            diagnostics.push(crate::plugins::Diagnostic {
+                level: crate::plugins::DiagLevel::Warning,
+                target: def.id.clone(),
+                message: format!(
+                    "plugin subagent `{}` is shadowed by `{}` with the same name",
+                    def.id, winner.id
+                ),
+            });
+        }
+        user.push(def);
+    }
+    (user, diagnostics)
+}
+
 /// Whether a tool may be offered to the model — and may run — in this mode.
 /// The same predicate filters the tool list and gates execution, so a forced
 /// call can never do what the list would not offer.
@@ -406,6 +439,33 @@ impl Agent {
         if let Ok(parsed) = serde_json::from_value::<BackendEvent>(event) {
             self.sink.emit(parsed);
         }
+    }
+
+    /// The live subagent registry: the user's definitions first, then the
+    /// enabled plugins' ones, rebuilt on every call so an enable/disable or a
+    /// config edit applies mid-turn. Every mapping and shadowing diagnostic is
+    /// logged — the agent has no UI channel for them.
+    fn subagent_registry(&self) -> Vec<crate::config::SubagentConfig> {
+        let user = self.store.config.lock().unwrap().subagents.clone();
+        let builtin_tools: Vec<String> = crate::builtin::tools()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        let mcp_tools: Vec<String> = self
+            .manager
+            .aggregated_tools()
+            .iter()
+            .map(|t| t.qualified_name.clone())
+            .collect();
+        let (plugin, diagnostics) = self
+            .manager
+            .plugins()
+            .resolved_subagents(&builtin_tools, &mcp_tools);
+        let (registry, shadowed) = merge_subagent_defs(user, plugin);
+        for diag in diagnostics.iter().chain(shadowed.iter()) {
+            tracing::warn!(subagent = %diag.target, "plugin subagent: {}", diag.message);
+        }
+        registry
     }
 
     /// The skills visible to this run, resolved from the plugin index and the
@@ -934,7 +994,7 @@ impl Agent {
             }
             // With configured agent types the subagent tool gains an `agent`
             // enum describing them; with none it stays the generic static def.
-            let subagent_defs = self.store.config.lock().unwrap().subagents.clone();
+            let subagent_defs = self.subagent_registry();
             if !subagent_defs.is_empty() {
                 builtin_defs.retain(|t| t.name != crate::builtin::SUBAGENT);
                 builtin_defs.push(crate::builtin::subagent_tool_def(&subagent_defs));
@@ -1311,9 +1371,8 @@ impl Agent {
             None => (crate::builtin::DEFAULT_SUBAGENT_NAME, false),
         };
         let spec = {
-            let cfg = self.store.config.lock().unwrap();
-            match cfg
-                .subagents
+            let defs = self.subagent_registry();
+            match defs
                 .iter()
                 .find(|s| s.name.trim().eq_ignore_ascii_case(lookup_name))
                 .cloned()
@@ -1321,8 +1380,7 @@ impl Agent {
                 Some(def) => Some(SubagentSpec::from(def)),
                 None if explicit => {
                     let available: Vec<String> =
-                        cfg.subagents.iter().map(|s| s.name.clone()).collect();
-                    drop(cfg);
+                        defs.iter().map(|s| s.name.clone()).collect();
                     let msg = if available.is_empty() {
                         "no subagent types are configured; omit `agent` to spawn a generic \
                          subagent"

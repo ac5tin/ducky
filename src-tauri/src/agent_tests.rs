@@ -1966,6 +1966,40 @@ async fn skills_block_reaches_main_and_subagent_prompts() {
     assert!(sub[0].system.contains("# Skills"), "{}", sub[0].system);
 }
 
+#[test]
+fn user_subagent_wins_name_collision() {
+    let user = config_subagent("u1", "reviewer");
+    let plugin = config_subagent("plugin:acme:reviewer", "reviewer");
+
+    let (merged, diagnostics) = crate::agent::merge_subagent_defs(vec![user], vec![plugin]);
+
+    assert_eq!(merged.len(), 2, "both definitions are listed");
+    assert_eq!(merged[0].id, "u1", "the user definition is listed first");
+    assert_eq!(merged[1].id, "plugin:acme:reviewer");
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].level, crate::plugins::DiagLevel::Warning);
+    assert!(
+        diagnostics[0].message.contains("plugin:acme:reviewer")
+            && diagnostics[0].message.contains("shadowed"),
+        "{diagnostics:?}"
+    );
+}
+
+/// A minimal definition for registry-merge tests.
+fn config_subagent(id: &str, name: &str) -> SubagentConfig {
+    SubagentConfig {
+        id: id.into(),
+        name: name.into(),
+        description: "reviews code".into(),
+        system_prompt: String::new(),
+        provider_id: None,
+        model: None,
+        effort: None,
+        tools: None,
+        created_at: "t".into(),
+    }
+}
+
 #[tokio::test]
 async fn skills_block_absent_without_skills() {
     script("t9-noskills-main", vec![MockRound::Text("ok".into())]);

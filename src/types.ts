@@ -508,12 +508,19 @@ export interface PluginSkillSummary {
         path: string;
 }
 
+/** One subagent contributed by a plugin, as `plugins_list` reports it. */
+export interface PluginSubagentSummary {
+        name: string;
+        description: string;
+}
+
 /** One installed plugin as `plugins_list` reports it. */
 export interface PluginSummary {
         id: string;
         name: string;
         enabled: boolean;
         skills: PluginSkillSummary[];
+        subagents: PluginSubagentSummary[];
 }
 
 /**

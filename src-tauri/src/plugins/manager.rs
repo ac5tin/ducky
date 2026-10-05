@@ -21,7 +21,7 @@ use super::marketplace::{
 };
 use super::skills::{self, ResolvedSkill};
 use super::update;
-use crate::config::{expand_tilde, PolicyDefault};
+use crate::config::{expand_tilde, PolicyDefault, SubagentConfig};
 use crate::events::{BackendEvent, EventSink};
 
 /// The bundled official marketplace id. It can never be removed or shadowed
@@ -293,6 +293,32 @@ impl PluginManager {
         )
     }
 
+    /// Every subagent contributed by an enabled plugin, mapped to a runnable
+    /// definition (design §10), in index order, with the per-definition
+    /// diagnostics. The caller supplies the live tool names because the
+    /// manager does not own the MCP registry. A definition whose name or
+    /// description fails validation is reported as an error and dropped.
+    pub fn resolved_subagents(
+        &self,
+        builtin_tools: &[String],
+        mcp_tools: &[String],
+    ) -> (Vec<SubagentConfig>, Vec<Diagnostic>) {
+        let mut defs = Vec::new();
+        let mut diagnostics = Vec::new();
+        for sub in &self.index().subagents {
+            let (def, mut sub_diagnostics) =
+                super::layout::to_subagent_config(sub, builtin_tools, mcp_tools);
+            let invalid = sub_diagnostics
+                .iter()
+                .any(|diag| diag.level == DiagLevel::Error);
+            diagnostics.append(&mut sub_diagnostics);
+            if !invalid {
+                defs.push(def);
+            }
+        }
+        (defs, diagnostics)
+    }
+
     /// Rebuild the index from the install records and the packages on disk.
     ///
     /// A missing package keeps its record and reports `Error`; an invalid
@@ -316,7 +342,11 @@ impl PluginManager {
             let (plugin, discovered) = self.scan(record);
             if record.enabled {
                 index.skills.extend(discovered.skills.iter().cloned());
-                index.subagents.extend(discovered.subagents.iter().cloned());
+                index.subagents.extend(discovered.subagents.iter().cloned().map(|mut sub| {
+                    // discovery is id-agnostic; the record owns the plugin id
+                    sub.plugin_id = record.id.clone();
+                    sub
+                }));
                 for server in &discovered.servers {
                     if !is_server_disabled(record, &server.name) {
                         index.servers.push(PluginServerRef {
