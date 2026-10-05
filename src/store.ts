@@ -10,6 +10,15 @@ import {
 } from "./chatSteering";
 import { resolveDraftModel } from "./chatDraft";
 import { toLayout } from "./groups";
+import {
+  formatVersion,
+  hoursToInterval,
+  runInstallPlugin,
+  withPluginProgress,
+  withUpdateAvailable,
+  withoutPluginProgress,
+  type PluginProgressRow,
+} from "./plugins";
 import { expandInitPrompt, formatSkills, parseSlashCommand } from "./slashCommands";
 import {
   activityTool,
@@ -22,11 +31,18 @@ import type {
   AppConfig,
   AuthReason,
   BackendEvent,
+  CatalogEntry,
   ChatGroup,
   ConnectorSuggestion,
   EffortLevel,
+  MarketplaceInput,
+  MarketplaceSummary,
   PlanRequest,
+  PluginDetail,
+  PluginInstallRequest,
+  PluginSettings,
   PluginSummary,
+  PluginUpdateInfo,
   ProviderConfig,
   ProviderPreset,
   RawMessage,
@@ -34,6 +50,7 @@ import type {
   SkillSummary,
   SteeringMessage,
   ToolCallState,
+  UpdatePolicy,
 } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -71,6 +88,8 @@ export interface Toast {
   id: string;
   kind: "error" | "info" | "success";
   text: string;
+  /** Optional inline action, e.g. Update on an update-available toast. */
+  action?: { label: string; run: () => void };
 }
 
 export interface ApprovalRequest {
@@ -131,6 +150,40 @@ function scheduleUpdateChecks(hours: number) {
     }, hours * 3_600_000);
   }
 }
+
+let marketplaceTimer: ReturnType<typeof setInterval> | null = null;
+let pluginUpdateTimer: ReturnType<typeof setInterval> | null = null;
+let marketplaceHours: number | null = null;
+let pluginUpdateHours: number | null = null;
+
+/**
+ * (Re)arm the two plugin timers from settings; 0 hours means "startup only",
+ * so no interval starts. A timer is only touched when its hours changed, so
+ * the `refreshConfig()` that follows every turn never resets the countdown —
+ * and a settings change can never leave two timers running.
+ */
+function schedulePluginMaintenance(settings: PluginSettings) {
+  if (settings.marketplace_refresh_hours !== marketplaceHours) {
+    marketplaceHours = settings.marketplace_refresh_hours;
+    const marketplaceMs = hoursToInterval(marketplaceHours);
+    if (marketplaceTimer) clearInterval(marketplaceTimer);
+    marketplaceTimer = marketplaceMs
+      ? setInterval(() => {
+          void useStore.getState().refreshMarketplace(null);
+        }, marketplaceMs)
+      : null;
+  }
+  if (settings.update_check_hours !== pluginUpdateHours) {
+    pluginUpdateHours = settings.update_check_hours;
+    const updateMs = hoursToInterval(pluginUpdateHours);
+    if (pluginUpdateTimer) clearInterval(pluginUpdateTimer);
+    pluginUpdateTimer = updateMs
+      ? setInterval(() => {
+          void useStore.getState().checkForPluginUpdates();
+        }, updateMs)
+      : null;
+  }
+}
 const media =
   typeof window === "undefined"
     ? null
@@ -156,6 +209,13 @@ interface StoreState {
   servers: ServerSummary[];
   plugins: PluginSummary[];
   skills: SkillSummary[];
+  marketplaces: MarketplaceSummary[];
+  catalog: CatalogEntry[];
+  /** The marketplace the Discover tab shows; null = every marketplace. */
+  catalogMarketplace: string | null;
+  catalogLoading: boolean;
+  /** In-flight plugin operations, keyed by install record id. */
+  pluginProgress: Record<string, PluginProgressRow>;
   version: string;
   /** The machine's home directory; the default working directory. */
   homeDir: string;
@@ -200,7 +260,7 @@ interface StoreState {
   init: () => Promise<void>;
   setView: (v: View) => void;
 
-  toast: (kind: Toast["kind"], text: string) => void;
+  toast: (kind: Toast["kind"], text: string, action?: Toast["action"]) => void;
   dismissToast: (id: string) => void;
 
   checkForUpdates: (manual: boolean) => Promise<void>;
@@ -212,6 +272,32 @@ interface StoreState {
   refreshServers: () => Promise<void>;
   refreshPlugins: () => Promise<void>;
   refreshSkills: () => Promise<void>;
+  refreshMarketplaces: () => Promise<void>;
+  /** Load the catalog for one marketplace, or all when `marketplace` is null. */
+  loadCatalog: (marketplace: string | null) => Promise<void>;
+  installPlugin: (req: PluginInstallRequest) => Promise<PluginDetail | null>;
+  /** `null` = no such plugin; a rejected promise = the load itself failed. */
+  loadPluginDetail: (id: string) => Promise<PluginDetail | null>;
+  setPluginEnabled: (id: string, enabled: boolean) => Promise<void>;
+  setPluginServerEnabled: (
+    id: string,
+    server: string,
+    enabled: boolean,
+  ) => Promise<void>;
+  setPluginUpdatePolicy: (id: string, policy: UpdatePolicy) => Promise<void>;
+  checkForPluginUpdates: () => Promise<PluginUpdateInfo[]>;
+  updatePlugin: (id: string, force?: boolean) => Promise<void>;
+  updateAllPlugins: (force?: boolean) => Promise<void>;
+  rollbackPlugin: (id: string) => Promise<void>;
+  uninstallPlugin: (id: string, deleteData: boolean) => Promise<void>;
+  openPluginFolder: (id: string, which?: "package" | "data") => Promise<void>;
+  addMarketplace: (
+    input: MarketplaceInput,
+    name?: string,
+  ) => Promise<MarketplaceSummary | null>;
+  removeMarketplace: (id: string, confirm?: boolean) => Promise<void>;
+  refreshMarketplace: (id: string | null) => Promise<void>;
+  setMarketplaceAutoRefresh: (id: string, enabled: boolean) => Promise<void>;
   refreshServer: (id: string) => Promise<void>;
 
   openConversation: (id: string) => Promise<void>;
@@ -339,6 +425,11 @@ export const useStore = create<StoreState>((set, get) => ({
   servers: [],
   plugins: [],
   skills: [],
+  marketplaces: [],
+  catalog: [],
+  catalogMarketplace: null,
+  catalogLoading: false,
+  pluginProgress: {},
   version: "",
   homeDir: "",
 
@@ -399,6 +490,11 @@ export const useStore = create<StoreState>((set, get) => ({
             boot.config.settings.update_check_interval_hours,
           );
           void get().checkForUpdates(false);
+          // the plugin timers run once at startup, then on their intervals;
+          // 0 hours in settings leaves only the startup run
+          schedulePluginMaintenance(boot.config.settings.plugins);
+          void get().refreshMarketplace(null);
+          void get().checkForPluginUpdates();
         }
       })().catch((e) => {
         initPromise = null;
@@ -412,10 +508,12 @@ export const useStore = create<StoreState>((set, get) => ({
     set({ view });
   },
 
-  toast(kind, text) {
+  toast(kind, text, action) {
     const id = Math.random().toString(36).slice(2);
-    set((s) => ({ toasts: [...s.toasts, { id, kind, text }] }));
-    setTimeout(() => get().dismissToast(id), kind === "error" ? 9000 : 4000);
+    set((s) => ({ toasts: [...s.toasts, { id, kind, text, action }] }));
+    // an actionable toast needs time to be read and clicked
+    const ms = kind === "error" || action ? 9000 : 4000;
+    setTimeout(() => get().dismissToast(id), ms);
   },
   dismissToast(id) {
     set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) }));
@@ -436,6 +534,8 @@ export const useStore = create<StoreState>((set, get) => ({
     }));
     // the check interval may have just changed
     scheduleUpdateChecks(config.settings.update_check_interval_hours);
+    // so may the plugin intervals: re-arming is the only way they change
+    schedulePluginMaintenance(config.settings.plugins);
   },
 
   async refreshServers() {
@@ -448,6 +548,223 @@ export const useStore = create<StoreState>((set, get) => ({
 
   async refreshSkills() {
     set({ skills: await api.skillsList() });
+  },
+
+  async refreshMarketplaces() {
+    set({ marketplaces: await api.marketplacesList() });
+  },
+
+  async loadCatalog(marketplace) {
+    set({ catalogLoading: true, catalogMarketplace: marketplace });
+    try {
+      const catalog = await api.marketplaceCatalog(marketplace);
+      set({ catalog, catalogLoading: false });
+    } catch (err) {
+      set({ catalog: [], catalogLoading: false });
+      get().toast("error", `Could not load the catalog: ${err}`);
+    }
+  },
+
+  async installPlugin(req) {
+    try {
+      const detail = await runInstallPlugin(api, req, (catalogLoading) =>
+        set({ catalogLoading }),
+      );
+      await reloadPluginState(get);
+      await get().loadCatalog(get().catalogMarketplace);
+      get().toast("success", `Installed ${detail.name}`);
+      return detail;
+    } catch (err) {
+      get().toast("error", `Install failed: ${err}`);
+      return null;
+    } finally {
+      // the install's three phases are over either way; the record id is only
+      // known on success, so drop the whole set rather than guess
+      set({ pluginProgress: {} });
+    }
+  },
+
+  async loadPluginDetail(id) {
+    try {
+      return await api.pluginDetail(id);
+    } catch (err) {
+      // a rejected load is not "plugin not found": surface it, then let the
+      // caller decide — the two must never render the same way
+      get().toast("error", `Could not load ${id}: ${err}`);
+      throw err;
+    }
+  },
+
+  async setPluginEnabled(id, enabled) {
+    try {
+      await api.pluginSetEnabled(id, enabled);
+      await reloadPluginState(get);
+      get().toast("success", enabled ? "Plugin enabled" : "Plugin disabled");
+    } catch (err) {
+      get().toast(
+        "error",
+        `Could not ${enabled ? "enable" : "disable"} the plugin: ${err}`,
+      );
+    }
+  },
+
+  async setPluginServerEnabled(id, server, enabled) {
+    try {
+      await api.pluginSetServerEnabled(id, server, enabled);
+      await reloadPluginState(get);
+      await get()
+        .refreshServers()
+        .catch(() => {});
+    } catch (err) {
+      get().toast(
+        "error",
+        `Could not ${enabled ? "start" : "stop"} the server: ${err}`,
+      );
+    }
+  },
+
+  async setPluginUpdatePolicy(id, policy) {
+    try {
+      await api.pluginSetUpdatePolicy(id, policy);
+      await get().refreshPlugins();
+    } catch (err) {
+      get().toast("error", `Could not set the update policy: ${err}`);
+    }
+  },
+
+  async checkForPluginUpdates() {
+    try {
+      const updates = await api.pluginCheckUpdates();
+      await reloadPluginState(get);
+      return updates;
+    } catch (err) {
+      get().toast("error", `Update check failed: ${err}`);
+      return [];
+    }
+  },
+
+  async updatePlugin(id, force = false) {
+    try {
+      const info = await api.pluginUpdate(id, force);
+      await reloadPluginState(get);
+      await get().loadCatalog(get().catalogMarketplace);
+      get().toast(
+        "success",
+        `${info.plugin_id} updated to ${formatVersion(info.to)}`,
+      );
+    } catch (err) {
+      get().toast("error", `Update failed: ${err}`);
+    } finally {
+      set((s) => ({
+        pluginProgress: withoutPluginProgress(s.pluginProgress, id),
+      }));
+    }
+  },
+
+  async updateAllPlugins(force = false) {
+    try {
+      const updates = await api.pluginUpdateAll(force);
+      await reloadPluginState(get);
+      await get().loadCatalog(get().catalogMarketplace);
+      get().toast(
+        updates.length ? "success" : "info",
+        updates.length
+          ? `${updates.length} plugin(s) updated`
+          : "Everything is up to date",
+      );
+    } catch (err) {
+      get().toast("error", `Update failed: ${err}`);
+    } finally {
+      set({ pluginProgress: {} });
+    }
+  },
+
+  async rollbackPlugin(id) {
+    try {
+      const info = await api.pluginRollback(id);
+      await reloadPluginState(get);
+      await get().loadCatalog(get().catalogMarketplace);
+      get().toast(
+        "success",
+        `${info.plugin_id} rolled back to ${formatVersion(info.to)}`,
+      );
+    } catch (err) {
+      get().toast("error", `Rollback failed: ${err}`);
+    }
+  },
+
+  async uninstallPlugin(id, deleteData) {
+    const name = get().plugins.find((p) => p.id === id)?.name ?? id;
+    try {
+      const serverIds = await api.pluginUninstall(id, deleteData);
+      // the package is gone, but its MCP servers keep running unless we drop
+      // them here: the backend only reports the ids the plugin owned
+      for (const serverId of serverIds) {
+        await api.mcpDisconnect(serverId).catch(() => {});
+      }
+      await reloadPluginState(get);
+      await get()
+        .refreshServers()
+        .catch(() => {});
+      await get().loadCatalog(get().catalogMarketplace);
+      set((s) => ({
+        pluginProgress: withoutPluginProgress(s.pluginProgress, id),
+      }));
+      get().toast("success", `Uninstalled ${name}`);
+    } catch (err) {
+      get().toast("error", `Uninstall failed: ${err}`);
+    }
+  },
+
+  async openPluginFolder(id, which = "package") {
+    try {
+      await api.pluginOpenFolder(id, which);
+    } catch (err) {
+      get().toast("error", `Could not open the folder: ${err}`);
+    }
+  },
+
+  async addMarketplace(input, name) {
+    try {
+      const summary = await api.marketplaceAdd(input, name);
+      await get().refreshMarketplaces();
+      await get().loadCatalog(get().catalogMarketplace);
+      get().toast("success", `Added ${summary.name}`);
+      return summary;
+    } catch (err) {
+      get().toast("error", `Could not add the marketplace: ${err}`);
+      return null;
+    }
+  },
+
+  async removeMarketplace(id, confirm = false) {
+    try {
+      await api.marketplaceRemove(id, confirm);
+      await get().refreshMarketplaces();
+      const shown = get().catalogMarketplace;
+      await get().loadCatalog(shown === id ? null : shown);
+      get().toast("success", "Marketplace removed");
+    } catch (err) {
+      get().toast("error", `Could not remove the marketplace: ${err}`);
+    }
+  },
+
+  async refreshMarketplace(id) {
+    try {
+      set({ marketplaces: await api.marketplaceRefresh(id) });
+      await get().loadCatalog(get().catalogMarketplace);
+    } catch (err) {
+      get().toast("error", `Refresh failed: ${err}`);
+    }
+  },
+
+  async setMarketplaceAutoRefresh(id, enabled) {
+    try {
+      await api.marketplaceSetAutoRefresh(id, enabled);
+      await get().refreshMarketplaces();
+    } catch (err) {
+      get().toast("error", `Could not change auto-refresh: ${err}`);
+    }
   },
 
   async refreshServer(id) {
@@ -706,9 +1023,9 @@ export const useStore = create<StoreState>((set, get) => ({
           return get().send(expandInitPrompt(workingDir, command.args));
         }
         case "skills": {
-          // always refresh: nothing writes this slice on plugins_changed yet,
-          // so a second /skills in a session must not render the first
-          // snapshot; a failed refresh is reported, never rendered stale
+          // always refresh: plugins_changed writes this slice too, but a
+          // second /skills must never render a stale snapshot; a failed
+          // refresh is reported, never rendered stale
           let text: string;
           try {
             await get().refreshSkills();
@@ -1329,6 +1646,11 @@ function flushSteering(convId: string, set: SetFn, get: GetFn) {
   void dispatchSend(convId, next.text, set, get);
 }
 
+/** Refresh the two slices the plugin index feeds: rows and skills. */
+async function reloadPluginState(get: GetFn) {
+  await Promise.all([get().refreshPlugins(), get().refreshSkills()]);
+}
+
 function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
   if (
     event.type !== "chat_delta" &&
@@ -1698,6 +2020,47 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
           : s.config;
         return { titleGeneratingIds, config };
       });
+      break;
+    }
+    case "plugins_changed": {
+      // the index feeds both slices: the rows (status, components, updates)
+      // and the skills list the model and /skills see
+      void reloadPluginState(get).catch(() => {});
+      break;
+    }
+    case "plugin_progress": {
+      // keyed by install record id, so all three phases land on one row
+      set((s) => ({
+        pluginProgress: withPluginProgress(s.pluginProgress, event),
+      }));
+      break;
+    }
+    case "plugin_update_available": {
+      set((s) => ({ plugins: withUpdateAvailable(s.plugins, event) }));
+      const name =
+        get().plugins.find((p) => p.id === event.plugin_id)?.name ??
+        event.plugin_id;
+      get().toast("info", `Update available for ${name}`, {
+        label: "Update",
+        run: () => {
+          void get().updatePlugin(event.plugin_id);
+        },
+      });
+      break;
+    }
+    case "marketplace_refreshed": {
+      if (event.error) {
+        get().toast("error", `Marketplace refresh failed: ${event.error}`);
+      }
+      void get()
+        .refreshMarketplaces()
+        .catch(() => {});
+      const shown = get().catalogMarketplace;
+      // reload when the moved marketplace is the one on screen, or when the
+      // screen shows every marketplace
+      if (shown === null || shown === event.marketplace_id) {
+        void get().loadCatalog(shown);
+      }
       break;
     }
   }

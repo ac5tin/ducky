@@ -5,16 +5,23 @@ import type {
   AgentMode,
   AppConfig,
   BackendEvent,
+  CatalogEntry,
   ChatGroup,
   ClonedSubagent,
   ConnectorSuggestion,
   ConversationMeta,
   EffortLevel,
   GroupLayout,
+  MarketplaceInput,
+  MarketplaceSummary,
   McpServerConfig,
+  PluginDetail,
+  PluginInstallRequest,
   PluginSummary,
+  PluginUpdateInfo,
   SkillSummary,
   ToolDetailsMode,
+  UpdatePolicy,
   ProviderConfig,
   ProviderPreset,
   RawMessage,
@@ -393,3 +400,67 @@ export const pluginsList = () => invoke<PluginSummary[]>("plugins_list");
  * shadowing. The system-prompt block is built from the same list.
  */
 export const skillsList = () => invoke<SkillSummary[]>("skills_list");
+
+/**
+ * One plugin, full component and trust detail. Resolves to `null` when the id
+ * is not in the index; an unsafe id rejects with an error — the two are not
+ * the same and a caller must not render "not found" for a rejection.
+ */
+export const pluginDetail = (id: string) =>
+  invoke<PluginDetail | null>("plugin_detail", { id });
+
+/** Install from a marketplace entry (`marketplace` + `name`) or a `source`. */
+export const pluginInstall = (req: PluginInstallRequest) =>
+  invoke<PluginDetail>("plugin_install", req);
+
+/** Uninstall; returns the `plugin:<id>:<server>` ids the package owned. */
+export const pluginUninstall = (id: string, deleteData: boolean) =>
+  invoke<string[]>("plugin_uninstall", { id, deleteData });
+
+export const pluginSetEnabled = (id: string, enabled: boolean) =>
+  invoke<void>("plugin_set_enabled", { id, enabled });
+
+export const pluginSetServerEnabled = (
+  id: string,
+  server: string,
+  enabled: boolean,
+) => invoke<void>("plugin_set_server_enabled", { id, server, enabled });
+
+export const pluginSetUpdatePolicy = (id: string, policy: UpdatePolicy) =>
+  invoke<void>("plugin_set_update_policy", { id, policy });
+
+export const pluginCheckUpdates = () =>
+  invoke<PluginUpdateInfo[]>("plugin_check_updates");
+
+export const pluginUpdate = (id: string, force = false) =>
+  invoke<PluginUpdateInfo>("plugin_update", { id, force });
+
+export const pluginUpdateAll = (force = false) =>
+  invoke<PluginUpdateInfo[]>("plugin_update_all", { force });
+
+export const pluginRollback = (id: string) =>
+  invoke<PluginUpdateInfo>("plugin_rollback", { id });
+
+/** Reveal the package (`which = "package"`, the default) or data directory. */
+export const pluginOpenFolder = (id: string, which: "package" | "data" = "package") =>
+  invoke<void>("plugin_open_folder", { id, which });
+
+export const marketplacesList = () =>
+  invoke<MarketplaceSummary[]>("marketplaces_list");
+
+export const marketplaceAdd = (input: MarketplaceInput, name?: string) =>
+  invoke<MarketplaceSummary>("marketplace_add", { input, name });
+
+export const marketplaceRemove = (id: string, confirm = false) =>
+  invoke<void>("marketplace_remove", { id, confirm });
+
+/** Refresh one marketplace, or every one when `id` is null. */
+export const marketplaceRefresh = (id: string | null = null) =>
+  invoke<MarketplaceSummary[]>("marketplace_refresh", { id });
+
+export const marketplaceSetAutoRefresh = (id: string, enabled: boolean) =>
+  invoke<void>("marketplace_set_auto_refresh", { id, enabled });
+
+/** Normalised registry entries plus install state; null = every marketplace. */
+export const marketplaceCatalog = (marketplace: string | null = null) =>
+  invoke<CatalogEntry[]>("marketplace_catalog", { marketplace });

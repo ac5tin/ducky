@@ -101,6 +101,8 @@ export interface AppSettings {
         update_check_interval_hours: number;
         /** Custom prompt appended to the main agent's system message; empty = none. */
         system_prompt: string;
+        /** Plugin settings (design §3). */
+        plugins: PluginSettings;
 }
 
 export interface ConversationMeta {
@@ -456,7 +458,22 @@ export type BackendEvent =
                   exit_code: number | null;
           }
         | { type: "title_generating"; conversation_id: string }
-        | { type: "title_updated"; conversation_id: string; title: string };
+        | { type: "title_updated"; conversation_id: string; title: string }
+        | { type: "plugins_changed"; reason: string }
+        | {
+                  type: "plugin_update_available";
+                  plugin_id: string;
+                  from: string | null;
+                  to: string | null;
+          }
+        | ({
+                  type: "plugin_progress";
+          } & PluginProgressEvent)
+        | {
+                  type: "marketplace_refreshed";
+                  marketplace_id: string;
+                  error: string | null;
+          };
 
 // ---------------------------------------------------------------------------
 // Terminal
@@ -506,6 +523,70 @@ export interface ElicitationSchemaShape {
 // Plugins and skills
 // ---------------------------------------------------------------------------
 
+/**
+ * Where a plugin or marketplace came from (`PluginSource`). Serialized with
+ * the tag `kind` and kebab-case variants; the git ref is written `ref`.
+ */
+export type PluginSource =
+        | {
+                  kind: "github";
+                  repo: string;
+                  path?: string | null;
+                  ref?: string | null;
+                  sha?: string | null;
+          }
+        | {
+                  kind: "git";
+                  url: string;
+                  path?: string | null;
+                  ref?: string | null;
+                  sha?: string | null;
+          }
+        | {
+                  kind: "git-subdir";
+                  url: string;
+                  path: string;
+                  ref?: string | null;
+                  sha?: string | null;
+          }
+        | { kind: "url"; url: string }
+        | { kind: "path"; path: string }
+        | { kind: "unsupported"; sourceKind: string; detail: string };
+
+/** How the package is laid out on disk. */
+export type PluginLayout = "agent-plugins" | "claude-code";
+
+/** Update policy of one installed plugin (design §7). */
+export type UpdatePolicy = "auto" | "manual";
+
+/** Lifecycle state of one installed plugin (design §11). */
+export type PluginStatus =
+        | "installed_disabled"
+        | "enabled"
+        | "invalid"
+        | "update_available"
+        | "modified_locally"
+        | "error";
+
+/** Severity of one plugin diagnostic. */
+export type PluginDiagnosticLevel = "error" | "warning" | "info";
+
+/** One diagnosis about a plugin package or component. */
+export interface PluginDiagnostic {
+        level: PluginDiagnosticLevel;
+        target: string;
+        message: string;
+}
+
+/**
+ * The update an update check found, cached on the install record. Serialized
+ * camelCase: the SHA field is `resolvedSha`.
+ */
+export interface AvailableUpdate {
+        version: string | null;
+        resolvedSha: string | null;
+}
+
 /** One skill contributed by a plugin, as `plugins_list` reports it. */
 export interface PluginSkillSummary {
         name: string;
@@ -523,13 +604,148 @@ export interface PluginSubagentSummary {
         slug: string;
 }
 
-/** One installed plugin as `plugins_list` reports it. */
+/**
+ * One MCP server a plugin contributes. `url` is host[:port] only — the backend
+ * never sends a query string, and env/header values never reach the webview.
+ */
+export interface PluginServerView {
+        name: string;
+        id: string;
+        /** True only when the plugin is enabled and this server is consented. */
+        enabled: boolean;
+        /** `stdio`, `streamable-http` or `sse`. */
+        transport: string;
+        command: string | null;
+        args: string[];
+        url: string | null;
+}
+
+/**
+ * One component a plugin contributes. The three shapes are told apart by the
+ * fields they carry: `path` (skill), `slug` (subagent), `transport` (server).
+ */
+export type PluginComponent =
+        | PluginSkillSummary
+        | PluginSubagentSummary
+        | PluginServerView;
+
+/** One installed plugin as `plugins_list` reports it (`PluginSummary`). */
 export interface PluginSummary {
         id: string;
         name: string;
+        version: string | null;
+        previous_version: string | null;
+        marketplace: string | null;
+        source: PluginSource;
+        resolved_sha: string | null;
+        resolved_sha256: string | null;
+        layout: PluginLayout;
         enabled: boolean;
+        update_policy: UpdatePolicy;
+        disabled_servers: string[];
+        status: PluginStatus;
+        diagnostics: PluginDiagnostic[];
+        available_update: AvailableUpdate | null;
+        last_checked_at: string | null;
+        installed_at: string;
+        tree_hash: string | null;
+        package_dir: string;
+        data_dir: string;
         skills: PluginSkillSummary[];
+        servers: PluginServerView[];
         subagents: PluginSubagentSummary[];
+}
+
+/** `plugin_detail`: the index entry plus the manifest's trust fields. */
+export interface PluginDetail extends PluginSummary {
+        description: string | null;
+        author: string | null;
+        homepage: string | null;
+        license: string | null;
+        trust_warning: string;
+}
+
+/** What an install sends: a marketplace entry or a direct source. */
+export type PluginInstallRequest = {
+        marketplace?: string | null;
+        name?: string | null;
+        source?: PluginSource | null;
+};
+
+/** One applied update or rollback. */
+export interface PluginUpdateInfo {
+        plugin_id: string;
+        from: string | null;
+        to: string | null;
+}
+
+/** `marketplaces_list` / `marketplace_add` / `marketplace_refresh`. */
+export interface MarketplaceSummary {
+        id: string;
+        name: string;
+        source: PluginSource;
+        registry_path: string;
+        auto_refresh: boolean;
+        last_refreshed_at: string | null;
+        resolved_sha: string | null;
+        bundled: boolean;
+        hidden: boolean;
+        error: string | null;
+        entry_count: number;
+}
+
+/** What the add-marketplace form sends: one string in any accepted form. */
+export interface MarketplaceInput {
+        source: string;
+}
+
+/** One normalised registry entry plus its install state (design §12). */
+export interface CatalogEntry {
+        marketplace_id: string;
+        name: string;
+        display_name: string | null;
+        description: string | null;
+        version: string | null;
+        category: string | null;
+        tags: string[];
+        author: string | null;
+        homepage: string | null;
+        icon: string | null;
+        keywords: string[];
+        available: boolean;
+        reason: string | null;
+        source_kind: string;
+        /** The installed plugin's id when this entry is installed. */
+        installed: string | null;
+        installed_version: string | null;
+        update_available: boolean;
+}
+
+/** One `plugin_progress` event, as it arrives on `backend://event`. */
+export interface PluginProgressEvent {
+        plugin_id: string;
+        /** `fetch`, `validate` or `place`. */
+        phase: string;
+        detail: string;
+}
+
+/** One `plugin_update_available` event, as it arrives on `backend://event`. */
+export interface PluginUpdateAvailableEvent {
+        plugin_id: string;
+        from: string | null;
+        to: string | null;
+}
+
+/** Settings → Plugins (design §3). */
+export interface PluginSettings {
+        /** Master switch for the skills block in the system prompt and the tools. */
+        skills_enabled: boolean;
+        /** Default policy for newly installed plugins. */
+        policy_default: "content" | "auto" | "manual";
+        /** Hours between marketplace refreshes; 0 = never refresh automatically. */
+        marketplace_refresh_hours: number;
+        /** Hours between update checks; 0 = never check automatically. */
+        update_check_hours: number;
 }
 
 /**
