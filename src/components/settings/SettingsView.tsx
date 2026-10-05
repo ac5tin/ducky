@@ -8,6 +8,7 @@ import type {
   SubagentConfig,
 } from "../../types";
 import { MODE_META, MODE_ORDER } from "../../modes";
+import { pluginSubagentShadowed } from "../../subagents";
 import { Button, Field, Modal, inputClass } from "../modals/Modal";
 import { Icon } from "../icons";
 import {
@@ -1042,7 +1043,7 @@ function SubagentsSection() {
         ...sub,
         pluginId: p.id,
         pluginName: p.name,
-        shadowed: present.has(sub.name.trim().toLowerCase()),
+        shadowed: pluginSubagentShadowed(present, sub.slug),
       })),
     );
 
@@ -1057,9 +1058,10 @@ function SubagentsSection() {
 
   const clone = async (pluginId: string, name: string) => {
     try {
-      await api.subagentCloneFromPlugin(pluginId, name);
+      const { warnings } = await api.subagentCloneFromPlugin(pluginId, name);
       await refreshConfig();
-      toast("success", `Cloned ${name} to your subagents.`);
+      const dropped = warnings.length > 0 ? ` ${warnings.join("; ")}` : "";
+      toast("success", `Cloned ${name} to your subagents.${dropped}`);
     } catch (e) {
       toast("error", `${e}`);
     }

@@ -864,26 +864,48 @@ pub fn to_subagent_config(
 /// Split `---`-delimited frontmatter from a Markdown document: returns the
 /// scalar `key: value` pairs and the body, or `None` when there is no
 /// frontmatter. Minimal YAML: one-line scalars, quotes stripped, everything
-/// else ignored.
+/// else ignored. A `key:` line with an empty value followed by `- item` lines
+/// is a block sequence and becomes a comma-joined scalar, so every consumer
+/// keeps its one comma-split reading of the value.
 pub(crate) fn parse_frontmatter(text: &str) -> Option<(BTreeMap<String, String>, String)> {
-    let mut lines = text.lines().enumerate();
+    let mut lines = text.lines().enumerate().peekable();
     let (_, first) = lines.next()?;
     if first.trim_end() != "---" {
         return None;
     }
     let mut map = BTreeMap::new();
     let mut closing = None;
-    for (index, line) in lines {
+    while let Some((index, line)) = lines.next() {
         if line.trim_end() == "---" {
             closing = Some(index);
             break;
         }
-        if let Some((key, value)) = line.split_once(':') {
-            let key = key.trim();
-            if !key.is_empty() {
-                map.insert(key.to_string(), unquote(value.trim()));
-            }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
         }
+        let value = unquote(value.trim());
+        if !value.is_empty() {
+            map.insert(key.to_string(), value);
+            continue;
+        }
+        // A block sequence: any indent depth, ending at the first blank or
+        // non-item line; an item with no text is skipped.
+        let mut items = Vec::new();
+        while let Some((_, next)) = lines.peek() {
+            let Some(item) = next.trim_start().strip_prefix("- ") else {
+                break;
+            };
+            let item = unquote(item.trim());
+            if !item.is_empty() {
+                items.push(item);
+            }
+            lines.next();
+        }
+        map.insert(key.to_string(), items.join(", "));
     }
     let closing = closing?;
     let body = text

@@ -118,6 +118,9 @@ pub struct PluginServerView {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct PluginSubagentView {
     pub name: String,
+    /// The registry key: `to_subagent_config` slugs `name`, and the UI must
+    /// compare user definitions against this, not the display name.
+    pub slug: String,
     pub description: String,
 }
 
@@ -1094,6 +1097,7 @@ impl PluginManager {
                 .iter()
                 .map(|subagent| PluginSubagentView {
                     name: subagent.name.clone(),
+                    slug: install::slug(&subagent.name),
                     description: subagent.description.clone(),
                 })
                 .collect(),

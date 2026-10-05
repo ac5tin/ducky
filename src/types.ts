@@ -135,6 +135,13 @@ export interface SubagentConfig {
         created_at: string;
 }
 
+/** `subagent_clone_from_plugin` result: the saved user definition plus the
+ * mapping warnings (e.g. tools the plugin listed that this install lacks). */
+export interface ClonedSubagent {
+        subagent: SubagentConfig;
+        warnings: string[];
+}
+
 /** A named, coloured group of chats. `conversation_ids` is both the member
  *  list and its display order — a chat belongs to the group that lists it. */
 export interface ChatGroup {
@@ -512,6 +519,8 @@ export interface PluginSkillSummary {
 export interface PluginSubagentSummary {
         name: string;
         description: string;
+        /** The registry key: `to_subagent_config` slugs the display name. */
+        slug: string;
 }
 
 /** One installed plugin as `plugins_list` reports it. */

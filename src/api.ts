@@ -6,6 +6,7 @@ import type {
   AppConfig,
   BackendEvent,
   ChatGroup,
+  ClonedSubagent,
   ConnectorSuggestion,
   ConversationMeta,
   EffortLevel,
@@ -130,7 +131,7 @@ export const subagentRestoreDefaults = () =>
 
 /** Copy one plugin-provided subagent into the user's own definitions. */
 export const subagentCloneFromPlugin = (pluginId: string, name: string) =>
-  invoke<SubagentConfig>("subagent_clone_from_plugin", { pluginId, name });
+  invoke<ClonedSubagent>("subagent_clone_from_plugin", { pluginId, name });
 
 // ---------------------------------------------------------------------------
 // Conversations & chat

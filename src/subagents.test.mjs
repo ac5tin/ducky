@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   activityTool,
   applySubagentDeltas,
+  pluginSubagentShadowed,
   subagentActivityLabel,
   subagentHeader,
   subagentTask,
@@ -52,6 +53,23 @@ test("subagentHeader prefers name + description, falls back to task", () => {
   // nothing usable at all
   assert.deepEqual(subagentHeader({}), { name: "Subagent", brief: "" });
   assert.deepEqual(subagentHeader(undefined), { name: "Subagent", brief: "" });
+});
+
+test("plugin subagent shadow uses the registry slug, not the display name", () => {
+  const users = new Set(["code-reviewer", "explore"]);
+  assert.equal(pluginSubagentShadowed(users, "code-reviewer"), true);
+  assert.equal(pluginSubagentShadowed(users, "Reviewer"), false);
+  // raw-name equality is not the registry key: `merge_subagent_defs`
+  // compares the user's name with the plugin definition's slug
+  assert.equal(
+    pluginSubagentShadowed(new Set(["Code Reviewer"]), "code-reviewer"),
+    false,
+  );
+  // user names still match case-insensitively
+  assert.equal(
+    pluginSubagentShadowed(new Set([" Code-Reviewer "]), "code-reviewer"),
+    true,
+  );
 });
 
 test("subagentHeader name falls back to the agent type before Subagent", () => {

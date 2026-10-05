@@ -347,6 +347,23 @@ fn discovers_skills_and_mcp() {
 }
 
 #[test]
+fn parses_block_style_skill_allowed_tools() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "plugin.json", &agent_manifest("block-skills", ""));
+    write(
+        tmp.path(),
+        "skills/reviewer/SKILL.md",
+        "---\nname: reviewer\ndescription: demo\nallowed-tools:\n  - Read\n  - Grep\n---\nBody.",
+    );
+
+    let manifest = load(tmp.path()).unwrap();
+    let found = discover(tmp.path(), &manifest);
+
+    assert_eq!(found.skills.len(), 1, "{:?}", found.diagnostics);
+    assert_eq!(found.skills[0].allowed_tools.as_deref(), Some("Read, Grep"));
+}
+
+#[test]
 fn missing_locations_ok() {
     let tmp = tempfile::tempdir().unwrap();
 
@@ -1867,6 +1884,49 @@ fn parses_app_ducky_subagents_dir() {
         sub.source_path.ends_with("app.ducky/subagents/reviewer.md"),
         "{:?}",
         sub.source_path
+    );
+}
+
+#[test]
+fn parses_block_style_tool_list() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "plugin.json", &agent_manifest("block-tools", ""));
+    write(
+        tmp.path(),
+        "app.ducky/subagents/reviewer.md",
+        "---\nname: reviewer\ndescription: reviews code\ntools:\n    - ducky__fs_read\n    - ducky__fs_search\n---\nReview.",
+    );
+
+    let manifest = load(tmp.path()).unwrap();
+    let found = discover(tmp.path(), &manifest);
+
+    assert_eq!(found.subagents.len(), 1, "{:?}", found.diagnostics);
+    assert_eq!(
+        found.subagents[0].tools,
+        Some(vec![
+            "ducky__fs_read".to_string(),
+            "ducky__fs_search".to_string()
+        ])
+    );
+}
+
+#[test]
+fn block_list_skips_empty_items_and_stays_present() {
+    let (frontmatter, _) = super::layout::parse_frontmatter(
+        "---\ntools:\n  - \n  - ducky__fs_read\n---\nBody",
+    )
+    .unwrap();
+    assert_eq!(
+        frontmatter.get("tools").map(String::as_str),
+        Some("ducky__fs_read")
+    );
+
+    let (empty, _) =
+        super::layout::parse_frontmatter("---\ntools:\n  - \n---\nBody").unwrap();
+    assert_eq!(
+        empty.get("tools").map(String::as_str),
+        Some(""),
+        "an empty list is present-but-empty, never absent"
     );
 }
 
@@ -4264,6 +4324,30 @@ async fn reload_scans_records_into_index() {
     assert_eq!(index.servers.len(), 1);
     assert_eq!(index.servers[0].id, format!("plugin:{}:demo", record.id));
     assert!(index.subagents.is_empty());
+}
+
+#[tokio::test]
+async fn plugin_subagent_view_publishes_the_registry_slug() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    plugin_package(&source, "demo-plugin");
+    write(
+        &source,
+        "app.ducky/subagents/reviewer.md",
+        "---\nname: Code Reviewer\ndescription: reviews code\n---\nReview.",
+    );
+    seed_installed(tmp.path(), &source);
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+    manager.reload().unwrap();
+
+    let list = manager.list();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].subagents.len(), 1, "{:?}", list[0].subagents);
+    assert_eq!(list[0].subagents[0].name, "Code Reviewer");
+    assert_eq!(
+        list[0].subagents[0].slug, "code-reviewer",
+        "the UI badges on the same key `merge_subagent_defs` uses"
+    );
 }
 
 #[tokio::test]
