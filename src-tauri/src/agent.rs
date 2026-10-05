@@ -292,6 +292,7 @@ fn system_message(
     scope: &RunScope,
     main_prompt: &str,
     mode: AgentMode,
+    skills_block: Option<&str>,
 ) -> Msg {
     let grounding = format!(
         "Working directory: {}. Resolve relative file paths the user mentions \
@@ -309,6 +310,10 @@ fn system_message(
             if !prompt.is_empty() {
                 text.push_str("\n\n");
                 text.push_str(prompt);
+            }
+            if let Some(block) = skills_block {
+                text.push_str("\n\n");
+                text.push_str(block);
             }
             if let Some(mode_text) = mode_prompt(mode, scope) {
                 text.push_str("\n\n");
@@ -341,6 +346,10 @@ fn system_message(
                         tools.join(", ")
                     ));
                 }
+            }
+            if let Some(block) = skills_block {
+                text.push_str("\n\n");
+                text.push_str(block);
             }
             if let Some(mode_text) = mode_prompt(mode, scope) {
                 text.push_str("\n\n");
@@ -397,6 +406,28 @@ impl Agent {
         if let Ok(parsed) = serde_json::from_value::<BackendEvent>(event) {
             self.sink.emit(parsed);
         }
+    }
+
+    /// The skills visible to this run, resolved from the plugin index and the
+    /// three filesystem roots. Read fresh on every call so a root edit or an
+    /// enable/disable applies mid-turn.
+    fn resolved_skills(&self, cwd: &std::path::Path) -> Vec<crate::plugins::skills::ResolvedSkill> {
+        let plugins = self.manager.plugins();
+        let enabled = self
+            .store
+            .config
+            .lock()
+            .unwrap()
+            .settings
+            .plugins
+            .skills_enabled;
+        crate::plugins::skills::collect(
+            &plugins.index(),
+            &plugins.data_dir.join("skills"),
+            &cwd.join(".ducky").join("skills"),
+            &self.store.home_dir.join(".agents").join("skills"),
+            enabled,
+        )
     }
 
     /// Stream one text chunk to wherever this run's output goes: the
@@ -895,7 +926,19 @@ impl Agent {
                     parameters: t.input_schema.clone(),
                 })
                 .collect();
+            let skills_enabled = self
+                .store
+                .config
+                .lock()
+                .unwrap()
+                .settings
+                .plugins
+                .skills_enabled;
             let mut builtin_defs = crate::builtin::tool_defs();
+            // the master switch hides the skill tools as well as the block
+            if !skills_enabled {
+                builtin_defs.retain(|t| !crate::builtin::skills::is_skill_tool(&t.name));
+            }
             // With configured agent types the subagent tool gains an `agent`
             // enum describing them; with none it stays the generic static def.
             let subagent_defs = self.store.config.lock().unwrap().subagents.clone();
@@ -927,8 +970,18 @@ impl Agent {
                     cfg.settings.system_prompt.clone(),
                 )
             };
+            // the skills block is rebuilt each round, like the rest of the
+            // system message, so a plugin toggle or a new skill shows up
+            // without restarting the app
+            let skills_block = crate::plugins::skills::prompt_block(
+                &self.resolved_skills(&cwd),
+                crate::plugins::skills::PROMPT_CAP,
+            );
             let mut snapshot = history.clone();
-            snapshot.insert(0, system_message(&cwd, scope, &main_prompt, mode));
+            snapshot.insert(
+                0,
+                system_message(&cwd, scope, &main_prompt, mode, skills_block.as_deref()),
+            );
             // A message that references an earlier chat carries an id token;
             // the model only sees the token, so remind it that the history is
             // not loaded and how to read it. In-memory only: never persisted.
@@ -1720,6 +1773,17 @@ impl Agent {
                     &self.store,
                     conversation_id,
                     &call.arguments,
+                )
+            } else if crate::builtin::skills::is_skill_tool(&call.name) {
+                // the skill tools need the resolved list, not a cwd
+                let cwd = {
+                    let cfg = self.store.config.lock().unwrap();
+                    cfg.settings.effective_working_dir(&self.store.home_dir)
+                };
+                crate::builtin::skills::execute(
+                    &call.name,
+                    &call.arguments,
+                    &self.resolved_skills(&cwd),
                 )
             } else {
                 let cwd = {

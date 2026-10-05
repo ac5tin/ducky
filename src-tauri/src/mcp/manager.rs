@@ -660,6 +660,11 @@ impl McpManager {
         &self.store
     }
 
+    /// Installed plugins, marketplaces and the derived component index.
+    pub fn plugins(&self) -> &Arc<PluginManager> {
+        &self.plugins
+    }
+
     pub fn get(&self, server_id: &str) -> Option<Arc<ServerHandle>> {
         self.handles.lock().unwrap().get(server_id).cloned()
     }

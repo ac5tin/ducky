@@ -494,3 +494,24 @@ export interface ElicitationSchemaShape {
         properties?: Record<string, ElicitationFieldSchema>;
         required?: string[];
 }
+
+// ---------------------------------------------------------------------------
+// Plugins and skills
+// ---------------------------------------------------------------------------
+
+/** One skill contributed by a plugin, as `plugins_list` reports it. */
+export interface PluginSkillSummary {
+        name: string;
+        description: string;
+        license?: string | null;
+        /** Absolute path of the skill directory. */
+        path: string;
+}
+
+/** One installed plugin as `plugins_list` reports it. */
+export interface PluginSummary {
+        id: string;
+        name: string;
+        enabled: boolean;
+        skills: PluginSkillSummary[];
+}

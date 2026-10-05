@@ -747,6 +747,11 @@ pub struct AppConfig {
     /// delete every subagent without them reappearing on the next launch.
     #[serde(default)]
     pub subagents_seeded: bool,
+    /// Whether the seeded subagent allowlists have been offered the two skill
+    /// tools once (design §8). Kept separate from `subagents_seeded` so an
+    /// existing config is touched up without re-seeding deleted subagents.
+    #[serde(default)]
+    pub plugin_skill_tools_seeded: bool,
     #[serde(default)]
     pub settings: AppSettings,
     #[serde(default)]
@@ -1010,6 +1015,7 @@ impl Store {
         };
         store.hydrate_empty_titles()?;
         store.seed_default_subagents()?;
+        store.touch_up_seeded_subagent_tools()?;
         Ok(store)
     }
 
@@ -1024,6 +1030,43 @@ impl Store {
                 let now = chrono::Utc::now().to_rfc3339();
                 cfg.subagents.extend(default_subagent_defs(&now));
                 cfg.subagents_seeded = true;
+                dirty = true;
+            }
+        }
+        if dirty {
+            self.save_config()?;
+        }
+        Ok(())
+    }
+
+    /// Give the seeded subagent definitions the two skill tools once (design
+    /// §8). Explore's allowlist is exactly the five read-only builtins, so it
+    /// gains the two names; General-Purpose has `None` (every tool) and needs
+    /// nothing. A user-customised allowlist is left untouched, and the flag is
+    /// set either way.
+    fn touch_up_seeded_subagent_tools(&self) -> anyhow::Result<()> {
+        let mut dirty = false;
+        {
+            let mut cfg = self.config.lock().unwrap();
+            if !cfg.plugin_skill_tools_seeded {
+                let seeded_read_only: Vec<String> = vec![
+                    crate::builtin::fs::LIST.to_string(),
+                    crate::builtin::fs::READ.to_string(),
+                    crate::builtin::fs::SEARCH.to_string(),
+                    crate::builtin::web::FETCH.to_string(),
+                    crate::builtin::web::SEARCH.to_string(),
+                ];
+                for def in &mut cfg.subagents {
+                    let Some(tools) = def.tools.as_mut() else {
+                        continue;
+                    };
+                    if *tools != seeded_read_only {
+                        continue;
+                    }
+                    tools.push(crate::builtin::skills::LOAD_SKILL.to_string());
+                    tools.push(crate::builtin::skills::READ_SKILL_FILE.to_string());
+                }
+                cfg.plugin_skill_tools_seeded = true;
                 dirty = true;
             }
         }
@@ -1750,12 +1793,16 @@ mod tests {
             let names: Vec<&str> = cfg.subagents.iter().map(|s| s.name.as_str()).collect();
             assert_eq!(names, ["General-Purpose", "Explore"]);
             let explore = cfg.subagents.iter().find(|s| s.name == "Explore").unwrap();
+            // the five read-only builtins plus the two skill tools appended
+            // by `touch_up_seeded_subagent_tools` (design §8)
             let expected: Vec<String> = [
                 "ducky__fs_list",
                 "ducky__fs_read",
                 "ducky__fs_search",
                 "ducky__web_fetch",
                 "ducky__web_search",
+                "ducky__load_skill",
+                "ducky__read_skill_file",
             ]
             .iter()
             .map(|s| s.to_string())
@@ -2048,5 +2095,65 @@ mod tests {
         let reopened = Store::new(tmp.path(), tmp.path().to_path_buf()).unwrap();
         let cfg = reopened.config.lock().unwrap();
         assert_eq!(cfg.groups[0].conversation_ids, ["c2"]);
+    }
+
+    // -- plugin skill tools in the seeded subagents ------------------------
+
+    #[test]
+    fn seeded_explore_allowlist_gains_skill_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::new(tmp.path(), tmp.path().to_path_buf()).unwrap();
+        let cfg = store.config.lock().unwrap();
+
+        assert!(cfg.plugin_skill_tools_seeded);
+        let explore = cfg
+            .subagents
+            .iter()
+            .find(|s| s.name == "Explore")
+            .expect("Explore is seeded");
+        let tools = explore.tools.as_ref().expect("Explore has an allowlist");
+        for expected in [
+            crate::builtin::skills::LOAD_SKILL,
+            crate::builtin::skills::READ_SKILL_FILE,
+        ] {
+            assert!(
+                tools.iter().any(|t| t == expected),
+                "{expected} missing from {tools:?}"
+            );
+        }
+        assert_eq!(tools.len(), 7, "the five read-only builtins plus two: {tools:?}");
+        // General-Purpose keeps `None`: it already gets every tool, so it
+        // already has the two skill tools.
+        let general = cfg
+            .subagents
+            .iter()
+            .find(|s| s.name == "General-Purpose")
+            .expect("General-Purpose is seeded");
+        assert!(general.tools.is_none());
+    }
+
+    #[test]
+    fn customised_allowlist_is_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        {
+            let store = Store::new(tmp.path(), tmp.path().to_path_buf()).unwrap();
+            let mut cfg = store.config.lock().unwrap();
+            // a config from before this feature, with Explore edited by hand
+            cfg.plugin_skill_tools_seeded = false;
+            let explore = cfg
+                .subagents
+                .iter_mut()
+                .find(|s| s.name == "Explore")
+                .unwrap();
+            explore.tools = Some(vec!["ducky__fs_read".into()]);
+            drop(cfg);
+            store.save_config().unwrap();
+        }
+
+        let reopened = Store::new(tmp.path(), tmp.path().to_path_buf()).unwrap();
+        let cfg = reopened.config.lock().unwrap();
+        assert!(cfg.plugin_skill_tools_seeded, "the flag is set regardless");
+        let explore = cfg.subagents.iter().find(|s| s.name == "Explore").unwrap();
+        assert_eq!(explore.tools, Some(vec!["ducky__fs_read".to_string()]));
     }
 }

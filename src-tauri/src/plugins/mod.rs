@@ -32,6 +32,7 @@ pub mod manager;
 pub mod manifest;
 pub mod marketplace;
 pub mod path;
+pub mod skills;
 pub mod update;
 
 pub use install::{AvailableUpdate, InstallRecord, InstallStore, PluginStatus, UpdatePolicy};

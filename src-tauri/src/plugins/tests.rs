@@ -16,7 +16,8 @@ use super::marketplace::{
     parse_git_remote, parse_registry, parse_source, refresh, Change, Entry, HttpClient,
     HttpResponse, MarketplaceRecord, MarketplaceStore, PluginSource, Registry,
 };
-use super::manager::{display_host, MarketplaceInput, PluginManager};
+use super::manager::{display_host, MarketplaceInput, PluginIndex, PluginManager};
+use super::skills::{collect, load_body, prompt_block, ResolvedSkill, SkillOrigin};
 use super::update::{apply, check_one, rollback};
 use crate::config::{PluginSettings, PolicyDefault};
 use crate::events::{BackendEvent, CollectingSink};
@@ -4616,4 +4617,296 @@ fn display_host_never_includes_userinfo_or_query() {
         display_host("https://user:pass@mcp.example.com:8443/mcp?token=secret"),
         "mcp.example.com:8443"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Skills at runtime: roots, precedence, prompt block and bodies (design §4, §8)
+// ---------------------------------------------------------------------------
+
+/// A synthetic resolved skill pointing at `dir`; nothing on disk is checked.
+fn skill_at(name: &str, description: &str, dir: &Path, origin: SkillOrigin) -> ResolvedSkill {
+    ResolvedSkill {
+        id: origin.id_for(name),
+        name: name.to_string(),
+        description: description.to_string(),
+        dir: dir.to_path_buf(),
+        origin,
+        shadowed: None,
+    }
+}
+
+#[test]
+fn precedence_user_beats_plugin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    plugin_package(&source, "demo-plugin");
+    let record = seed_installed(tmp.path(), &source);
+    edit_record(tmp.path(), &record.id, |r| r.enabled = true);
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+    manager.reload().unwrap();
+    let index = manager.index();
+
+    // the user root wins the name `demo`
+    write(
+        tmp.path(),
+        "skills/demo/SKILL.md",
+        "---\nname: demo\ndescription: user demo\n---\nUser body.",
+    );
+
+    let skills = collect(
+        &index,
+        &tmp.path().join("skills"),
+        &tmp.path().join("ws"),
+        &tmp.path().join("agents"),
+        true,
+    );
+
+    let user = skills
+        .iter()
+        .find(|s| s.id == "user:demo")
+        .expect("the user skill wins");
+    assert_eq!(user.description, "user demo");
+    assert!(user.shadowed.is_none());
+    let plugin = skills
+        .iter()
+        .find(|s| s.id == format!("plugin:{}:demo", record.id))
+        .expect("the shadowed plugin skill is still listed");
+    assert_eq!(plugin.shadowed.as_deref(), Some("user:demo"));
+}
+
+#[test]
+fn bare_name_resolves_by_precedence() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "user-root/deploy/SKILL.md",
+        "---\nname: deploy\ndescription: user deploy\n---\nBody.",
+    );
+    write(
+        tmp.path(),
+        "ws/.ducky/skills/deploy/SKILL.md",
+        "---\nname: deploy\ndescription: ws deploy\n---\nBody.",
+    );
+
+    let skills = collect(
+        &PluginIndex::default(),
+        &tmp.path().join("user-root"),
+        &tmp.path().join("ws/.ducky/skills"),
+        &tmp.path().join("agents"),
+        true,
+    );
+
+    let resolved = crate::builtin::skills::resolve_id(&skills, "deploy").expect("bare name resolves");
+    assert_eq!(resolved.id, "user:deploy");
+    assert_eq!(resolved.description, "user deploy");
+}
+
+#[test]
+fn prompt_block_caps_at_60() {
+    let skills: Vec<ResolvedSkill> = (0..61)
+        .map(|i| {
+            skill_at(
+                &format!("skill-{i}"),
+                "does a thing",
+                Path::new("/tmp"),
+                SkillOrigin::User,
+            )
+        })
+        .collect();
+
+    let block = prompt_block(&skills, 60).expect("61 skills still render a block");
+
+    let entries = block.lines().filter(|line| line.starts_with("- `")).count();
+    assert_eq!(entries, 60, "{block}");
+    assert!(block.contains("1 more"), "{block}");
+    assert!(block.contains("/skills"), "{block}");
+}
+
+#[test]
+fn prompt_block_truncates_on_char_boundary() {
+    let long = "é".repeat(300);
+    let skills = vec![skill_at("uni", &long, Path::new("/tmp"), SkillOrigin::User)];
+
+    let block = prompt_block(&skills, 60).expect("block");
+
+    let line = block
+        .lines()
+        .find(|line| line.starts_with("- `"))
+        .expect("an entry line");
+    let (_, rest) = line.split_once(" — ").expect("separator");
+    let desc = rest.rsplit_once(" (").expect("origin suffix").0;
+    // 200 characters, not 200 bytes; a byte split would have panicked above
+    assert_eq!(desc.chars().count(), 200, "{line}");
+    assert!(!desc.contains(&"é".repeat(201)));
+}
+
+#[test]
+fn prompt_block_shows_a_bare_name_when_unique() {
+    let unique = skill_at(
+        "brainstorming",
+        "turn an idea into a design",
+        Path::new("/tmp"),
+        SkillOrigin::User,
+    );
+    let block = prompt_block(std::slice::from_ref(&unique), 60).expect("block");
+    assert!(
+        block.contains("- `brainstorming` — turn an idea into a design (user)"),
+        "{block}"
+    );
+
+    // a duplicate name cannot be told apart by its bare name: full ids
+    let mut shadowed = skill_at(
+        "brainstorming",
+        "a plugin copy",
+        Path::new("/tmp"),
+        SkillOrigin::Plugin {
+            id: "acme".into(),
+            name: "acme".into(),
+        },
+    );
+    shadowed.shadowed = Some("user:brainstorming".into());
+    let block = prompt_block(&[unique, shadowed], 60).expect("block");
+    assert!(block.contains("- `user:brainstorming`"), "{block}");
+    assert!(block.contains("- `plugin:acme:brainstorming`"), "{block}");
+    assert!(block.contains("shadowed by user:brainstorming"), "{block}");
+}
+
+#[test]
+fn prompt_block_absent_when_disabled() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "skills/demo/SKILL.md",
+        "---\nname: demo\ndescription: demo skill\n---\nBody.",
+    );
+
+    let skills = collect(
+        &PluginIndex::default(),
+        &tmp.path().join("skills"),
+        &tmp.path().join("ws"),
+        &tmp.path().join("agents"),
+        false,
+    );
+
+    assert!(skills.is_empty(), "the master switch hides every root");
+    assert!(prompt_block(&skills, 60).is_none());
+}
+
+#[test]
+fn prompt_block_absent_when_empty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let skills = collect(
+        &PluginIndex::default(),
+        &tmp.path().join("skills"),
+        &tmp.path().join("ws"),
+        &tmp.path().join("agents"),
+        true,
+    );
+
+    assert!(skills.is_empty());
+    assert!(prompt_block(&skills, 60).is_none());
+}
+
+#[test]
+fn load_body_strips_frontmatter() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "demo/SKILL.md",
+        "---\nname: demo\ndescription: demo skill\n---\nBody line one.\nBody line two.",
+    );
+    let skill = skill_at(
+        "demo",
+        "demo skill",
+        &tmp.path().join("demo"),
+        SkillOrigin::User,
+    );
+
+    let body = load_body(&skill).unwrap();
+
+    assert_eq!(body, "Body line one.\nBody line two.");
+}
+
+#[test]
+fn load_body_is_capped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let big = "a".repeat(40 * 1024);
+    write(
+        tmp.path(),
+        "demo/SKILL.md",
+        &format!("---\nname: demo\ndescription: big\n---\n{big}"),
+    );
+    let skill = skill_at("demo", "big", &tmp.path().join("demo"), SkillOrigin::User);
+
+    let body = load_body(&skill).unwrap();
+
+    assert!(body.len() <= 32 * 1024, "{} bytes", body.len());
+    assert!(body.contains("truncated"), "{}", &body[body.len() - 120..]);
+}
+
+#[test]
+fn read_skill_file_refuses_escape() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "demo/SKILL.md",
+        "---\nname: demo\ndescription: demo skill\n---\nBody.",
+    );
+    write(tmp.path(), "outside.txt", "secret");
+    let skill = skill_at("demo", "demo", &tmp.path().join("demo"), SkillOrigin::User);
+
+    assert!(
+        crate::builtin::skills::read_skill_file(&skill, "../outside.txt").is_err(),
+        "`..` must not escape"
+    );
+    assert!(
+        crate::builtin::skills::read_skill_file(&skill, "/etc/hosts").is_err(),
+        "an absolute path is refused even when it resolves inside"
+    );
+    assert!(
+        crate::builtin::skills::read_skill_file(&skill, "missing.txt").is_err(),
+        "a missing file is an error"
+    );
+
+    #[cfg(unix)]
+    {
+        symlink(&tmp.path().join("outside.txt"), &tmp.path().join("demo/link.txt"));
+        assert!(
+            crate::builtin::skills::read_skill_file(&skill, "link.txt").is_err(),
+            "a symlink escape must not be followed"
+        );
+    }
+}
+
+#[test]
+fn read_skill_file_reads_references() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "demo/references/REFERENCE.md",
+        "# Reference\nHello.",
+    );
+    let skill = skill_at("demo", "demo", &tmp.path().join("demo"), SkillOrigin::User);
+
+    let text =
+        crate::builtin::skills::read_skill_file(&skill, "references/REFERENCE.md").unwrap();
+
+    assert!(text.contains("Hello."), "{text}");
+}
+
+#[test]
+fn unknown_skill_id_lists_close_matches() {
+    let skills = vec![
+        skill_at("deploy", "ship it", Path::new("/tmp"), SkillOrigin::User),
+        skill_at("debug", "find bugs", Path::new("/tmp"), SkillOrigin::Workspace),
+    ];
+
+    let err = crate::builtin::skills::execute(
+        crate::builtin::skills::LOAD_SKILL,
+        &serde_json::json!({ "id": "deplo" }),
+        &skills,
+    )
+    .unwrap_err();
+
+    assert!(err.contains("deploy"), "{err}");
 }

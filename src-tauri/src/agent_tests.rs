@@ -1899,3 +1899,84 @@ async fn steering_is_not_delivered_when_the_run_is_cancelled() {
         "the steer stays queued so the frontend can resend it"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Skills at runtime (design §8)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn plan_mode_allows_skill_tools() {
+    use crate::agent::mode_allows;
+    use crate::builtin::skills::{LOAD_SKILL, READ_SKILL_FILE};
+
+    // read-only tools, so Plan and ReadOnly keep them and AutoApproveReadOnly
+    // covers them
+    for mode in [AgentMode::Plan, AgentMode::ReadOnly] {
+        assert!(mode_allows(mode, LOAD_SKILL, true), "{mode:?}");
+        assert!(mode_allows(mode, READ_SKILL_FILE, true), "{mode:?}");
+    }
+}
+
+/// Write a valid user-scope skill (`<root>/<name>/SKILL.md`).
+fn write_user_skill(root: &std::path::Path, name: &str, description: &str) {
+    let dir = root.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: {description}\n---\nBody."),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn skills_block_reaches_main_and_subagent_prompts() {
+    script(
+        "t9-skills-main",
+        vec![
+            MockRound::Tools(vec![(
+                SUBAGENT.into(),
+                serde_json::json!({"task": "t9-skills-sub"}),
+            )]),
+            MockRound::Text("main done".into()),
+        ],
+    );
+    script("t9-skills-sub", vec![MockRound::Text("sub answer".into())]);
+
+    let (agent, _sink, _store, dir) = test_agent_in_dir("t9-skills-conv", AgentMode::Default);
+    // the user root is `<data_dir>/skills`; the test agent's data dir is `dir`
+    write_user_skill(&dir.join("skills"), "demo", "demo skill for tests");
+
+    run(&agent, "t9-skills-conv", "t9-skills-main", &CancellationToken::new()).await;
+
+    let main = captures_for("t9-skills-main");
+    assert!(
+        main[0]
+            .system
+            .contains("- `demo` — demo skill for tests (user)"),
+        "{}",
+        main[0].system
+    );
+    // the subagent run sees the same block
+    let sub = captures_for("t9-skills-sub");
+    assert!(
+        sub[0].system.contains("demo skill for tests"),
+        "{}",
+        sub[0].system
+    );
+    assert!(sub[0].system.contains("# Skills"), "{}", sub[0].system);
+}
+
+#[tokio::test]
+async fn skills_block_absent_without_skills() {
+    script("t9-noskills-main", vec![MockRound::Text("ok".into())]);
+    let (agent, _sink, _store, _dir) = test_agent_in_dir("t9-noskills-conv", AgentMode::Default);
+
+    run(&agent, "t9-noskills-conv", "t9-noskills-main", &CancellationToken::new()).await;
+
+    let captured = captures_for("t9-noskills-main");
+    assert!(
+        !captured[0].system.contains("# Skills"),
+        "{}",
+        captured[0].system
+    );
+}

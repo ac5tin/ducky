@@ -6,6 +6,7 @@
 pub mod fs;
 pub mod html;
 pub mod session_context;
+pub mod skills;
 pub mod web;
 
 use std::path::Path;
@@ -127,6 +128,9 @@ pub async fn execute(name: &str, args: &Value, cwd: &Path) -> Result<String, Str
         web::execute(name, args).await
     } else if name == session_context::READ_SESSION_CONTEXT {
         // needs the store and the active chat id, so the engine dispatches it
+        Err(format!("{name} is handled by the chat engine"))
+    } else if skills::is_skill_tool(name) {
+        // needs the resolved skill list, so the engine dispatches it
         Err(format!("{name} is handled by the chat engine"))
     } else if is_control(name) {
         // reached only if the engine's control branch is ever bypassed
@@ -364,6 +368,47 @@ static REGISTRY: LazyLock<Vec<BuiltinTool>> = LazyLock::new(|| {
             ),
             read_only: true,
         },
+        BuiltinTool {
+            name: skills::LOAD_SKILL,
+            description: "Load a skill's full instructions (the body of its SKILL.md). \
+                      The skills block in your system prompt lists what is available; \
+                      call this when a task matches a skill's description. The skill's \
+                      directory can hold scripts and reference files — read those with \
+                      ducky__read_skill_file.",
+            schema: obj(
+                &["id"],
+                serde_json::json!({
+                    "id": {
+                        "type": "string",
+                        "description": "Skill id from the skills block, e.g. \
+                                        `user:brainstorming`; a bare name also works \
+                                        when no other root uses it."
+                    }
+                }),
+            ),
+            read_only: true,
+        },
+        BuiltinTool {
+            name: skills::READ_SKILL_FILE,
+            description: "Read one file inside a skill's directory, such as a script or a \
+                      reference document named by the skill's instructions. `path` is \
+                      relative to the skill directory and cannot escape it. Output is \
+                      capped at 32 KB.",
+            schema: obj(
+                &["id", "path"],
+                serde_json::json!({
+                    "id": {
+                        "type": "string",
+                        "description": "Skill id, as passed to ducky__load_skill."
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path of the file inside the skill directory, e.g. `references/API.md`."
+                    }
+                }),
+            ),
+            read_only: true,
+        },
     ]
 });
 
@@ -430,6 +475,17 @@ mod tests {
         assert!(!is_builtin("filesystem__read_file"));
         assert!(lookup("ducky__web_search").is_some());
         assert!(lookup("ducky__nope").is_none());
+    }
+
+    #[test]
+    fn skill_tools_are_read_only() {
+        for name in [skills::LOAD_SKILL, skills::READ_SKILL_FILE] {
+            let tool = lookup(name).unwrap_or_else(|| panic!("{name} is registered"));
+            assert!(tool.read_only, "{name} must survive read-only modes");
+            assert!(!is_control(name), "{name} is not chat flow");
+        }
+        assert!(skills::is_skill_tool(skills::LOAD_SKILL));
+        assert!(!skills::is_skill_tool("ducky__fs_read"));
     }
 
     #[test]

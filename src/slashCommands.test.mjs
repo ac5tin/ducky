@@ -7,6 +7,7 @@ import {
   SLASH_COMMANDS,
   expandInitPrompt,
   filterCommands,
+  formatSkills,
   parseSlashCommand,
 } from "./slashCommands.ts";
 
@@ -50,6 +51,45 @@ test("parseSlashCommand leaves normal messages and paths alone", () => {
   assert.equal(parseSlashCommand("/compact\nsome note")?.name, "compact");
 });
 
+test("slash_skills_parses", () => {
+  assert.deepEqual(parseSlashCommand("/skills"), {
+    name: "skills",
+    args: "",
+    unknown: false,
+  });
+  assert.deepEqual(parseSlashCommand("/skills now"), {
+    name: "skills",
+    args: "now",
+    unknown: false,
+  });
+  assert.equal(
+    SLASH_COMMANDS.find((c) => c.name === "skills")?.description,
+    "List enabled skills",
+  );
+});
+
+test("formatSkills lists enabled plugin skills", () => {
+  const text = formatSkills([
+    {
+      id: "acme",
+      name: "Acme",
+      enabled: true,
+      skills: [{ name: "deploy", description: "ship it" }],
+    },
+    {
+      id: "off",
+      name: "Off",
+      enabled: false,
+      skills: [{ name: "hidden", description: "not shown" }],
+    },
+  ]);
+
+  assert.ok(text.includes("plugin:acme:deploy"), text);
+  assert.ok(text.includes("ship it"), text);
+  assert.ok(!text.includes("hidden"), text);
+  assert.ok(!text.includes("nope"), text);
+});
+
 test("filterCommands matches by name prefix", () => {
   assert.deepEqual(
     filterCommands("/").map((c) => c.name),
@@ -62,6 +102,10 @@ test("filterCommands matches by name prefix", () => {
   assert.deepEqual(
     filterCommands("/in").map((c) => c.name),
     ["init"],
+  );
+  assert.deepEqual(
+    filterCommands("/sk").map((c) => c.name),
+    ["skills"],
   );
   assert.deepEqual(filterCommands("/zzz"), []);
 });

@@ -24,6 +24,11 @@ export const SLASH_COMMANDS: SlashCommand[] = [
     description: "Create or update AGENTS.md for the working directory",
     needsConversation: false,
   },
+  {
+    name: "skills",
+    description: "List enabled skills",
+    needsConversation: false,
+  },
 ];
 
 /** Marks the user message that carries a compaction summary. Must match
@@ -67,6 +72,35 @@ export function parseSlashCommand(text: string): ParsedSlashCommand | null {
 export function filterCommands(token: string): SlashCommand[] {
   const q = token.trim().replace(/^\//, "").toLowerCase();
   return SLASH_COMMANDS.filter((c) => c.name.startsWith(q));
+}
+
+/** The plugin shape `formatSkills` needs; `PluginSummary` satisfies it. */
+export interface SkillListSource {
+  id: string;
+  name: string;
+  enabled: boolean;
+  skills: { name: string; description: string }[];
+}
+
+/**
+ * The `/skills` local chat message: one line per skill of every enabled
+ * plugin. User, workspace and agents skills are not part of `plugins_list`,
+ * so this lists the plugin-provided ones; the model's skills block covers
+ * every root.
+ */
+export function formatSkills(plugins: SkillListSource[]): string {
+  const lines = plugins
+    .filter((plugin) => plugin.enabled)
+    .flatMap((plugin) =>
+      plugin.skills.map(
+        (skill) =>
+          `- \`plugin:${plugin.id}:${skill.name}\` — ${skill.description} (plugin: ${plugin.name})`,
+      ),
+    );
+  if (lines.length === 0) {
+    return "No plugin skills are installed and enabled.";
+  }
+  return `Skills available to the model:\n\n${lines.join("\n")}`;
 }
 
 /**

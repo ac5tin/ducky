@@ -11,6 +11,7 @@ import type {
   EffortLevel,
   GroupLayout,
   McpServerConfig,
+  PluginSummary,
   ToolDetailsMode,
   ProviderConfig,
   ProviderPreset,
@@ -373,3 +374,10 @@ export const mcpSetOauthConfig = (
     clientSecret,
     redirectPort,
   });
+
+// ---------------------------------------------------------------------------
+// Plugins
+// ---------------------------------------------------------------------------
+
+/** Installed plugins, their enabled state and their contributed skills. */
+export const pluginsList = () => invoke<PluginSummary[]>("plugins_list");
