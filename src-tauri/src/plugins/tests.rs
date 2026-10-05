@@ -4554,7 +4554,7 @@ async fn add_marketplace_rejects_bundled_id() {
             MarketplaceInput {
                 source: "acme/tools".to_string(),
             },
-            Some("ducky-official".to_string()),
+            Some(super::bundled::BUNDLED_ID.to_string()),
         )
         .unwrap_err();
 
@@ -4657,7 +4657,7 @@ async fn reserved_marketplace_id_cannot_be_removed() {
 
     let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
     let err = manager
-        .remove_marketplace("ducky-official", true)
+        .remove_marketplace(super::bundled::BUNDLED_ID, true)
         .unwrap_err();
     assert!(err.contains("bundled"), "{err}");
     assert_eq!(manager.marketplaces().len(), 1);
@@ -4692,19 +4692,72 @@ fn seeds_once() {
 }
 
 #[test]
-fn missing_resource_falls_back_to_disk() {
+fn checked_in_copy_is_only_used_without_a_resource_dir() {
     // A dev build has no packaged resource directory; the checked-in copy is
     // the fallback, so the bundled registry still loads.
+    let registry = super::bundled::load_registry(None).unwrap();
+    assert_eq!(registry.name, "Ducky Official");
+    assert!(registry.registry_path.is_file());
+    assert!(
+        registry
+            .registry_path
+            .ends_with("resources/ducky-official.json"),
+        "{}",
+        registry.registry_path.display()
+    );
+
+    // A resource dir without the file is a packaging bug, not a dev build:
+    // the missing-file error must surface, never the checked-in copy
+    // (design §5, review fix round 1).
     let empty = tempfile::tempdir().unwrap();
-    for resource_dir in [None, Some(empty.path())] {
-        let registry = super::bundled::load_registry(resource_dir).unwrap();
-        assert_eq!(registry.name, "Ducky Official");
-        assert!(registry.registry_path.is_file());
-        assert!(
-            registry.registry_path.ends_with("ducky-official.json"),
-            "{}",
-            registry.registry_path.display()
-        );
+    let err = super::bundled::load_registry(Some(empty.path())).unwrap_err();
+    assert!(err.contains("missing"), "{err}");
+    assert!(err.contains("ducky-official.json"), "{err}");
+}
+
+#[tokio::test]
+async fn missing_packaged_file_is_not_masked_by_the_dev_copy() {
+    // Packaging bug: a resource directory exists but the file is missing.
+    // The manager must seed the record with the missing-file diagnostic
+    // instead of silently reading the checked-in dev copy, which is only
+    // for builds without a resource directory (design §5, review fix
+    // round 1).
+    let packaged = tempfile::tempdir().unwrap();
+    let resources = packaged.path().join("resources");
+    std::fs::create_dir_all(&resources).unwrap();
+    let manager = PluginManager::with_sink(
+        packaged.path(),
+        packaged.path(),
+        Some(resources.as_path()),
+        Arc::new(CollectingSink::default()),
+    );
+    let record = manager
+        .marketplaces()
+        .into_iter()
+        .find(|record| record.id == "ducky-official")
+        .expect("the bundled record is seeded");
+    let err = record
+        .error
+        .expect("a missing packaged file must be diagnosed, not masked");
+    assert!(err.contains("missing"), "{err}");
+    assert!(err.contains("ducky-official.json"), "{err}");
+    assert_eq!(record.entry_count, 0);
+
+    // The dev path (no resource dir) still reads the checked-in file.
+    let dev = tempfile::tempdir().unwrap();
+    let manager = test_manager(dev.path(), Arc::new(CollectingSink::default()));
+    let record = manager
+        .marketplaces()
+        .into_iter()
+        .find(|record| record.id == "ducky-official")
+        .expect("the bundled record is seeded");
+    assert!(record.error.is_none(), "{record:?}");
+    match &record.source {
+        PluginSource::Path { path } => assert!(
+            path.ends_with("resources/ducky-official.json"),
+            "{path}"
+        ),
+        other => panic!("expected a path source, got {other:?}"),
     }
 }
 

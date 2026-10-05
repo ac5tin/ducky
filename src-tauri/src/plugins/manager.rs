@@ -25,10 +25,6 @@ use super::update;
 use crate::config::{expand_tilde, PolicyDefault, SubagentConfig};
 use crate::events::{BackendEvent, EventSink};
 
-/// The bundled official marketplace id. It can never be removed or shadowed
-/// by another add (design §5).
-pub const BUNDLED_MARKETPLACE_ID: &str = "ducky-official";
-
 /// A marketplace refreshed within this window is not refreshed again by an
 /// update check (design §7).
 const REFRESH_GRACE_SECONDS: i64 = 30;
@@ -843,9 +839,10 @@ impl PluginManager {
         if id.is_empty() {
             return Err("marketplace name must contain a letter or digit".to_string());
         }
-        if id == BUNDLED_MARKETPLACE_ID {
+        if id == bundled::BUNDLED_ID {
             return Err(format!(
-                "`{BUNDLED_MARKETPLACE_ID}` is reserved for the bundled marketplace"
+                "`{}` is reserved for the bundled marketplace",
+                bundled::BUNDLED_ID
             ));
         }
         let mut record = MarketplaceRecord {
@@ -908,7 +905,7 @@ impl PluginManager {
         };
         // The reserved id is never removable, even when a hand-edited record
         // clears the `bundled` flag (design §5).
-        if store.records[index].bundled || id == BUNDLED_MARKETPLACE_ID {
+        if store.records[index].bundled || id == bundled::BUNDLED_ID {
             return Err(format!("the bundled marketplace `{id}` cannot be removed"));
         }
         let users = {

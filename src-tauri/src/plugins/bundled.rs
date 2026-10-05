@@ -41,18 +41,20 @@ fn expected_file(resource_dir: Option<&Path>) -> PathBuf {
     }
 }
 
-/// The registry file on disk: the packaged resource when present, otherwise
-/// the checked-in copy. A dev build and a packaging mistake both end here.
+/// The registry file on disk: the packaged resource when present, or the
+/// checked-in copy when the build has no resource directory (dev/test). A
+/// present resource directory without the file is a packaging mistake: it
+/// resolves to nothing so the diagnostic surfaces instead of the dev copy.
 fn resolve_file(resource_dir: Option<&Path>) -> Option<PathBuf> {
-    if let Some(dir) = resource_dir {
-        for candidate in [dir.join(RESOURCE_SUBPATH), dir.join(RESOURCE_FILE)] {
-            if candidate.is_file() {
-                return Some(candidate);
-            }
+    match resource_dir {
+        Some(dir) => [dir.join(RESOURCE_SUBPATH), dir.join(RESOURCE_FILE)]
+            .into_iter()
+            .find(|candidate| candidate.is_file()),
+        None => {
+            let checked_in = checked_in();
+            checked_in.is_file().then_some(checked_in)
         }
     }
-    let checked_in = checked_in();
-    checked_in.is_file().then_some(checked_in)
 }
 
 /// Read the bundled registry. Errors carry the path, and never stop startup.
