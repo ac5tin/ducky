@@ -18,6 +18,7 @@ use crate::plugins::manager::{
     PluginUpdateInfo,
 };
 use crate::plugins::marketplace::PluginSource;
+use crate::plugins::skills::{summarize, SkillSummary};
 use crate::plugins::UpdatePolicy;
 use crate::providers::Msg;
 use crate::state::AppState;
@@ -1798,6 +1799,21 @@ pub fn mcp_set_oauth_config(
 #[tauri::command]
 pub fn plugins_list(state: State<'_, Arc<AppState>>) -> Vec<PluginSummary> {
     state.plugins.list()
+}
+
+/// Every skill the model can use: all four roots, in precedence order, each
+/// with its provenance and, when shadowed, the id that won. `/skills` renders
+/// exactly this; the system-prompt block is built from the same resolution.
+#[tauri::command]
+pub fn skills_list(state: State<'_, Arc<AppState>>) -> Vec<SkillSummary> {
+    let (cwd, enabled) = {
+        let cfg = state.store.config.lock().unwrap();
+        (
+            cfg.settings.effective_working_dir(&state.store.home_dir),
+            cfg.settings.plugins.skills_enabled,
+        )
+    };
+    summarize(&state.plugins.resolved_skills(&cwd, enabled))
 }
 
 #[tauri::command]

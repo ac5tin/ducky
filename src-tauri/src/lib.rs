@@ -145,6 +145,7 @@ pub fn run() {
             commands::mcp_set_oauth_config,
             commands::app_info,
             commands::plugins_list,
+            commands::skills_list,
             commands::plugin_detail,
             commands::plugin_install,
             commands::plugin_uninstall,

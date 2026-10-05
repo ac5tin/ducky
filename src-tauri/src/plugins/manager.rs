@@ -19,6 +19,7 @@ use super::marketplace::{
     self, join_diagnostics, Entry, HttpClient, HttpResponse, MarketplaceRecord, MarketplaceStore,
     PluginSource, Registry,
 };
+use super::skills::{self, ResolvedSkill};
 use super::update;
 use crate::config::{expand_tilde, PolicyDefault};
 use crate::events::{BackendEvent, EventSink};
@@ -273,6 +274,23 @@ impl PluginManager {
 
     pub fn list(&self) -> Vec<PluginSummary> {
         self.index.read().unwrap().plugins.clone()
+    }
+
+    /// Every skill visible to the model, across the four roots, in precedence
+    /// order (design §4). The system-prompt block and the `skills_list`
+    /// command both come from here, so they cannot disagree about a root, the
+    /// ordering, or which skill shadows which.
+    ///
+    /// `enabled` is `PluginSettings.skills_enabled`; the caller owns the
+    /// config lock, so it is passed in rather than read here.
+    pub fn resolved_skills(&self, cwd: &Path, enabled: bool) -> Vec<ResolvedSkill> {
+        skills::collect(
+            &self.index(),
+            &self.data_dir.join("skills"),
+            &cwd.join(".ducky").join("skills"),
+            &self.home.join(".agents").join("skills"),
+            enabled,
+        )
     }
 
     /// Rebuild the index from the install records and the packages on disk.

@@ -12,6 +12,7 @@ import type {
   GroupLayout,
   McpServerConfig,
   PluginSummary,
+  SkillSummary,
   ToolDetailsMode,
   ProviderConfig,
   ProviderPreset,
@@ -381,3 +382,9 @@ export const mcpSetOauthConfig = (
 
 /** Installed plugins, their enabled state and their contributed skills. */
 export const pluginsList = () => invoke<PluginSummary[]>("plugins_list");
+
+/**
+ * Every skill the model can use, in precedence order, with provenance and
+ * shadowing. The system-prompt block is built from the same list.
+ */
+export const skillsList = () => invoke<SkillSummary[]>("skills_list");

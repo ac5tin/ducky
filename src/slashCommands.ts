@@ -1,6 +1,8 @@
 // Slash commands typed in the composer ("/compact", "/undo", "/init").
 // Pure logic only — the store routes parsed commands to their actions.
 
+import type { SkillSummary } from "./types";
+
 export interface SlashCommand {
   name: string;
   description: string;
@@ -74,32 +76,20 @@ export function filterCommands(token: string): SlashCommand[] {
   return SLASH_COMMANDS.filter((c) => c.name.startsWith(q));
 }
 
-/** The plugin shape `formatSkills` needs; `PluginSummary` satisfies it. */
-export interface SkillListSource {
-  id: string;
-  name: string;
-  enabled: boolean;
-  skills: { name: string; description: string }[];
-}
-
 /**
- * The `/skills` local chat message: one line per skill of every enabled
- * plugin. User, workspace and agents skills are not part of `plugins_list`,
- * so this lists the plugin-provided ones; the model's skills block covers
- * every root.
+ * The `/skills` local chat message: one line per skill the model can use,
+ * across every root, in precedence order. A shadowed skill stays listed with
+ * the id that won. The system-prompt block is built from the same resolution,
+ * so this is always a superset of what the prompt points at.
  */
-export function formatSkills(plugins: SkillListSource[]): string {
-  const lines = plugins
-    .filter((plugin) => plugin.enabled)
-    .flatMap((plugin) =>
-      plugin.skills.map(
-        (skill) =>
-          `- \`plugin:${plugin.id}:${skill.name}\` — ${skill.description} (plugin: ${plugin.name})`,
-      ),
-    );
-  if (lines.length === 0) {
-    return "No plugin skills are installed and enabled.";
+export function formatSkills(skills: SkillSummary[]): string {
+  if (skills.length === 0) {
+    return "No skills are installed and enabled.";
   }
+  const lines = skills.map((skill) => {
+    const shadow = skill.shadowed ? ` [shadowed by ${skill.shadowed}]` : "";
+    return `- \`${skill.id}\` — ${skill.description} (${skill.origin})${shadow}`;
+  });
   return `Skills available to the model:\n\n${lines.join("\n")}`;
 }
 

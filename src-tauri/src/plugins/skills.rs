@@ -8,8 +8,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use serde::Serialize;
+
 use super::layout::parse_frontmatter;
 use super::manager::PluginIndex;
+use super::path::resolve_within;
 
 /// How many skills the prompt block lists before it truncates.
 pub const PROMPT_CAP: usize = 60;
@@ -50,6 +53,38 @@ impl SkillOrigin {
             SkillOrigin::Plugin { name, .. } => format!("plugin: {name}"),
         }
     }
+}
+
+/// The `skills_list` payload: the same resolved skills the prompt block is
+/// built from, minus the filesystem path. `/skills` renders these.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SkillSummary {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    /// Human-readable provenance: `user`, `workspace`, `agents` or
+    /// `plugin: <name>`. The plugin id is already in `id`.
+    pub origin: String,
+    /// The id of the skill that won the name, when this one is shadowed.
+    pub shadowed: Option<String>,
+}
+
+impl From<&ResolvedSkill> for SkillSummary {
+    fn from(skill: &ResolvedSkill) -> Self {
+        Self {
+            id: skill.id.clone(),
+            name: skill.name.clone(),
+            description: skill.description.clone(),
+            origin: skill.origin.label(),
+            shadowed: skill.shadowed.clone(),
+        }
+    }
+}
+
+/// The `skills_list` payload for a resolved list — the whole list, not the
+/// prompt's capped view, so it is a superset of what the prompt points at.
+pub fn summarize(skills: &[ResolvedSkill]) -> Vec<SkillSummary> {
+    skills.iter().map(SkillSummary::from).collect()
 }
 
 /// One skill after precedence and shadowing are applied.
@@ -142,7 +177,12 @@ fn scan_root(root: &Path) -> Vec<(String, String, PathBuf)> {
         let Some(name) = dir.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        let Ok(text) = std::fs::read_to_string(dir.join("SKILL.md")) else {
+        // a SKILL.md that resolves outside the skill directory (a symlink
+        // escape) is skipped; the same rule guards `load_body`
+        let Some(skill_md) = resolve_within(&dir, &dir.join("SKILL.md")) else {
+            continue;
+        };
+        let Ok(text) = std::fs::read_to_string(&skill_md) else {
             continue;
         };
         let Some((frontmatter, _)) = parse_frontmatter(&text) else {
@@ -201,10 +241,20 @@ pub fn prompt_block(skills: &[ResolvedSkill], cap: usize) -> Option<String> {
 }
 
 /// The `SKILL.md` body with frontmatter stripped, capped at 32 KB.
+///
+/// The path is resolved through [`resolve_within`] before reading, so a
+/// `SKILL.md` symlinked outside the skill directory is refused here even if
+/// it reached a [`ResolvedSkill`] some other way.
 pub fn load_body(skill: &ResolvedSkill) -> Result<String, String> {
     let path = skill.dir.join("SKILL.md");
-    let text = std::fs::read_to_string(&path)
-        .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+    let resolved = resolve_within(&skill.dir, &path).ok_or_else(|| {
+        format!(
+            "cannot read {}: missing, or outside the skill directory",
+            path.display()
+        )
+    })?;
+    let text = std::fs::read_to_string(&resolved)
+        .map_err(|err| format!("cannot read {}: {err}", resolved.display()))?;
     let body = match parse_frontmatter(&text) {
         Some((_, body)) => body,
         None => text,

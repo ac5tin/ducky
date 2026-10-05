@@ -412,7 +412,6 @@ impl Agent {
     /// three filesystem roots. Read fresh on every call so a root edit or an
     /// enable/disable applies mid-turn.
     fn resolved_skills(&self, cwd: &std::path::Path) -> Vec<crate::plugins::skills::ResolvedSkill> {
-        let plugins = self.manager.plugins();
         let enabled = self
             .store
             .config
@@ -421,13 +420,7 @@ impl Agent {
             .settings
             .plugins
             .skills_enabled;
-        crate::plugins::skills::collect(
-            &plugins.index(),
-            &plugins.data_dir.join("skills"),
-            &cwd.join(".ducky").join("skills"),
-            &self.store.home_dir.join(".agents").join("skills"),
-            enabled,
-        )
+        self.manager.plugins().resolved_skills(cwd, enabled)
     }
 
     /// Stream one text chunk to wherever this run's output goes: the

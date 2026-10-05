@@ -515,3 +515,17 @@ export interface PluginSummary {
         enabled: boolean;
         skills: PluginSkillSummary[];
 }
+
+/**
+ * One skill the model can use, as `skills_list` reports it: every root, in
+ * precedence order, with provenance and the id that shadows it (if any).
+ */
+export interface SkillSummary {
+        id: string;
+        name: string;
+        description: string;
+        /** `user`, `workspace`, `agents`, or `plugin: <name>`. */
+        origin: string;
+        /** The id that won the name, when this one is shadowed. */
+        shadowed: string | null;
+}

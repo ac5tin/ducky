@@ -6,7 +6,7 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::plugins::path::resolve_within;
+use crate::plugins::path::resolve_within_maybe_missing;
 use crate::plugins::skills::{cap_file, load_body, ResolvedSkill};
 
 pub const LOAD_SKILL: &str = "ducky__load_skill";
@@ -84,13 +84,16 @@ pub fn read_skill_file(skill: &ResolvedSkill, path: &str) -> Result<String, Stri
         ));
     }
     let target = skill.dir.join(path);
-    if !target.exists() {
+    // containment first: a path that escapes the skill directory reports that
+    // whether or not the target exists, so the refusal is not an oracle for
+    // files elsewhere on disk
+    let resolved = resolve_within_maybe_missing(&skill.dir, &target)
+        .ok_or_else(|| format!("`{path}` is outside the skill directory"))?;
+    if !resolved.exists() {
         return Err(format!(
             "cannot read `{path}`: no such file in the skill directory"
         ));
     }
-    let resolved = resolve_within(&skill.dir, &target)
-        .ok_or_else(|| format!("`{path}` is outside the skill directory"))?;
     let text = std::fs::read_to_string(&resolved)
         .map_err(|err| format!("cannot read `{path}`: {err}"))?;
     Ok(cap_file(&text))

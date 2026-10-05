@@ -31,6 +31,7 @@ import type {
   ProviderPreset,
   RawMessage,
   ServerSummary,
+  SkillSummary,
   SteeringMessage,
   ToolCallState,
 } from "./types";
@@ -154,6 +155,7 @@ interface StoreState {
   suggestions: ConnectorSuggestion[];
   servers: ServerSummary[];
   plugins: PluginSummary[];
+  skills: SkillSummary[];
   version: string;
   /** The machine's home directory; the default working directory. */
   homeDir: string;
@@ -209,6 +211,7 @@ interface StoreState {
   refreshConfig: () => Promise<void>;
   refreshServers: () => Promise<void>;
   refreshPlugins: () => Promise<void>;
+  refreshSkills: () => Promise<void>;
   refreshServer: (id: string) => Promise<void>;
 
   openConversation: (id: string) => Promise<void>;
@@ -335,6 +338,7 @@ export const useStore = create<StoreState>((set, get) => ({
   suggestions: [],
   servers: [],
   plugins: [],
+  skills: [],
   version: "",
   homeDir: "",
 
@@ -440,6 +444,10 @@ export const useStore = create<StoreState>((set, get) => ({
 
   async refreshPlugins() {
     set({ plugins: await api.pluginsList() });
+  },
+
+  async refreshSkills() {
+    set({ skills: await api.skillsList() });
   },
 
   async refreshServer(id) {
@@ -698,9 +706,15 @@ export const useStore = create<StoreState>((set, get) => ({
           return get().send(expandInitPrompt(workingDir, command.args));
         }
         case "skills": {
-          // local message, no model turn: the plugin list is enough here
-          if (get().plugins.length === 0) {
-            await get().refreshPlugins().catch(() => {});
+          // always refresh: nothing writes this slice on plugins_changed yet,
+          // so a second /skills in a session must not render the first
+          // snapshot; a failed refresh is reported, never rendered stale
+          let text: string;
+          try {
+            await get().refreshSkills();
+            text = formatSkills(get().skills);
+          } catch (err) {
+            text = `Could not list skills: ${String(err)}`;
           }
           set((s) => ({
             items: [
@@ -708,7 +722,7 @@ export const useStore = create<StoreState>((set, get) => ({
               {
                 kind: "assistant" as const,
                 id: `skills-${Date.now()}`,
-                text: formatSkills(get().plugins),
+                text,
                 ts: new Date().toISOString(),
               },
             ],

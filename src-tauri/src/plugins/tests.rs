@@ -17,7 +17,7 @@ use super::marketplace::{
     HttpResponse, MarketplaceRecord, MarketplaceStore, PluginSource, Registry,
 };
 use super::manager::{display_host, MarketplaceInput, PluginIndex, PluginManager};
-use super::skills::{collect, load_body, prompt_block, ResolvedSkill, SkillOrigin};
+use super::skills::{collect, load_body, prompt_block, summarize, ResolvedSkill, SkillOrigin};
 use super::update::{apply, check_one, rollback};
 use crate::config::{PluginSettings, PolicyDefault};
 use crate::events::{BackendEvent, CollectingSink};
@@ -4674,6 +4674,67 @@ fn precedence_user_beats_plugin() {
     assert_eq!(plugin.shadowed.as_deref(), Some("user:demo"));
 }
 
+/// The `/skills` payload (`skills_list`) spans every root and carries the
+/// shadow mark, exactly like the prompt block's list — nothing about it is
+/// plugin-only.
+#[test]
+fn skills_list_payload_lists_every_root_with_shadowing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    plugin_package(&source, "demo-plugin");
+    let record = seed_installed(tmp.path(), &source);
+    edit_record(tmp.path(), &record.id, |r| r.enabled = true);
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+    manager.reload().unwrap();
+
+    // the user root wins the name `demo`; the other two filesystem roots
+    // contribute skills of their own
+    write(
+        tmp.path(),
+        "skills/demo/SKILL.md",
+        "---\nname: demo\ndescription: user demo\n---\nUser body.",
+    );
+    write(
+        tmp.path(),
+        "ws/.ducky/skills/ws-only/SKILL.md",
+        "---\nname: ws-only\ndescription: ws skill\n---\nBody.",
+    );
+    write(
+        tmp.path(),
+        ".agents/skills/agents-only/SKILL.md",
+        "---\nname: agents-only\ndescription: agents skill\n---\nBody.",
+    );
+
+    let payload = summarize(&manager.resolved_skills(&tmp.path().join("ws"), true));
+
+    let user = payload
+        .iter()
+        .find(|s| s.id == "user:demo")
+        .expect("the user-root skill is in the payload");
+    assert_eq!(user.origin, "user");
+    assert_eq!(user.shadowed, None);
+
+    let plugin = payload
+        .iter()
+        .find(|s| s.id == format!("plugin:{}:demo", record.id))
+        .expect("the plugin skill is in the payload alongside the user one");
+    assert_eq!(plugin.origin, "plugin: demo-plugin");
+    assert_eq!(plugin.shadowed.as_deref(), Some("user:demo"));
+
+    assert!(
+        payload
+            .iter()
+            .any(|s| s.id == "workspace:ws-only" && s.origin == "workspace"),
+        "{payload:?}"
+    );
+    assert!(
+        payload
+            .iter()
+            .any(|s| s.id == "agents:agents-only" && s.origin == "agents"),
+        "{payload:?}"
+    );
+}
+
 #[test]
 fn bare_name_resolves_by_precedence() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4876,6 +4937,66 @@ fn read_skill_file_refuses_escape() {
             "a symlink escape must not be followed"
         );
     }
+}
+
+#[test]
+fn read_skill_file_outside_reports_containment_even_when_missing() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "demo/SKILL.md",
+        "---\nname: demo\ndescription: demo skill\n---\nBody.",
+    );
+    write(tmp.path(), "secrets.json", "{}");
+    let skill = skill_at("demo", "demo", &tmp.path().join("demo"), SkillOrigin::User);
+
+    // containment is checked first, so the refusal does not reveal whether a
+    // file elsewhere on disk exists
+    let exists = crate::builtin::skills::read_skill_file(&skill, "../secrets.json").unwrap_err();
+    assert!(exists.contains("outside the skill directory"), "{exists}");
+    let missing = crate::builtin::skills::read_skill_file(&skill, "../ghost.json").unwrap_err();
+    assert!(missing.contains("outside the skill directory"), "{missing}");
+
+    // inside the directory, a missing file keeps the missing-file refusal
+    let inside = crate::builtin::skills::read_skill_file(&skill, "missing.txt").unwrap_err();
+    assert!(inside.contains("no such file"), "{inside}");
+}
+
+/// A `SKILL.md` symlinked outside its skill directory is skipped at discovery
+/// and refused by the body reader, for the filesystem roots too (the plugin
+/// layer already guards its own).
+#[cfg(unix)]
+#[test]
+fn escaping_skill_md_symlink_is_skipped_and_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "skills/demo/README.md", "x");
+    write(
+        tmp.path(),
+        "skills/secret.md",
+        "---\nname: demo\ndescription: secret\n---\nSecret.",
+    );
+    symlink(
+        &tmp.path().join("skills/secret.md"),
+        &tmp.path().join("skills/demo/SKILL.md"),
+    );
+    let skill = skill_at(
+        "demo",
+        "secret",
+        &tmp.path().join("skills/demo"),
+        SkillOrigin::User,
+    );
+
+    let skills = collect(
+        &PluginIndex::default(),
+        &tmp.path().join("skills"),
+        &tmp.path().join("ws"),
+        &tmp.path().join("agents"),
+        true,
+    );
+    assert!(skills.is_empty(), "discovery skipped the escape: {skills:?}");
+
+    let err = load_body(&skill).unwrap_err();
+    assert!(err.contains("outside the skill directory"), "{err}");
 }
 
 #[test]

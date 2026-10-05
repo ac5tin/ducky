@@ -68,26 +68,42 @@ test("slash_skills_parses", () => {
   );
 });
 
-test("formatSkills lists enabled plugin skills", () => {
+test("formatSkills lists every root with provenance and shadowing", () => {
   const text = formatSkills([
     {
-      id: "acme",
-      name: "Acme",
-      enabled: true,
-      skills: [{ name: "deploy", description: "ship it" }],
+      id: "user:demo",
+      name: "demo",
+      description: "user demo",
+      origin: "user",
+      shadowed: null,
     },
     {
-      id: "off",
-      name: "Off",
-      enabled: false,
-      skills: [{ name: "hidden", description: "not shown" }],
+      id: "plugin:acme:demo",
+      name: "demo",
+      description: "plugin demo",
+      origin: "plugin: Acme",
+      shadowed: "user:demo",
+    },
+    {
+      id: "agents:report",
+      name: "report",
+      description: "write a report",
+      origin: "agents",
+      shadowed: null,
     },
   ]);
 
-  assert.ok(text.includes("plugin:acme:deploy"), text);
-  assert.ok(text.includes("ship it"), text);
-  assert.ok(!text.includes("hidden"), text);
-  assert.ok(!text.includes("nope"), text);
+  assert.ok(text.includes("`user:demo`"), text);
+  assert.ok(text.includes("(user)"), text);
+  assert.ok(text.includes("plugin:acme:demo"), text);
+  assert.ok(text.includes("(plugin: Acme)"), text);
+  assert.ok(text.includes("[shadowed by user:demo]"), text);
+  assert.ok(text.includes("agents:report"), text);
+  assert.ok(text.includes("write a report"), text);
+});
+
+test("formatSkills says so when nothing is enabled", () => {
+  assert.equal(formatSkills([]), "No skills are installed and enabled.");
 });
 
 test("filterCommands matches by name prefix", () => {
