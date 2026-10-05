@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use async_trait::async_trait;
 
+use super::bundled;
 use super::diagnostics::{DiagLevel, Diagnostic};
 use super::install::{self, InstallRecord, InstallStore, PluginStatus, UpdatePolicy};
 use super::layout::{
@@ -247,6 +248,15 @@ impl PluginManager {
     ) -> Arc<Self> {
         let plugins_dir = data_dir.join("plugins");
         let marketplaces_dir = data_dir.join("marketplaces");
+        // Seed the bundled marketplace before the first reload (Task 11). An
+        // existing record is left alone, so the file is only written when the
+        // seed actually adds it (design §5).
+        let mut marketplaces = MarketplaceStore::load(&marketplaces_dir);
+        if bundled::ensure_seeded(&mut marketplaces, resource_dir) {
+            if let Err(err) = marketplaces.save(&marketplaces_dir) {
+                tracing::warn!("cannot write marketplaces.json: {err}");
+            }
+        }
         let manager = Arc::new(Self {
             data_dir: data_dir.to_path_buf(),
             home: home.to_path_buf(),
@@ -254,7 +264,7 @@ impl PluginManager {
             marketplaces_dir: marketplaces_dir.clone(),
             plugins_dir: plugins_dir.clone(),
             plugin_data_dir: data_dir.join("plugin-data"),
-            marketplaces: Mutex::new(MarketplaceStore::load(&marketplaces_dir)),
+            marketplaces: Mutex::new(marketplaces),
             install: Mutex::new(InstallStore::load(&plugins_dir)),
             index: RwLock::new(PluginIndex::default()),
             sink,

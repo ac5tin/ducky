@@ -4559,7 +4559,9 @@ async fn add_marketplace_rejects_bundled_id() {
         .unwrap_err();
 
     assert!(err.contains("ducky-official"), "{err}");
-    assert!(manager.marketplaces().is_empty());
+    // The seed is the only record; the refused add left it alone.
+    assert_eq!(manager.marketplaces().len(), 1);
+    assert_eq!(manager.marketplaces()[0].id, "ducky-official");
 }
 
 #[tokio::test]
@@ -4600,10 +4602,16 @@ async fn remove_marketplace_requires_confirm() {
 
     let err = manager.remove_marketplace(&summary.id, false).unwrap_err();
     assert!(err.contains("confirm"), "{err}");
-    assert_eq!(manager.marketplaces().len(), 1);
+    assert!(manager
+        .marketplaces()
+        .iter()
+        .any(|item| item.id == summary.id));
 
     manager.remove_marketplace(&summary.id, true).unwrap();
-    assert!(manager.marketplaces().is_empty());
+    assert!(!manager
+        .marketplaces()
+        .iter()
+        .any(|item| item.id == summary.id));
 }
 
 /// Hand-seed one marketplace record before the manager loads its stores.
@@ -4653,6 +4661,156 @@ async fn reserved_marketplace_id_cannot_be_removed() {
         .unwrap_err();
     assert!(err.contains("bundled"), "{err}");
     assert_eq!(manager.marketplaces().len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Task 11: the bundled official marketplace (design §5)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn seeds_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("marketplaces");
+    let mut store = MarketplaceStore::load(&dir);
+
+    assert!(super::bundled::ensure_seeded(&mut store, None));
+    assert!(!super::bundled::ensure_seeded(&mut store, None));
+    assert_eq!(store.records.len(), 1);
+    assert_eq!(store.records[0].id, "ducky-official");
+
+    // A later startup loads the record from disk: no second seed, no rewrite
+    // and a hand edit survives. A third call changes nothing on disk either.
+    store.save(&dir).unwrap();
+    let mut reloaded = MarketplaceStore::load(&dir);
+    reloaded.records[0].name = "My Official".to_string();
+    reloaded.save(&dir).unwrap();
+    let bytes = std::fs::read(dir.join("marketplaces.json")).unwrap();
+    assert!(!super::bundled::ensure_seeded(&mut reloaded, None));
+    assert_eq!(reloaded.records.len(), 1);
+    assert_eq!(reloaded.records[0].name, "My Official");
+    assert_eq!(std::fs::read(dir.join("marketplaces.json")).unwrap(), bytes);
+}
+
+#[test]
+fn missing_resource_falls_back_to_disk() {
+    // A dev build has no packaged resource directory; the checked-in copy is
+    // the fallback, so the bundled registry still loads.
+    let empty = tempfile::tempdir().unwrap();
+    for resource_dir in [None, Some(empty.path())] {
+        let registry = super::bundled::load_registry(resource_dir).unwrap();
+        assert_eq!(registry.name, "Ducky Official");
+        assert!(registry.registry_path.is_file());
+        assert!(
+            registry.registry_path.ends_with("ducky-official.json"),
+            "{}",
+            registry.registry_path.display()
+        );
+    }
+}
+
+#[test]
+fn bundled_registry_parses() {
+    // The shipped file is the normalised Ducky dialect: it parses unchanged,
+    // with zero entries and therefore no diagnostics.
+    let registry = super::bundled::load_registry(None).unwrap();
+    assert_eq!(registry.name, "Ducky Official");
+    assert!(registry.description.is_some());
+    assert!(registry.entries.is_empty());
+    assert!(
+        registry
+            .registry_path
+            .ends_with("resources/ducky-official.json"),
+        "{}",
+        registry.registry_path.display()
+    );
+}
+
+#[tokio::test]
+async fn broken_resource_does_not_stop_startup() {
+    // A packaging mistake must not brick the app: the manager still builds,
+    // the marketplace is listed and its error carries the diagnosis.
+    let tmp = tempfile::tempdir().unwrap();
+    let resources = tmp.path().join("resources");
+    std::fs::create_dir_all(&resources).unwrap();
+    std::fs::write(resources.join("ducky-official.json"), "{not json").unwrap();
+
+    let manager = PluginManager::with_sink(
+        tmp.path(),
+        tmp.path(),
+        Some(resources.as_path()),
+        Arc::new(CollectingSink::default()),
+    );
+
+    let record = manager
+        .marketplaces()
+        .into_iter()
+        .find(|record| record.id == "ducky-official")
+        .expect("the bundled record is seeded even when its file is broken");
+    assert!(record.bundled);
+    assert!(record.error.is_some(), "{record:?}");
+    assert_eq!(record.entry_count, 0);
+    assert!(manager.catalog(None).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn seeded_record_is_bundled_and_readonly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+    let record = manager
+        .marketplaces()
+        .into_iter()
+        .find(|record| record.id == "ducky-official")
+        .expect("the bundled record is seeded at startup");
+    assert!(record.bundled);
+    assert!(record.hidden);
+
+    let err = manager
+        .remove_marketplace("ducky-official", true)
+        .unwrap_err();
+    assert!(err.contains("bundled"), "{err}");
+    assert!(manager
+        .marketplaces()
+        .iter()
+        .any(|item| item.id == "ducky-official"));
+    drop(manager);
+
+    // A second startup must not rewrite the file: hand-edit it into compact
+    // JSON, and a rewrite would re-pretty-print it.
+    let file = tmp.path().join("marketplaces/marketplaces.json");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    value["marketplaces"][0]["name"] = serde_json::json!("My Official");
+    let compact = serde_json::to_string(&value).unwrap();
+    std::fs::write(&file, &compact).unwrap();
+
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+    let record = manager
+        .marketplaces()
+        .into_iter()
+        .find(|record| record.id == "ducky-official")
+        .expect("the bundled record survives a restart");
+    assert_eq!(record.name, "My Official");
+    assert!(record.bundled);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), compact);
+}
+
+#[tokio::test]
+async fn bundled_cannot_be_shadowed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+
+    let err = manager
+        .add_marketplace(
+            MarketplaceInput {
+                source: "acme/tools".to_string(),
+            },
+            Some("ducky-official".to_string()),
+        )
+        .unwrap_err();
+
+    assert!(err.contains("ducky-official"), "{err}");
+    assert_eq!(manager.marketplaces().len(), 1);
+    assert_eq!(manager.marketplaces()[0].id, "ducky-official");
 }
 
 #[tokio::test]

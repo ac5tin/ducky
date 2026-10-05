@@ -26,6 +26,7 @@ pub mod diagnostics {
 
 pub use diagnostics::{DiagLevel, Diagnostic};
 
+pub mod bundled;
 pub mod install;
 pub mod layout;
 pub mod manager;
