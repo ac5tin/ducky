@@ -526,28 +526,35 @@ export interface ElicitationSchemaShape {
 /**
  * Where a plugin or marketplace came from (`PluginSource`). Serialized with
  * the tag `kind` and kebab-case variants; the git ref is written `ref`.
+ *
+ * `path`, `ref` and `sha` are `string | null`, **not** optional: the Rust
+ * `PluginSource` declares them `Option<T>` without `#[serde(default)]`
+ * (`src-tauri/src/plugins/marketplace.rs`), so serde requires the key and
+ * rejects a payload that omits it with `missing field` — never a null
+ * default. `plugin_install` deserializes this shape straight from the
+ * webview, so a key that TypeScript lets you omit is a runtime rejection.
  */
 export type PluginSource =
         | {
                   kind: "github";
                   repo: string;
-                  path?: string | null;
-                  ref?: string | null;
-                  sha?: string | null;
+                  path: string | null;
+                  ref: string | null;
+                  sha: string | null;
           }
         | {
                   kind: "git";
                   url: string;
-                  path?: string | null;
-                  ref?: string | null;
-                  sha?: string | null;
+                  path: string | null;
+                  ref: string | null;
+                  sha: string | null;
           }
         | {
                   kind: "git-subdir";
                   url: string;
                   path: string;
-                  ref?: string | null;
-                  sha?: string | null;
+                  ref: string | null;
+                  sha: string | null;
           }
         | { kind: "url"; url: string }
         | { kind: "path"; path: string }

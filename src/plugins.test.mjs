@@ -9,6 +9,7 @@ import {
   hoursToInterval,
   pluginStatusLabel,
   runInstallPlugin,
+  shouldSchedulePluginMaintenance,
   skillCount,
   withPluginProgress,
   withUpdateAvailable,
@@ -164,6 +165,16 @@ test("hoursToInterval maps 0 hours to no timer", () => {
   assert.equal(hoursToInterval(0), null);
   assert.equal(hoursToInterval(-1), null);
   assert.equal(hoursToInterval(6), 21_600_000);
+});
+
+test("shouldSchedulePluginMaintenance never schedules in dev", () => {
+  // the dev guard: a positive interval is still a no in a dev build
+  assert.equal(shouldSchedulePluginMaintenance({ dev: true, hours: 6 }), false);
+  assert.equal(shouldSchedulePluginMaintenance({ dev: false, hours: 6 }), true);
+  // 0 / negative hours mean "startup only", in every build
+  assert.equal(shouldSchedulePluginMaintenance({ dev: false, hours: 0 }), false);
+  assert.equal(shouldSchedulePluginMaintenance({ dev: false, hours: -1 }), false);
+  assert.equal(shouldSchedulePluginMaintenance({ dev: true, hours: 0 }), false);
 });
 
 test("plugin progress is keyed by the install record id", () => {

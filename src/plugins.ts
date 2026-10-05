@@ -167,6 +167,20 @@ export function hoursToInterval(hours: number): number | null {
   return Number.isFinite(hours) && hours > 0 ? hours * 3_600_000 : null;
 }
 
+/**
+ * Whether one plugin maintenance timer may run: never in a dev build, and
+ * only for a positive hour count. The store arms both intervals through this
+ * predicate, so a caller cannot start a timer that ADR-0002 says dev builds
+ * must skip — `refreshConfig()` runs after every completed turn, so a dev
+ * check at the `init()` call site alone does not hold.
+ */
+export function shouldSchedulePluginMaintenance(input: {
+  dev: boolean;
+  hours: number;
+}): boolean {
+  return !input.dev && hoursToInterval(input.hours) !== null;
+}
+
 /** The api surface the install flow needs, so tests can inject a fake. */
 export interface PluginInstallApi {
   pluginInstall: (req: PluginInstallRequest) => Promise<PluginDetail>;

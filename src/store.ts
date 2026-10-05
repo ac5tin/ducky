@@ -14,6 +14,7 @@ import {
   formatVersion,
   hoursToInterval,
   runInstallPlugin,
+  shouldSchedulePluginMaintenance,
   withPluginProgress,
   withUpdateAvailable,
   withoutPluginProgress,
@@ -158,14 +159,33 @@ let pluginUpdateHours: number | null = null;
 
 /**
  * (Re)arm the two plugin timers from settings; 0 hours means "startup only",
- * so no interval starts. A timer is only touched when its hours changed, so
- * the `refreshConfig()` that follows every turn never resets the countdown —
- * and a settings change can never leave two timers running.
+ * so no interval starts. Dev builds never arm either timer: the decision goes
+ * through `shouldSchedulePluginMaintenance`, which pins both effective
+ * intervals to 0, so the change-guarded blocks below clear any handle and
+ * start nothing. The guard lives inside this function, not at a call site,
+ * because `refreshConfig()` runs after every completed turn — an `init()`-only
+ * guard would let dev builds arm both timers anyway (ADR-0002: checks skipped
+ * in dev builds). A timer is only touched when its effective hours changed,
+ * so the per-turn `refreshConfig()` never resets the countdown — and a
+ * settings change can never leave two timers running.
  */
 function schedulePluginMaintenance(settings: PluginSettings) {
-  if (settings.marketplace_refresh_hours !== marketplaceHours) {
-    marketplaceHours = settings.marketplace_refresh_hours;
-    const marketplaceMs = hoursToInterval(marketplaceHours);
+  const dev = import.meta.env.DEV;
+  const marketplace = shouldSchedulePluginMaintenance({
+    dev,
+    hours: settings.marketplace_refresh_hours,
+  })
+    ? settings.marketplace_refresh_hours
+    : 0;
+  const updates = shouldSchedulePluginMaintenance({
+    dev,
+    hours: settings.update_check_hours,
+  })
+    ? settings.update_check_hours
+    : 0;
+  if (marketplace !== marketplaceHours) {
+    marketplaceHours = marketplace;
+    const marketplaceMs = hoursToInterval(marketplace);
     if (marketplaceTimer) clearInterval(marketplaceTimer);
     marketplaceTimer = marketplaceMs
       ? setInterval(() => {
@@ -173,9 +193,9 @@ function schedulePluginMaintenance(settings: PluginSettings) {
         }, marketplaceMs)
       : null;
   }
-  if (settings.update_check_hours !== pluginUpdateHours) {
-    pluginUpdateHours = settings.update_check_hours;
-    const updateMs = hoursToInterval(pluginUpdateHours);
+  if (updates !== pluginUpdateHours) {
+    pluginUpdateHours = updates;
+    const updateMs = hoursToInterval(updates);
     if (pluginUpdateTimer) clearInterval(pluginUpdateTimer);
     pluginUpdateTimer = updateMs
       ? setInterval(() => {
@@ -566,21 +586,30 @@ export const useStore = create<StoreState>((set, get) => ({
   },
 
   async installPlugin(req) {
+    let installed: PluginDetail | null = null;
     try {
-      const detail = await runInstallPlugin(api, req, (catalogLoading) =>
+      installed = await runInstallPlugin(api, req, (catalogLoading) =>
         set({ catalogLoading }),
       );
       await reloadPluginState(get);
       await get().loadCatalog(get().catalogMarketplace);
-      get().toast("success", `Installed ${detail.name}`);
-      return detail;
+      get().toast("success", `Installed ${installed.name}`);
+      return installed;
     } catch (err) {
       get().toast("error", `Install failed: ${err}`);
       return null;
     } finally {
-      // the install's three phases are over either way; the record id is only
-      // known on success, so drop the whole set rather than guess
-      set({ pluginProgress: {} });
+      // on success the record id is known (the detail carries it), so drop
+      // only this install's row and leave a concurrent install's progress
+      // alone. A failed install's id may be unknowable — a phase may have
+      // fired before the failure — so drop the whole set rather than guess.
+      const finishedId = installed?.id ?? null;
+      set((s) => ({
+        pluginProgress:
+          finishedId === null
+            ? {}
+            : withoutPluginProgress(s.pluginProgress, finishedId),
+      }));
     }
   },
 
