@@ -6,9 +6,20 @@ import type {
   PluginDetail,
   PluginInstallRequest,
   PluginProgressEvent,
+  PluginServerView,
+  PluginSource,
   PluginSummary,
   PluginUpdateAvailableEvent,
+  SkillSummary,
 } from "./types";
+
+/**
+ * The backend's `TRUST_WARNING` (`src-tauri/src/plugins/manager.rs`), shown
+ * before a plugin is enabled. `plugin_detail` sends the same text; this copy
+ * covers the surfaces that have no detail payload yet (Discover installs).
+ */
+export const INSTALL_TRUST_WARNING =
+  "enabling a plugin runs its code with your user account; MCP servers start local programs and reach the hosts listed above";
 
 /**
  * The row's status chip label. An error always wins: a plugin that failed to
@@ -29,6 +40,27 @@ export function pluginStatusLabel(
     return "Update available";
   }
   return p.status === "enabled" ? "Enabled" : "Disabled";
+}
+
+/** One status chip's tone, for the row's colour. */
+export type PluginStatusTone = "ok" | "warn" | "error" | "muted";
+
+/** The tone that goes with `pluginStatusLabel` — the same precedence. */
+export function pluginStatusTone(
+  p: Pick<PluginSummary, "status" | "diagnostics" | "available_update">,
+): PluginStatusTone {
+  switch (pluginStatusLabel(p)) {
+    case "Error":
+    case "Invalid":
+      return "error";
+    case "Update available":
+    case "Modified locally":
+      return "warn";
+    case "Enabled":
+      return "ok";
+    default:
+      return "muted";
+  }
 }
 
 /** One in-flight plugin operation's progress text. */
@@ -62,6 +94,41 @@ export function withoutPluginProgress(
   const next = { ...current };
   delete next[pluginId];
   return next;
+}
+
+/** The gerund shown next to one install phase (design §11). */
+export function progressPhaseLabel(phase: string): string {
+  switch (phase) {
+    case "fetch":
+      return "Fetching";
+    case "validate":
+      return "Validating";
+    case "place":
+      return "Placing";
+    default:
+      return "Working";
+  }
+}
+
+/** One in-flight operation as a display row. */
+export interface PluginProgressView extends PluginProgressRow {
+  id: string;
+  label: string;
+}
+
+const PHASE_ORDER = ["fetch", "validate", "place"];
+
+/** In-flight operations in phase order; ties keep insertion order. */
+export function progressRowViews(
+  progress: Record<string, PluginProgressRow>,
+): PluginProgressView[] {
+  const rank = (phase: string) => {
+    const index = PHASE_ORDER.indexOf(phase);
+    return index === -1 ? PHASE_ORDER.length : index;
+  };
+  return Object.entries(progress)
+    .map(([id, row]) => ({ id, ...row, label: progressPhaseLabel(row.phase) }))
+    .sort((a, b) => rank(a.phase) - rank(b.phase));
 }
 
 /**
@@ -126,6 +193,41 @@ export interface CatalogCategoryGroup {
   entries: CatalogEntry[];
 }
 
+/** One Discover card's single action button. */
+export interface CatalogAction {
+  kind: "install" | "installed" | "update" | "unavailable";
+  label: string;
+  disabled: boolean;
+  /** Why the entry cannot be installed, when it cannot. */
+  hint: string | null;
+}
+
+/**
+ * The single action a catalog entry offers: an unavailable entry (with the
+ * reason), an update, the installed badge, or Install. `busy` disables the
+ * two buttons that start work.
+ */
+export function catalogEntryAction(
+  entry: CatalogEntry,
+  busy = false,
+): CatalogAction {
+  if (!entry.available) {
+    return {
+      kind: "unavailable",
+      label: "Unavailable",
+      disabled: true,
+      hint: entry.reason,
+    };
+  }
+  if (entry.update_available) {
+    return { kind: "update", label: "Update", disabled: busy, hint: null };
+  }
+  if (entry.installed) {
+    return { kind: "installed", label: "Installed", disabled: true, hint: null };
+  }
+  return { kind: "install", label: "Install", disabled: busy, hint: null };
+}
+
 /** Group entries by category, alphabetically; uncategorised entries last. */
 export function groupByCategory(entries: CatalogEntry[]): CatalogCategoryGroup[] {
   const groups = new Map<string, CatalogEntry[]>();
@@ -160,6 +262,91 @@ export function skillCount(plugin: Pick<PluginSummary, "skills">): number {
 export function formatVersion(v?: string | null): string {
   const trimmed = v?.trim();
   return trimmed ? trimmed : "unknown";
+}
+
+/** One plugin or marketplace source as a single display line. */
+export function sourceLabel(source: PluginSource): string {
+  switch (source.kind) {
+    case "github":
+      return source.path ? `${source.repo} · ${source.path}` : source.repo;
+    case "git":
+      return source.path ? `${source.url} · ${source.path}` : source.url;
+    case "git-subdir":
+      return `${source.url} · ${source.path}`;
+    case "url":
+      return source.url;
+    case "path":
+      return source.path;
+    case "unsupported":
+      return `${source.sourceKind} (unsupported)`;
+  }
+}
+
+/**
+ * One server's trust line: the exact command and args for a local server, or
+ * the host the backend published for a remote one. Only these fields can
+ * appear — env and header values never reach the webview.
+ */
+export function serverTrustLine(
+  server: Pick<PluginServerView, "transport" | "command" | "args" | "url">,
+): string {
+  const command = [server.command, ...server.args].filter(Boolean).join(" ");
+  if (command) return `${server.transport} — ${command}`;
+  return `${server.transport} — ${server.url ?? "host unknown"}`;
+}
+
+/** One plugin skill with its provenance and shadow state. */
+export interface PluginSkillRow {
+  id: string;
+  name: string;
+  description: string;
+  origin: string;
+  /** The id that won the name, when a higher-precedence root shadows this. */
+  shadowed: string | null;
+}
+
+/**
+ * A plugin's skills joined with the resolved skills list, so provenance and
+ * shadowing come from the same list the prompt block uses. A skill of a
+ * disabled plugin is not in that list; it keeps the plugin as its origin.
+ */
+export function pluginSkillRows(
+  plugin: Pick<PluginSummary, "id" | "skills">,
+  resolved: SkillSummary[],
+): PluginSkillRow[] {
+  return (plugin.skills ?? []).map((skill) => {
+    const id = `plugin:${plugin.id}:${skill.name}`;
+    const found = resolved.find((candidate) => candidate.id === id);
+    return {
+      id,
+      name: skill.name,
+      description: skill.description,
+      origin: found?.origin ?? `plugin:${plugin.id}`,
+      shadowed: found?.shadowed ?? null,
+    };
+  });
+}
+
+/** The spec §6 enable-consent summary: what a plugin will run. */
+export interface PluginTrustSummary {
+  warning: string;
+  servers: { name: string; line: string }[];
+  subagents: string[];
+}
+
+/** Build the enable-consent body from the plugin's components. */
+export function pluginTrustSummary(
+  plugin: Pick<PluginSummary, "servers" | "subagents">,
+  warning: string,
+): PluginTrustSummary {
+  return {
+    warning,
+    servers: (plugin.servers ?? []).map((server) => ({
+      name: server.name,
+      line: serverTrustLine(server),
+    })),
+    subagents: (plugin.subagents ?? []).map((subagent) => subagent.name),
+  };
 }
 
 /** A settings interval in hours as milliseconds; 0 (or less) = no timer. */
@@ -202,4 +389,39 @@ export async function runInstallPlugin(
   } finally {
     setCatalogLoading(false);
   }
+}
+
+/** The api the install action needs: the install plus the reloads it drives. */
+export interface PluginInstallActionApi extends PluginInstallApi {
+  pluginsList: () => Promise<PluginSummary[]>;
+  skillsList: () => Promise<SkillSummary[]>;
+  marketplaceCatalog: (marketplace: string | null) => Promise<CatalogEntry[]>;
+}
+
+/** What one install action leaves for the store to apply, in one update. */
+export interface PluginInstallActionOutcome {
+  installed: PluginDetail;
+  plugins: PluginSummary[];
+  skills: SkillSummary[];
+  catalog: CatalogEntry[];
+}
+
+/**
+ * The install action's body with the api injected, so `node --test` can drive
+ * it without Tauri. The loading flag wraps the install alone; a rejection
+ * propagates before any reload runs, so a failed install reloads nothing.
+ */
+export async function runInstallPluginAction(
+  api: PluginInstallActionApi,
+  req: PluginInstallRequest,
+  marketplace: string | null,
+  setCatalogLoading: (loading: boolean) => void,
+): Promise<PluginInstallActionOutcome> {
+  const installed = await runInstallPlugin(api, req, setCatalogLoading);
+  const [plugins, skills, catalog] = await Promise.all([
+    api.pluginsList(),
+    api.skillsList(),
+    api.marketplaceCatalog(marketplace),
+  ]);
+  return { installed, plugins, skills, catalog };
 }

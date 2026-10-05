@@ -3,6 +3,7 @@ import { useStore } from "./store";
 import { Sidebar } from "./components/Sidebar";
 import { ChatView } from "./components/chat/ChatView";
 import { ConnectorsView } from "./components/connectors/ConnectorsView";
+import { PluginsView } from "./components/plugins/PluginsView";
 import { SettingsView } from "./components/settings/SettingsView";
 import { Onboarding } from "./components/Onboarding";
 import { ElicitationModal } from "./components/modals/ElicitationModal";
@@ -38,6 +39,7 @@ export default function App() {
         {view === "onboarding" && <Onboarding />}
         {view === "chat" && <ChatView />}
         {view === "connectors" && <ConnectorsView />}
+        {view === "plugins" && <PluginsView />}
         {view === "settings" && <SettingsView />}
       </main>
 

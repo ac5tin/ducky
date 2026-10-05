@@ -3,14 +3,23 @@ import assert from "node:assert/strict";
 
 import {
   availableUpdates,
+  catalogEntryAction,
   filterCatalog,
   formatVersion,
   groupByCategory,
   hoursToInterval,
+  pluginSkillRows,
   pluginStatusLabel,
+  pluginStatusTone,
+  pluginTrustSummary,
+  progressPhaseLabel,
+  progressRowViews,
   runInstallPlugin,
+  runInstallPluginAction,
+  serverTrustLine,
   shouldSchedulePluginMaintenance,
   skillCount,
+  sourceLabel,
   withPluginProgress,
   withUpdateAvailable,
   withoutPluginProgress,
@@ -274,4 +283,261 @@ test("runInstallPlugin clears catalogLoading when the install rejects", async ()
     /unsafe id/,
   );
   assert.deepEqual(seen, [true, false]);
+});
+
+test("install action sets catalogLoading then clears it", async () => {
+  const events = [];
+  const outcome = await runInstallPluginAction(
+    {
+      pluginInstall: async (req) => {
+        events.push("install");
+        return { id: "acme", name: "Acme", request: req };
+      },
+      pluginsList: async () => {
+        events.push("plugins");
+        return [plugin({ id: "acme" })];
+      },
+      skillsList: async () => {
+        events.push("skills");
+        return [];
+      },
+      marketplaceCatalog: async (marketplace) => {
+        events.push(`catalog:${marketplace}`);
+        return [entry()];
+      },
+    },
+    { marketplace: "official", name: "acme" },
+    "official",
+    (loading) => events.push(loading ? "loading:on" : "loading:off"),
+  );
+  // loading is raised before the fetch and cleared as soon as it settles, so
+  // the reload that follows is not covered by the install's loading flag
+  assert.deepEqual(events, [
+    "loading:on",
+    "install",
+    "loading:off",
+    "plugins",
+    "skills",
+    "catalog:official",
+  ]);
+  assert.equal(outcome.installed.id, "acme");
+  assert.deepEqual(outcome.plugins, [plugin({ id: "acme" })]);
+  assert.deepEqual(outcome.catalog, [entry()]);
+
+  // a failed install clears the flag and never reloads anything
+  const failed = [];
+  await assert.rejects(
+    runInstallPluginAction(
+      {
+        pluginInstall: async () => {
+          throw new Error("unsafe id");
+        },
+        pluginsList: async () => {
+          failed.push("plugins");
+          return [];
+        },
+        skillsList: async () => {
+          failed.push("skills");
+          return [];
+        },
+        marketplaceCatalog: async () => {
+          failed.push("catalog");
+          return [];
+        },
+      },
+      { source: { kind: "path", path: "/tmp/x" } },
+      null,
+      (loading) => failed.push(loading ? "loading:on" : "loading:off"),
+    ),
+    /unsafe id/,
+  );
+  assert.deepEqual(failed, ["loading:on", "loading:off"]);
+});
+
+test("catalogEntryAction maps install state to one button", () => {
+  const unavailable = entry({
+    available: false,
+    reason: "unsupported source kind: npm",
+  });
+  assert.deepEqual(catalogEntryAction(unavailable), {
+    kind: "unavailable",
+    label: "Unavailable",
+    disabled: true,
+    hint: "unsupported source kind: npm",
+  });
+  // an update outranks the installed chip; busy disables an action
+  assert.deepEqual(catalogEntryAction(entry({ installed: "acme", update_available: true })), {
+    kind: "update",
+    label: "Update",
+    disabled: false,
+    hint: null,
+  });
+  assert.equal(
+    catalogEntryAction(entry({ installed: "acme", update_available: true }), true).disabled,
+    true,
+  );
+  assert.deepEqual(catalogEntryAction(entry({ installed: "acme" })), {
+    kind: "installed",
+    label: "Installed",
+    disabled: true,
+    hint: null,
+  });
+  assert.deepEqual(catalogEntryAction(entry({})), {
+    kind: "install",
+    label: "Install",
+    disabled: false,
+    hint: null,
+  });
+  assert.equal(catalogEntryAction(entry({}), true).disabled, true);
+});
+
+test("pluginStatusTone ranks error over update", () => {
+  const withError = plugin({
+    status: "error",
+    diagnostics: [{ level: "error", target: "package", message: "missing" }],
+  });
+  assert.equal(pluginStatusTone(withError), "error");
+  assert.equal(
+    pluginStatusTone(plugin({ status: "update_available", diagnostics: [] })),
+    "warn",
+  );
+  assert.equal(
+    pluginStatusTone(plugin({ status: "modified_locally", diagnostics: [] })),
+    "warn",
+  );
+  assert.equal(pluginStatusTone(plugin({ status: "invalid", diagnostics: [] })), "error");
+  assert.equal(pluginStatusTone(plugin({ status: "enabled", diagnostics: [] })), "ok");
+  assert.equal(
+    pluginStatusTone(plugin({ status: "installed_disabled", diagnostics: [] })),
+    "muted",
+  );
+});
+
+test("progressPhaseLabel names the three install phases", () => {
+  assert.equal(progressPhaseLabel("fetch"), "Fetching");
+  assert.equal(progressPhaseLabel("validate"), "Validating");
+  assert.equal(progressPhaseLabel("place"), "Placing");
+  assert.equal(progressPhaseLabel("swap"), "Working");
+});
+
+test("progressRowViews keeps the record id and orders the phases", () => {
+  const rows = progressRowViews({
+    zeta: { phase: "place", detail: "placed" },
+    acme: { phase: "fetch", detail: "fetching the source" },
+  });
+  assert.deepEqual(
+    rows.map((row) => [row.id, row.label, row.detail]),
+    [
+      ["acme", "Fetching", "fetching the source"],
+      ["zeta", "Placing", "placed"],
+    ],
+  );
+  assert.deepEqual(progressRowViews({}), []);
+});
+
+test("serverTrustLine shows command args or the host only", () => {
+  assert.equal(
+    serverTrustLine({
+      transport: "stdio",
+      command: "node",
+      args: ["server.js", "--flag"],
+      url: null,
+    }),
+    "stdio — node server.js --flag",
+  );
+  assert.equal(
+    serverTrustLine({ transport: "stdio", command: "npx", args: [], url: null }),
+    "stdio — npx",
+  );
+  assert.equal(
+    serverTrustLine({
+      transport: "streamable-http",
+      command: null,
+      args: [],
+      url: "api.example.com:443",
+    }),
+    "streamable-http — api.example.com:443",
+  );
+  assert.equal(
+    serverTrustLine({ transport: "sse", command: null, args: [], url: null }),
+    "sse — host unknown",
+  );
+});
+
+test("sourceLabel names every source form", () => {
+  assert.equal(
+    sourceLabel({ kind: "github", repo: "o/r", path: null, ref: null, sha: null }),
+    "o/r",
+  );
+  assert.equal(
+    sourceLabel({ kind: "github", repo: "o/r", path: "sub", ref: null, sha: null }),
+    "o/r · sub",
+  );
+  assert.equal(
+    sourceLabel({ kind: "git", url: "https://x/y.git", path: "p", ref: null, sha: null }),
+    "https://x/y.git · p",
+  );
+  assert.equal(
+    sourceLabel({ kind: "git-subdir", url: "https://x/y.git", path: "p", ref: null, sha: null }),
+    "https://x/y.git · p",
+  );
+  assert.equal(sourceLabel({ kind: "url", url: "https://x/m.json" }), "https://x/m.json");
+  assert.equal(sourceLabel({ kind: "path", path: "/tmp/m" }), "/tmp/m");
+  assert.equal(
+    sourceLabel({ kind: "unsupported", sourceKind: "npm", detail: "no" }),
+    "npm (unsupported)",
+  );
+});
+
+test("pluginSkillRows carry provenance and the shadow mark", () => {
+  const rows = pluginSkillRows(
+    plugin({
+      id: "acme",
+      skills: [
+        { name: "alpha", description: "first", path: "/p/alpha" },
+        { name: "beta", description: "second", path: "/p/beta" },
+      ],
+    }),
+    [
+      {
+        id: "plugin:acme:alpha",
+        name: "alpha",
+        description: "first",
+        origin: "plugin: acme",
+        shadowed: "user:alpha",
+      },
+    ],
+  );
+  assert.deepEqual(
+    rows.map((row) => [row.id, row.origin, row.shadowed]),
+    [
+      ["plugin:acme:alpha", "plugin: acme", "user:alpha"],
+      ["plugin:acme:beta", "plugin:acme", null],
+    ],
+  );
+});
+
+test("pluginTrustSummary lists what will run", () => {
+  const summary = pluginTrustSummary(
+    plugin({
+      servers: [
+        {
+          name: "local",
+          id: "plugin:acme:local",
+          enabled: false,
+          transport: "stdio",
+          command: "node",
+          args: ["index.js"],
+          url: null,
+        },
+      ],
+      subagents: [{ name: "Helper", description: "d", slug: "helper" }],
+    }),
+    "enabling a plugin runs its code with your user account",
+  );
+  assert.equal(summary.warning, "enabling a plugin runs its code with your user account");
+  assert.deepEqual(summary.servers, [
+    { name: "local", line: "stdio — node index.js" },
+  ]);
+  assert.deepEqual(summary.subagents, ["Helper"]);
 });

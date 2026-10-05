@@ -13,7 +13,7 @@ import { toLayout } from "./groups";
 import {
   formatVersion,
   hoursToInterval,
-  runInstallPlugin,
+  runInstallPluginAction,
   shouldSchedulePluginMaintenance,
   withPluginProgress,
   withUpdateAvailable,
@@ -118,7 +118,7 @@ export interface SamplingRequest {
   max_tokens?: number;
 }
 
-export type View = "chat" | "connectors" | "settings" | "onboarding";
+export type View = "chat" | "connectors" | "plugins" | "settings" | "onboarding";
 
 export interface UpdateState {
   status: "idle" | "checking" | "available" | "downloading" | "ready";
@@ -234,6 +234,8 @@ interface StoreState {
   /** The marketplace the Discover tab shows; null = every marketplace. */
   catalogMarketplace: string | null;
   catalogLoading: boolean;
+  /** Why the last catalog load failed; null when it worked. */
+  catalogError: string | null;
   /** In-flight plugin operations, keyed by install record id. */
   pluginProgress: Record<string, PluginProgressRow>;
   version: string;
@@ -314,7 +316,7 @@ interface StoreState {
   addMarketplace: (
     input: MarketplaceInput,
     name?: string,
-  ) => Promise<MarketplaceSummary | null>;
+  ) => Promise<MarketplaceSummary>;
   removeMarketplace: (id: string, confirm?: boolean) => Promise<void>;
   refreshMarketplace: (id: string | null) => Promise<void>;
   setMarketplaceAutoRefresh: (id: string, enabled: boolean) => Promise<void>;
@@ -449,6 +451,7 @@ export const useStore = create<StoreState>((set, get) => ({
   catalog: [],
   catalogMarketplace: null,
   catalogLoading: false,
+  catalogError: null,
   pluginProgress: {},
   version: "",
   homeDir: "",
@@ -575,12 +578,12 @@ export const useStore = create<StoreState>((set, get) => ({
   },
 
   async loadCatalog(marketplace) {
-    set({ catalogLoading: true, catalogMarketplace: marketplace });
+    set({ catalogLoading: true, catalogMarketplace: marketplace, catalogError: null });
     try {
       const catalog = await api.marketplaceCatalog(marketplace);
       set({ catalog, catalogLoading: false });
     } catch (err) {
-      set({ catalog: [], catalogLoading: false });
+      set({ catalog: [], catalogLoading: false, catalogError: String(err) });
       get().toast("error", `Could not load the catalog: ${err}`);
     }
   },
@@ -588,11 +591,19 @@ export const useStore = create<StoreState>((set, get) => ({
   async installPlugin(req) {
     let installed: PluginDetail | null = null;
     try {
-      installed = await runInstallPlugin(api, req, (catalogLoading) =>
-        set({ catalogLoading }),
+      const outcome = await runInstallPluginAction(
+        api,
+        req,
+        get().catalogMarketplace,
+        (catalogLoading) => set({ catalogLoading }),
       );
-      await reloadPluginState(get);
-      await get().loadCatalog(get().catalogMarketplace);
+      installed = outcome.installed;
+      set({
+        plugins: outcome.plugins,
+        skills: outcome.skills,
+        catalog: outcome.catalog,
+        catalogError: null,
+      });
       get().toast("success", `Installed ${installed.name}`);
       return installed;
     } catch (err) {
@@ -761,8 +772,9 @@ export const useStore = create<StoreState>((set, get) => ({
       get().toast("success", `Added ${summary.name}`);
       return summary;
     } catch (err) {
+      // rethrow: the modal shows the backend's parse error inline
       get().toast("error", `Could not add the marketplace: ${err}`);
-      return null;
+      throw err;
     }
   },
 

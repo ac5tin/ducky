@@ -340,6 +340,7 @@ export function Sidebar() {
         {[
           { id: "chat", label: "Chat", icon: "chat" },
           { id: "connectors", label: "Connectors", icon: "plug" },
+          { id: "plugins", label: "Plugins", icon: "puzzle" },
           { id: "settings", label: "Settings", icon: "settings" },
         ].map((item) => (
           <button
