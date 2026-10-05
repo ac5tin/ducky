@@ -89,10 +89,17 @@ export function PluginsView() {
           </div>
         </div>
 
-        <div className="mt-6 flex gap-1 border-b border-slate-200 dark:border-slate-800">
+        <div
+          className="mt-6 flex gap-1 border-b border-slate-200 dark:border-slate-800"
+          role="tablist"
+          aria-label="Plugin views"
+        >
           {TABS.map((item) => (
             <button
               key={item.id}
+              type="button"
+              role="tab"
+              aria-selected={tab === item.id}
               className={`-mb-px border-b-2 px-3.5 py-2 text-sm transition ${
                 tab === item.id
                   ? "border-sky-500 font-medium text-slate-900 dark:text-white"

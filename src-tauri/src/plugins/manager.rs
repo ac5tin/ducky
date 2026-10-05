@@ -29,8 +29,10 @@ use crate::events::{BackendEvent, EventSink};
 /// update check (design §7).
 const REFRESH_GRACE_SECONDS: i64 = 30;
 
-/// The one-time warning the install sheet carries (design §6).
-pub const TRUST_WARNING: &str = "enabling a plugin runs its code with your user account; MCP servers start local programs and reach the hosts listed above";
+/// The trust warning the install sheet and the enable dialog carry (design
+/// §6). The host list renders below it on every surface, so the wording never
+/// points at a position.
+pub const TRUST_WARNING: &str = "enabling a plugin runs its code with your user account; MCP servers start local programs and reach remote hosts";
 
 // ---------------------------------------------------------------------------
 // Index and UI view types
@@ -82,6 +84,9 @@ pub struct InstalledPlugin {
     pub skills: Vec<PluginSkillView>,
     pub servers: Vec<PluginServerView>,
     pub subagents: Vec<PluginSubagentView>,
+    /// The spec §6 trust text. The sheet and the enable dialog render it from
+    /// here, so a backend edit reaches every surface.
+    pub trust_warning: String,
 }
 
 /// `plugins_list` returns exactly this (the index entry).
@@ -121,7 +126,8 @@ pub struct PluginSubagentView {
     pub description: String,
 }
 
-/// `plugin_detail`: the index entry plus the manifest's trust fields.
+/// `plugin_detail`: the index entry (which carries `trust_warning`) plus the
+/// manifest's display fields.
 #[derive(Debug, Clone, Serialize)]
 pub struct PluginDetail {
     #[serde(flatten)]
@@ -130,7 +136,6 @@ pub struct PluginDetail {
     pub author: Option<String>,
     pub homepage: Option<String>,
     pub license: Option<String>,
-    pub trust_warning: String,
 }
 
 /// `marketplaces_list` / `marketplace_add` / `marketplace_refresh`.
@@ -149,10 +154,16 @@ pub struct MarketplaceSummary {
     pub entry_count: usize,
 }
 
-/// What the add-marketplace form sends: one string in any accepted form.
+/// What the add-marketplace form sends: one string in any accepted form, plus
+/// an optional subdirectory inside a git source (`microsoft/Agents` keeps its
+/// registry under `agent-plugins/`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct MarketplaceInput {
     pub source: String,
+    /// Only a `Github` or `Git` source has a subdirectory; a local path or an
+    /// HTTPS registry URL ignores it.
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 /// One normalised registry entry plus its install state (design §12).
@@ -176,6 +187,9 @@ pub struct CatalogEntry {
     pub installed: Option<String>,
     pub installed_version: Option<String>,
     pub update_available: bool,
+    /// The same spec §6 text `plugins_list` carries, so the Discover sheet can
+    /// show it before the plugin is installed.
+    pub trust_warning: String,
 }
 
 /// One applied update or rollback.
@@ -414,7 +428,6 @@ impl PluginManager {
             author,
             homepage,
             license,
-            trust_warning: TRUST_WARNING.to_string(),
         }))
     }
 
@@ -465,6 +478,7 @@ impl PluginManager {
                     installed_version: installed.and_then(|item| item.version.clone()),
                     update_available: installed
                         .is_some_and(|item| item.available_update.is_some()),
+                    trust_warning: TRUST_WARNING.to_string(),
                 });
             }
         }
@@ -832,7 +846,21 @@ impl PluginManager {
         input: MarketplaceInput,
         name: Option<String>,
     ) -> Result<MarketplaceSummary, String> {
-        let source = parse_marketplace_source(&input.source, &self.home)?;
+        let mut source = parse_marketplace_source(&input.source, &self.home)?;
+        if let Some(path) = input
+            .path
+            .as_deref()
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        {
+            // The sub-path is validated where it is used: `read_git_registry`
+            // runs it through `resolve_within` at refresh time.
+            match &mut source {
+                PluginSource::Github { path: slot, .. }
+                | PluginSource::Git { path: slot, .. } => *slot = Some(path.to_string()),
+                _ => {}
+            }
+        }
         let fallback = source_name(&source);
         let explicit = name.as_deref().map(str::trim).filter(|name| !name.is_empty());
         let id = install::slug(explicit.unwrap_or(&fallback));
@@ -1108,6 +1136,7 @@ impl PluginManager {
                     description: subagent.description.clone(),
                 })
                 .collect(),
+            trust_warning: TRUST_WARNING.to_string(),
         }
     }
 

@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useStore } from "../../store";
 import type { MarketplaceSummary } from "../../types";
-import { sourceLabel } from "../../plugins";
+import { marketplaceRemovable, sourceLabel } from "../../plugins";
 import { Button, Modal } from "../modals/Modal";
 import { Icon } from "../icons";
 import { AddMarketplaceModal } from "./AddMarketplaceModal";
@@ -96,7 +96,7 @@ export function MarketplaceList() {
                 >
                   Refresh
                 </Button>
-                {!marketplace.bundled && (
+                {marketplaceRemovable(marketplace) && (
                   <Button
                     variant="ghost"
                     title="Remove"
@@ -113,6 +113,7 @@ export function MarketplaceList() {
                     type="checkbox"
                     className="peer sr-only"
                     checked={marketplace.auto_refresh}
+                    aria-label={`Auto-refresh ${marketplace.name}`}
                     onChange={() =>
                       void setMarketplaceAutoRefresh(
                         marketplace.id,

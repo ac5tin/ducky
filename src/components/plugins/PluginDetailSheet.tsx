@@ -3,7 +3,6 @@ import { useStore } from "../../store";
 import * as api from "../../api";
 import type { CatalogEntry, PluginDetail } from "../../types";
 import {
-  INSTALL_TRUST_WARNING,
   catalogEntryAction,
   formatVersion,
   pluginSkillRows,
@@ -89,8 +88,9 @@ export function PluginDetailSheet({
     setBusy(true);
     try {
       if (entry.update_available && entry.installed) {
-        await updatePlugin(entry.installed);
-        setInstalledId(entry.installed);
+        // only switch on success: updatePlugin returns false (and toasts)
+        // when the backend refused
+        if (await updatePlugin(entry.installed)) setInstalledId(entry.installed);
         return;
       }
       const installed = await installPlugin({
@@ -119,7 +119,7 @@ export function PluginDetailSheet({
   // detail is loaded, the detail's own update state drives the footer
   const action = entry && !id ? catalogEntryAction(entry, busy) : null;
   const name = detail?.name ?? entry?.display_name ?? entry?.name ?? "";
-  const warning = detail?.trust_warning ?? INSTALL_TRUST_WARNING;
+  const warning = detail?.trust_warning ?? entry?.trust_warning;
 
   return (
     <Modal
@@ -145,10 +145,12 @@ export function PluginDetailSheet({
       ) : (
         <div className="space-y-5">
           {/* spec §6: the trust posture travels with the plugin */}
-          <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 p-3.5 text-xs leading-relaxed text-amber-800 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
-            <Icon name="warning" className="mt-0.5 h-4 w-4 shrink-0" />
-            <span>{warning}</span>
-          </div>
+          {warning && (
+            <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 p-3.5 text-xs leading-relaxed text-amber-800 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
+              <Icon name="warning" className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>{warning}</span>
+            </div>
+          )}
 
           <div className="grid gap-x-6 gap-y-2 text-xs sm:grid-cols-2">
             <Meta label="Version" value={formatVersion(detail?.version ?? entry?.version)} />
@@ -176,7 +178,7 @@ export function PluginDetailSheet({
                 >
                   <div className="flex flex-wrap items-center gap-1.5">
                     <span className="text-sm font-medium">{skill.name}</span>
-                    <span className={chipClass}>{skill.origin}</span>
+                    <span className={chipClass}>{skill.id}</span>
                     {skill.shadowed && (
                       <span className={chipClass}>Shadowed by {skill.shadowed}</span>
                     )}

@@ -42,17 +42,7 @@ export function PluginCard({
 
   return (
     <div
-      role="button"
-      tabIndex={0}
       onClick={onOpen}
-      onKeyDown={(e) => {
-        // the action button inside the card handles its own keys
-        if (e.target !== e.currentTarget) return;
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          onOpen();
-        }
-      }}
       className="flex cursor-pointer flex-col rounded-2xl border border-slate-200 p-4 text-left transition hover:border-sky-300 hover:shadow-sm dark:border-slate-700 dark:hover:border-sky-700"
     >
       <div className="flex items-start gap-3">
@@ -61,7 +51,17 @@ export function PluginCard({
         </div>
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
-            <span className="truncate font-semibold">{name}</span>
+            {/* the card's click is a mouse convenience; this is the control */}
+            <button
+              type="button"
+              className="truncate text-left font-semibold"
+              onClick={(e) => {
+                e.stopPropagation();
+                onOpen();
+              }}
+            >
+              {name}
+            </button>
             <span className="shrink-0 text-[11px] text-slate-400">
               {formatVersion(entry.version)}
             </span>

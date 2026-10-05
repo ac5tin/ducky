@@ -8,6 +8,7 @@ import {
   formatVersion,
   groupByCategory,
   hoursToInterval,
+  marketplaceRemovable,
   pluginSkillRows,
   pluginStatusLabel,
   pluginStatusTone,
@@ -489,7 +490,7 @@ test("sourceLabel names every source form", () => {
   );
 });
 
-test("pluginSkillRows carry provenance and the shadow mark", () => {
+test("pluginSkillRows carry the spec id and the shadow mark", () => {
   const rows = pluginSkillRows(
     plugin({
       id: "acme",
@@ -509,12 +510,20 @@ test("pluginSkillRows carry provenance and the shadow mark", () => {
     ],
   );
   assert.deepEqual(
-    rows.map((row) => [row.id, row.origin, row.shadowed]),
+    rows.map((row) => [row.id, row.shadowed]),
     [
-      ["plugin:acme:alpha", "plugin: acme", "user:alpha"],
-      ["plugin:acme:beta", "plugin:acme", null],
+      ["plugin:acme:alpha", "user:alpha"],
+      ["plugin:acme:beta", null],
     ],
   );
+  assert.equal("origin" in rows[0], false, "the short provenance label is gone");
+});
+
+test("marketplaceRemovable follows the backend's reserved id", () => {
+  assert.equal(marketplaceRemovable({ id: "acme", bundled: false }), true);
+  assert.equal(marketplaceRemovable({ id: "acme", bundled: true }), false);
+  // a hand-edited record: bundled false, but the backend still refuses it
+  assert.equal(marketplaceRemovable({ id: "ducky-official", bundled: false }), false);
 });
 
 test("pluginTrustSummary lists what will run", () => {

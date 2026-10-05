@@ -3,7 +3,6 @@ import { useStore } from "../../store";
 import * as api from "../../api";
 import type { PluginSummary, UpdatePolicy } from "../../types";
 import {
-  INSTALL_TRUST_WARNING,
   formatVersion,
   pluginSkillRows,
   pluginStatusLabel,
@@ -81,7 +80,7 @@ function PluginRow({
   const [confirmUninstall, setConfirmUninstall] = useState(false);
   const [deleteData, setDeleteData] = useState(false);
 
-  const trust = pluginTrustSummary(plugin, INSTALL_TRUST_WARNING);
+  const trust = pluginTrustSummary(plugin, plugin.trust_warning);
   const userNames = (config?.subagents ?? []).map((sub) => sub.name);
   const skillRows = pluginSkillRows(plugin, skills);
   const errorDiagnostics = plugin.diagnostics.filter((d) => d.level === "error");
@@ -122,6 +121,7 @@ function PluginRow({
               type="checkbox"
               className="peer sr-only"
               checked={plugin.enabled}
+              aria-label={`${plugin.enabled ? "Disable" : "Enable"} ${plugin.name}`}
               onChange={toggleEnabled}
             />
             <span className={switchClass} />
@@ -210,7 +210,7 @@ function PluginRow({
                   >
                     <div className="flex flex-wrap items-center gap-1.5">
                       <span className="text-sm font-medium">{skill.name}</span>
-                      <span className={chipClass}>{skill.origin}</span>
+                      <span className={chipClass}>{skill.id}</span>
                       {skill.shadowed && (
                         <span className={chipClass}>Shadowed by {skill.shadowed}</span>
                       )}

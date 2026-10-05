@@ -1350,6 +1350,37 @@ async fn git_refresh_missing_subdir_keeps_previous_registry() {
 }
 
 #[tokio::test]
+async fn git_refresh_escaping_subdir_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    git_registry_repo(&source, &one_entry());
+    let dir = tmp.path().join("marketplaces");
+    // The path exists, but outside any checkout: containment — not existence —
+    // must be what refuses it (`refresh_git` -> `read_git_registry`).
+    write(
+        &dir.join("escape-market"),
+        "outside/marketplace.json",
+        &registry_body("outside", &one_entry()),
+    );
+    let mut rec = marketplace_record(
+        "escape-market",
+        PluginSource::Git {
+            url: file_url(&source),
+            path: Some("../outside".to_string()),
+            git_ref: None,
+            sha: None,
+        },
+    );
+    let http = FakeHttp::new(Vec::new());
+
+    let err = refresh(&mut rec, &dir, &http).await.unwrap_err();
+
+    assert!(err.contains("outside the root"), "{err}");
+    assert!(rec.resolved_sha.is_none(), "a refused refresh records no sha");
+    assert!(rec.last_refreshed_at.is_none());
+}
+
+#[tokio::test]
 async fn git_refresh_first_clone_uses_blob_none_filter() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
@@ -4480,6 +4511,7 @@ async fn add_marketplace_local_dir() {
         .add_marketplace(
             MarketplaceInput {
                 source: market.display().to_string(),
+                path: None,
             },
             None,
         )
@@ -4499,6 +4531,117 @@ async fn add_marketplace_local_dir() {
 }
 
 #[tokio::test]
+async fn add_marketplace_github_subdir_reaches_the_source_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+
+    let summary = manager
+        .add_marketplace(
+            MarketplaceInput {
+                source: "microsoft/Agents".to_string(),
+                path: Some("agent-plugins".to_string()),
+            },
+            None,
+        )
+        .unwrap();
+
+    match &summary.source {
+        PluginSource::Github { repo, path, .. } => {
+            assert_eq!(repo, "microsoft/Agents");
+            assert_eq!(path.as_deref(), Some("agent-plugins"));
+        }
+        other => panic!("expected a github source, got {other:?}"),
+    }
+    // The path survives the store round trip that `refresh_git` reads back.
+    let saved = MarketplaceStore::load(&tmp.path().join("marketplaces"));
+    let record = saved
+        .records
+        .iter()
+        .find(|record| record.id == summary.id)
+        .expect("the added record is persisted");
+    match &record.source {
+        PluginSource::Github { path, .. } => {
+            assert_eq!(path.as_deref(), Some("agent-plugins"));
+        }
+        other => panic!("expected a github source, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn add_marketplace_path_applies_only_to_git_sources() {
+    let tmp = tempfile::tempdir().unwrap();
+    let market = tmp.path().join("market");
+    write(
+        &market,
+        "marketplace.json",
+        r#"{"name": "Acme", "plugins": []}"#,
+    );
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+
+    let local = manager
+        .add_marketplace(
+            MarketplaceInput {
+                source: market.display().to_string(),
+                path: Some("agent-plugins".to_string()),
+            },
+            None,
+        )
+        .unwrap();
+    match &local.source {
+        PluginSource::Path { .. } => {}
+        other => panic!("a local source has no subdirectory, got {other:?}"),
+    }
+
+    let remote = manager
+        .add_marketplace(
+            MarketplaceInput {
+                source: "https://example.com/registry.json".to_string(),
+                path: Some("agent-plugins".to_string()),
+            },
+            None,
+        )
+        .unwrap();
+    match &remote.source {
+        PluginSource::Url { .. } => {}
+        other => panic!("a registry URL has no subdirectory, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn plugin_payloads_carry_the_trust_warning() {
+    let tmp = tempfile::tempdir().unwrap();
+    let market = tmp.path().join("market");
+    write(
+        &market,
+        "marketplace.json",
+        r#"{"name": "Acme", "plugins": [{"name": "demo", "source": "./demo"}]}"#,
+    );
+    plugin_package(&market.join("demo"), "demo-plugin");
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+    manager
+        .add_marketplace(
+            MarketplaceInput {
+                source: market.display().to_string(),
+                path: None,
+            },
+            None,
+        )
+        .unwrap();
+    manager
+        .install(Some("market"), Some("demo"), None, PolicyDefault::Content)
+        .unwrap();
+
+    let list = manager.list();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].trust_warning, super::manager::TRUST_WARNING);
+    let detail = manager.detail(&list[0].id).unwrap().unwrap();
+    assert_eq!(detail.plugin.trust_warning, super::manager::TRUST_WARNING);
+    for entry in manager.catalog(None).unwrap() {
+        assert_eq!(entry.trust_warning, super::manager::TRUST_WARNING);
+    }
+}
+
+#[tokio::test]
 async fn install_from_marketplace_resolves_relative_path() {
     let tmp = tempfile::tempdir().unwrap();
     let market = tmp.path().join("market");
@@ -4514,6 +4657,7 @@ async fn install_from_marketplace_resolves_relative_path() {
         .add_marketplace(
             MarketplaceInput {
                 source: market.display().to_string(),
+                path: None,
             },
             None,
         )
@@ -4553,6 +4697,7 @@ async fn add_marketplace_rejects_bundled_id() {
         .add_marketplace(
             MarketplaceInput {
                 source: "acme/tools".to_string(),
+                path: None,
             },
             Some(super::bundled::BUNDLED_ID.to_string()),
         )
@@ -4595,6 +4740,7 @@ async fn remove_marketplace_requires_confirm() {
         .add_marketplace(
             MarketplaceInput {
                 source: market.display().to_string(),
+                path: None,
             },
             None,
         )
@@ -4856,6 +5002,7 @@ async fn bundled_cannot_be_shadowed() {
         .add_marketplace(
             MarketplaceInput {
                 source: "acme/tools".to_string(),
+                path: None,
             },
             Some("ducky-official".to_string()),
         )

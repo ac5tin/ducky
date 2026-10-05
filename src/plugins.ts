@@ -3,6 +3,7 @@
 // drive this module directly (like `subagents.ts` and `slashCommands.ts`).
 import type {
   CatalogEntry,
+  MarketplaceSummary,
   PluginDetail,
   PluginInstallRequest,
   PluginProgressEvent,
@@ -12,14 +13,6 @@ import type {
   PluginUpdateAvailableEvent,
   SkillSummary,
 } from "./types";
-
-/**
- * The backend's `TRUST_WARNING` (`src-tauri/src/plugins/manager.rs`), shown
- * before a plugin is enabled. `plugin_detail` sends the same text; this copy
- * covers the surfaces that have no detail payload yet (Discover installs).
- */
-export const INSTALL_TRUST_WARNING =
-  "enabling a plugin runs its code with your user account; MCP servers start local programs and reach the hosts listed above";
 
 /**
  * The row's status chip label. An error always wins: a plugin that failed to
@@ -297,18 +290,19 @@ export function serverTrustLine(
 
 /** One plugin skill with its provenance and shadow state. */
 export interface PluginSkillRow {
+  /** The spec §4 stable id: `plugin:<plugin-id>:<name>`. */
   id: string;
   name: string;
   description: string;
-  origin: string;
   /** The id that won the name, when a higher-precedence root shadows this. */
   shadowed: string | null;
 }
 
 /**
- * A plugin's skills joined with the resolved skills list, so provenance and
- * shadowing come from the same list the prompt block uses. A skill of a
- * disabled plugin is not in that list; it keeps the plugin as its origin.
+ * A plugin's skills joined with the resolved skills list, so shadowing comes
+ * from the same list the prompt block uses. A skill of a disabled plugin is
+ * not in that list; `shadowed` stays null. The chip shows `id`, the stable
+ * form the tools accept, not the short human provenance label.
  */
 export function pluginSkillRows(
   plugin: Pick<PluginSummary, "id" | "skills">,
@@ -321,10 +315,20 @@ export function pluginSkillRows(
       id,
       name: skill.name,
       description: skill.description,
-      origin: found?.origin ?? `plugin:${plugin.id}`,
       shadowed: found?.shadowed ?? null,
     };
   });
+}
+
+/**
+ * Whether the Marketplaces tab may offer Remove. The backend refuses the
+ * bundled id even when a hand-edited record says `bundled: false`
+ * (`manager.rs`), so the control follows the same belt-and-braces rule.
+ */
+export function marketplaceRemovable(
+  marketplace: Pick<MarketplaceSummary, "id" | "bundled">,
+): boolean {
+  return !marketplace.bundled && marketplace.id !== "ducky-official";
 }
 
 /** The spec §6 enable-consent summary: what a plugin will run. */

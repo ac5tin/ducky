@@ -661,6 +661,8 @@ export interface PluginSummary {
         skills: PluginSkillSummary[];
         servers: PluginServerView[];
         subagents: PluginSubagentSummary[];
+        /** The spec §6 trust text; every plugin surface renders this one copy. */
+        trust_warning: string;
 }
 
 /** `plugin_detail`: the index entry plus the manifest's trust fields. */
@@ -669,7 +671,6 @@ export interface PluginDetail extends PluginSummary {
         author: string | null;
         homepage: string | null;
         license: string | null;
-        trust_warning: string;
 }
 
 /** What an install sends: a marketplace entry or a direct source. */
@@ -704,6 +705,12 @@ export interface MarketplaceSummary {
 /** What the add-marketplace form sends: one string in any accepted form. */
 export interface MarketplaceInput {
         source: string;
+        /**
+         * An optional subdirectory inside a git source (`microsoft/Agents`
+         * keeps its registry under `agent-plugins/`). A local path or an HTTPS
+         * registry URL has no subdirectory; the backend ignores it there.
+         */
+        path?: string | null;
 }
 
 /** One normalised registry entry plus its install state (design §12). */
@@ -726,6 +733,8 @@ export interface CatalogEntry {
         installed: string | null;
         installed_version: string | null;
         update_available: boolean;
+        /** The spec §6 trust text, so the sheet can show it before install. */
+        trust_warning: string;
 }
 
 /** One `plugin_progress` event, as it arrives on `backend://event`. */

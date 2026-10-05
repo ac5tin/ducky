@@ -15,6 +15,7 @@ export function AddMarketplaceModal({
 }) {
   const addMarketplace = useStore((s) => s.addMarketplace);
   const [source, setSource] = useState("");
+  const [path, setPath] = useState("");
   const [name, setName] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -22,6 +23,7 @@ export function AddMarketplaceModal({
   useEffect(() => {
     if (open) {
       setSource("");
+      setPath("");
       setName("");
       setError(null);
     }
@@ -31,7 +33,10 @@ export function AddMarketplaceModal({
     setError(null);
     setBusy(true);
     try {
-      await addMarketplace({ source: source.trim() }, name.trim() || undefined);
+      await addMarketplace(
+        { source: source.trim(), path: path.trim() || null },
+        name.trim() || undefined,
+      );
       onClose();
     } catch (err) {
       setError(String(err));
@@ -58,6 +63,17 @@ export function AddMarketplaceModal({
             onChange={(e) => setSource(e.target.value)}
             placeholder="microsoft/Agents"
             autoFocus
+          />
+        </Field>
+        <Field
+          label="Subdirectory"
+          hint="Optional. The folder inside the repository that holds the registry — for example microsoft/Agents keeps it in agent-plugins/. A local path or registry URL ignores this."
+        >
+          <input
+            className={inputClass}
+            value={path}
+            onChange={(e) => setPath(e.target.value)}
+            placeholder="agent-plugins"
           />
         </Field>
         <Field

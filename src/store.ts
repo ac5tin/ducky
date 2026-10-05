@@ -308,7 +308,7 @@ interface StoreState {
   ) => Promise<void>;
   setPluginUpdatePolicy: (id: string, policy: UpdatePolicy) => Promise<void>;
   checkForPluginUpdates: () => Promise<PluginUpdateInfo[]>;
-  updatePlugin: (id: string, force?: boolean) => Promise<void>;
+  updatePlugin: (id: string, force?: boolean) => Promise<boolean>;
   updateAllPlugins: (force?: boolean) => Promise<void>;
   rollbackPlugin: (id: string) => Promise<void>;
   uninstallPlugin: (id: string, deleteData: boolean) => Promise<void>;
@@ -692,8 +692,10 @@ export const useStore = create<StoreState>((set, get) => ({
         "success",
         `${info.plugin_id} updated to ${formatVersion(info.to)}`,
       );
+      return true;
     } catch (err) {
       get().toast("error", `Update failed: ${err}`);
+      return false;
     } finally {
       set((s) => ({
         pluginProgress: withoutPluginProgress(s.pluginProgress, id),
