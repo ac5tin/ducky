@@ -576,11 +576,15 @@ async function stopPluginServers(
 
 /**
  * The plugins an automatic pass updates, in check order: policy `auto` and
- * not locally modified (design §7). A manual plugin stays a toast action; a
- * locally modified one is skipped, because an unforced update refuses it.
+ * not locally modified (design §7). The local-modification flag comes from
+ * the check's tree-hash comparison — the same verdict `apply` refuses on —
+ * and the check never stores it, so the status a check overwrites cannot
+ * re-enable the update. A manual plugin stays a toast action; a locally
+ * modified one is skipped before any server is stopped, because an unforced
+ * update refuses it.
  */
 export function autoUpdateIds(
-  updates: Pick<PluginUpdateInfo, "plugin_id">[],
+  updates: Pick<PluginUpdateInfo, "plugin_id" | "modified_locally">[],
   plugins: Pick<PluginSummary, "id" | "update_policy" | "status">[],
 ): string[] {
   const ids: string[] = [];
@@ -588,6 +592,7 @@ export function autoUpdateIds(
     const plugin = plugins.find((p) => p.id === update.plugin_id);
     if (!plugin) continue;
     if (plugin.update_policy !== "auto") continue;
+    if (update.modified_locally) continue;
     if (plugin.status === "modified_locally") continue;
     ids.push(update.plugin_id);
   }

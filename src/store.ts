@@ -728,8 +728,9 @@ export const useStore = create<StoreState>((set, get) => ({
       const updates = await api.pluginCheckUpdates();
       await reloadPluginState(get);
       // An `auto` plugin applies here, after the check (design §7). Manual
-      // plugins keep the toast action; a locally modified package is skipped,
-      // because an unforced update refuses it anyway.
+      // plugins keep the toast action; a locally modified package is skipped
+      // on the check's tree-hash flag, so its servers are never stopped for
+      // an update a refusal would abandon.
       for (const id of autoUpdateIds(updates, get().plugins)) {
         await get().updatePlugin(id, false);
       }
@@ -769,10 +770,14 @@ export const useStore = create<StoreState>((set, get) => ({
   },
 
   async updateAllPlugins(force = false) {
-    // The batch swaps every plugin with a check result; the same
-    // disconnect/restart sequence applies to each (design §7).
+    // The batch swaps every plugin with a check result the update will
+    // actually proceed for; a locally modified package is refused unforced,
+    // so its servers must not be stopped and restarted for nothing. The
+    // same disconnect/restart sequence applies to each (design §7).
     const targets = get().plugins.filter(
-      (plugin) => plugin.available_update !== null,
+      (plugin) =>
+        plugin.available_update !== null &&
+        plugin.status !== "modified_locally",
     );
     const live = new Map(
       targets.map((plugin) => [

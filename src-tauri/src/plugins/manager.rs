@@ -202,6 +202,11 @@ pub struct PluginUpdateInfo {
     /// `plugin:<id>:<server>` ids that were enabled before the swap, so the
     /// frontend can restart the servers the swap stopped (design §7).
     pub enabled_servers: Vec<String>,
+    /// The package no longer matches `record.tree_hash`: the same verdict
+    /// `apply` refuses an unforced update on. The automatic pass skips such a
+    /// plugin before it stops any server (design §7). A check reports this
+    /// value, it never stores it, so no later check can overwrite it.
+    pub modified_locally: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -712,13 +717,21 @@ impl PluginManager {
                     .as_deref()
                     .and_then(|id| registries.get(id));
                 match update::check_one(record, registry, &self.plugins_dir) {
-                    Ok(Some(found)) => updates.push(PluginUpdateInfo {
-                        plugin_id: record.id.clone(),
-                        from: record.version.clone(),
-                        to: found.version.clone().or(found.resolved_sha.clone()),
-                        // A check applies nothing: no server was stopped.
-                        enabled_servers: Vec::new(),
-                    }),
+                    Ok(Some(found)) => {
+                        let package = install::package_dir(&self.plugins_dir, &record.id)
+                            .map(|dir| dir.join("package"))
+                            .ok();
+                        updates.push(PluginUpdateInfo {
+                            plugin_id: record.id.clone(),
+                            from: record.version.clone(),
+                            to: found.version.clone().or(found.resolved_sha.clone()),
+                            // A check applies nothing: no server was stopped.
+                            enabled_servers: Vec::new(),
+                            modified_locally: package.as_deref().is_some_and(|package| {
+                                update::locally_modified(record, package)
+                            }),
+                        });
+                    }
                     Ok(None) => {}
                     Err(err) => tracing::warn!("update check for `{}` failed: {err}", record.id),
                 }
@@ -771,6 +784,7 @@ impl PluginManager {
                             from,
                             to: outcome.to,
                             enabled_servers: outcome.enabled_servers,
+                            modified_locally: outcome.modified_locally,
                         }),
                         Err(err) => Err(format!("cannot write the install record: {err}")),
                     }
@@ -831,6 +845,7 @@ impl PluginManager {
             from,
             to,
             enabled_servers,
+            modified_locally: false,
         })
     }
 

@@ -699,6 +699,14 @@ export interface PluginUpdateInfo {
          * frontend can restart the servers the swap stopped (design §7).
          */
         enabled_servers: string[];
+        /**
+         * The package no longer matches its recorded tree hash: the same
+         * verdict `apply` refuses an unforced update on. The automatic pass
+         * skips such a plugin before it stops any server (design §7). A check
+         * reports this value, it never stores it, so no later check can
+         * overwrite it.
+         */
+        modified_locally: boolean;
 }
 
 /** `marketplaces_list` / `marketplace_add` / `marketplace_refresh`. */

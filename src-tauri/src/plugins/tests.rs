@@ -5878,6 +5878,70 @@ async fn local_edit_update_error_is_visible_without_a_restart() {
     );
 }
 
+/// A check reports a local edit from the tree hash and never overwrites the
+/// `ModifiedLocally` status, so the automatic pass can skip the plugin before
+/// it stops any server (re-review, Important 2).
+#[tokio::test]
+async fn a_check_reports_and_keeps_a_local_modification() {
+    let tmp = tempfile::tempdir().unwrap();
+    let market = tmp.path().join("market");
+    versioned_package(&market.join("demo"), "demo-plugin", "1.0.0", "old-bytes");
+    write(
+        &market,
+        "marketplace.json",
+        &registry_body(
+            "Acme",
+            r#"{"name": "demo-plugin", "version": "1.1.0", "source": "./demo"}"#,
+        ),
+    );
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+    manager
+        .add_marketplace(
+            MarketplaceInput {
+                source: market.display().to_string(),
+                path: None,
+            },
+            None,
+        )
+        .unwrap();
+    let id = manager
+        .install(
+            Some("market"),
+            Some("demo-plugin"),
+            None,
+            PolicyDefault::Content,
+        )
+        .unwrap();
+    let package = tmp.path().join("plugins").join(&id).join("package");
+    write(&package, "marker.txt", "local-edit");
+
+    // No refusal has marked the record yet, and the first check already
+    // reports the tree-hash verdict, so the auto pass can skip first.
+    let updates = manager.check_updates().await.unwrap();
+    assert_eq!(updates.len(), 1, "{updates:?}");
+    assert_eq!(updates[0].plugin_id, id);
+    assert_eq!(updates[0].to.as_deref(), Some("1.1.0"));
+    assert!(updates[0].modified_locally, "{updates:?}");
+
+    // An unforced update refuses and writes `ModifiedLocally` to the record.
+    let err = manager.update(&id, false).unwrap_err();
+    assert!(err.contains("modified locally"), "{err}");
+    assert_eq!(manager.list()[0].status, PluginStatus::ModifiedLocally);
+
+    // The next check keeps that status (it used to overwrite it) and still
+    // reports the same verdict, while the Update button keeps its data.
+    let updates = manager.check_updates().await.unwrap();
+    assert_eq!(updates.len(), 1, "{updates:?}");
+    assert!(updates[0].modified_locally, "{updates:?}");
+    let list = manager.list();
+    assert_eq!(list[0].status, PluginStatus::ModifiedLocally);
+    assert!(list[0].available_update.is_some());
+    assert_eq!(
+        std::fs::read_to_string(package.join("marker.txt")).unwrap(),
+        "local-edit"
+    );
+}
+
 /// A hand-edited unsafe id must not publish or reveal a path outside the
 /// plugins directory, and must not break the other records (Task 5 class,
 /// review fix round 1).

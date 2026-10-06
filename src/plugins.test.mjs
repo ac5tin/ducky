@@ -724,6 +724,90 @@ test("autoUpdateIds applies only auto plugins that are not locally modified", ()
   assert.deepEqual(autoUpdateIds(updates, plugins), ["a", "d"]);
 });
 
+// The auto pass as the store wires it: check result -> autoUpdateIds -> the
+// swap that stops the plugin's servers. The bug was a server stop before the
+// refusal, so these assert the server calls, not only the outcome.
+async function runAutoPass(updates, plugins, live) {
+  const events = [];
+  for (const id of autoUpdateIds(updates, plugins)) {
+    const info = updates.find((update) => update.plugin_id === id);
+    await runPluginSwap(swapApi(events, []), live[id] ?? [], async () => {
+      events.push("swap");
+      return info;
+    });
+  }
+  return events;
+}
+
+test("an auto plugin modified locally keeps its servers running through a check", async () => {
+  const updates = [
+    {
+      plugin_id: "acme",
+      from: "1.0.0",
+      to: "1.1.0",
+      enabled_servers: ["plugin:acme:alpha"],
+      modified_locally: true,
+    },
+  ];
+  const plugins = [
+    { id: "acme", update_policy: "auto", status: "modified_locally" },
+  ];
+
+  const events = await runAutoPass(updates, plugins, {
+    acme: ["plugin:acme:alpha"],
+  });
+
+  assert.deepEqual(events, []);
+});
+
+test("the auto skip reads the check's local-modification flag, not the status", async () => {
+  // The pre-fix check overwrote `modified_locally` with `update_available`;
+  // the flag comes from the package tree hash, so no check can rewrite it.
+  const updates = [
+    {
+      plugin_id: "acme",
+      from: "1.0.0",
+      to: "1.1.0",
+      enabled_servers: ["plugin:acme:alpha"],
+      modified_locally: true,
+    },
+  ];
+  const plugins = [
+    { id: "acme", update_policy: "auto", status: "update_available" },
+  ];
+
+  const events = await runAutoPass(updates, plugins, {
+    acme: ["plugin:acme:alpha"],
+  });
+
+  assert.deepEqual(events, []);
+});
+
+test("an auto plugin that is not modified is still updated", async () => {
+  const updates = [
+    {
+      plugin_id: "acme",
+      from: "1.0.0",
+      to: "1.1.0",
+      enabled_servers: ["plugin:acme:alpha"],
+      modified_locally: false,
+    },
+  ];
+  const plugins = [
+    { id: "acme", update_policy: "auto", status: "update_available" },
+  ];
+
+  const events = await runAutoPass(updates, plugins, {
+    acme: ["plugin:acme:alpha"],
+  });
+
+  assert.deepEqual(events, [
+    "disconnect:plugin:acme:alpha",
+    "swap",
+    "connect:plugin:acme:alpha",
+  ]);
+});
+
 function swapApi(events, toasts) {
   return {
     disconnect: async (serverId) => {

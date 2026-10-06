@@ -232,7 +232,12 @@ fn matching_version<'a>(record: &InstallRecord, registry: Option<&'a Registry>) 
 
 fn note_update(record: &mut InstallRecord, update: AvailableUpdate) -> AvailableUpdate {
     record.available_update = Some(update.clone());
-    record.status = PluginStatus::UpdateAvailable;
+    // A local edit outranks "update available" (design §7): keep the status,
+    // because the automatic pass reads it to skip the plugin, and every
+    // unforced update refuses a modified package anyway.
+    if record.status != PluginStatus::ModifiedLocally {
+        record.status = PluginStatus::UpdateAvailable;
+    }
     update
 }
 
@@ -327,7 +332,10 @@ fn resolve_remote_sha(stdout: &[u8], git_ref: &str) -> Result<String, String> {
     Err(format!("git ls-remote returned no commit for {git_ref}"))
 }
 
-fn locally_modified(record: &InstallRecord, package: &Path) -> bool {
+/// The package no longer matches `record.tree_hash`. `apply` refuses an
+/// unforced update on this; the check reports the same verdict to the caller
+/// without writing it, so a later check cannot overwrite it.
+pub(super) fn locally_modified(record: &InstallRecord, package: &Path) -> bool {
     let Some(recorded) = record.tree_hash.as_deref() else {
         return false;
     };
