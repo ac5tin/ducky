@@ -14,8 +14,8 @@ use super::layout::{discover, to_subagent_config, PluginSubagent, PluginTranspor
 use super::manager::{display_host, MarketplaceInput, PluginIndex, PluginManager};
 use super::manifest::{load, Layout, PluginManifest};
 use super::marketplace::{
-    parse_git_remote, parse_registry, parse_source, refresh, Change, Entry, HttpClient,
-    HttpResponse, MarketplaceRecord, MarketplaceStore, PluginSource, Registry,
+    git_guarded, parse_git_remote, parse_registry, parse_source, refresh, Change, Entry,
+    HttpClient, HttpResponse, MarketplaceRecord, MarketplaceStore, PluginSource, Registry,
 };
 use super::skills::{collect, load_body, prompt_block, summarize, ResolvedSkill, SkillOrigin};
 use super::update::{apply, check_one, rollback};
@@ -1666,6 +1666,45 @@ async fn marketplace_refresh_ref_that_looks_like_a_git_option_runs_nothing() {
     assert!(
         !marker.exists(),
         "refresh ran the option-shaped ref as a program"
+    );
+}
+
+/// The `--` separator, on its own. `validate_source` is bypassed here — the
+/// guarded helper is called directly — so deleting `--` from `git_guarded`
+/// makes the marker appear and this test fail.
+#[cfg(unix)]
+#[test]
+fn the_git_separator_alone_keeps_an_option_shaped_value_out_of_options() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let marker = tmp.path().join("pwned.txt");
+    repo_with_evil(&repo, &marker);
+
+    // Positive control: the same command without `--` runs the program, so
+    // the marker proves the shape is executable and the guarded run below is
+    // what stops it. This is the pre-fix command line, rebuilt by hand.
+    let control = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["fetch", "--depth", "1", "origin"])
+        .arg("--upload-pack=./evil.sh")
+        .output()
+        .unwrap();
+    assert!(!control.status.success(), "{control:?}");
+    assert!(marker.exists(), "the control command did not run evil.sh");
+
+    std::fs::remove_file(&marker).unwrap();
+    let guarded = git_guarded(
+        Some(&repo),
+        &["fetch", "--depth", "1", "origin"],
+        &[std::ffi::OsStr::new("--upload-pack=./evil.sh")],
+    )
+    .output()
+    .unwrap();
+    assert!(!guarded.status.success(), "{guarded:?}");
+    assert!(
+        !marker.exists(),
+        "git_guarded let an option-shaped value reach option position"
     );
 }
 
