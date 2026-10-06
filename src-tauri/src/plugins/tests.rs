@@ -2897,6 +2897,55 @@ fn corrupt_install_store_keeps_the_file() {
     );
 }
 
+/// The seed must not replace a damaged `marketplaces.json`: the parse error
+/// becomes an empty store, the seed finds no bundled record and saves, and
+/// every marketplace the user added is gone (final review, Important 4).
+#[test]
+fn a_corrupt_marketplace_store_is_never_overwritten() {
+    let tmp = tempfile::tempdir().unwrap();
+    let marketplaces = tmp.path().join("marketplaces");
+    std::fs::create_dir_all(&marketplaces).unwrap();
+    let damaged = b"{ not json";
+    std::fs::write(marketplaces.join("marketplaces.json"), damaged).unwrap();
+
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+    drop(manager);
+
+    assert_eq!(
+        std::fs::read(marketplaces.join("marketplaces.json")).unwrap(),
+        damaged,
+        "manager construction replaced the corrupt store"
+    );
+}
+
+#[test]
+fn save_refuses_a_corrupt_marketplace_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("marketplaces");
+    std::fs::create_dir_all(&dir).unwrap();
+    let damaged = b"{ not json";
+    std::fs::write(dir.join("marketplaces.json"), damaged).unwrap();
+
+    let store = MarketplaceStore::load(&dir);
+    let err = store.save(&dir).unwrap_err();
+
+    assert!(err.to_string().contains("marketplaces.json"), "{err}");
+    assert_eq!(std::fs::read(dir.join("marketplaces.json")).unwrap(), damaged);
+}
+
+#[test]
+fn a_missing_marketplace_store_loads_empty_and_saves() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("marketplaces");
+
+    let store = MarketplaceStore::load(&dir);
+
+    assert!(store.records.is_empty());
+    assert!(!store.poisoned);
+    store.save(&dir).unwrap();
+    assert!(dir.join("marketplaces.json").is_file());
+}
+
 #[test]
 fn concurrent_record_writes_never_corrupt() {
     let tmp = tempfile::tempdir().unwrap();

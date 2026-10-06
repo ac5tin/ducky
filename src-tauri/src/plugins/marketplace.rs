@@ -1,8 +1,8 @@
 //! Marketplace registry parsing, fetching and records (design §5).
 
 use std::collections::BTreeMap;
-use std::io;
 use std::ffi::OsStr;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -546,6 +546,13 @@ pub struct MarketplaceStore {
     /// Unknown fields round-trip (design §3).
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+    /// Load problems, kept beside the records and never persisted.
+    #[serde(skip)]
+    pub diagnostics: Vec<Diagnostic>,
+    /// Set when `marketplaces.json` could not be read. `save` must not
+    /// replace it: the bundled seed would otherwise overwrite every record.
+    #[serde(skip)]
+    pub poisoned: bool,
 }
 
 fn store_version() -> u32 {
@@ -558,21 +565,52 @@ impl Default for MarketplaceStore {
             version: store_version(),
             records: Vec::new(),
             extra: BTreeMap::new(),
+            diagnostics: Vec::new(),
+            poisoned: false,
         }
     }
 }
 
 impl MarketplaceStore {
-    /// Load `dir/marketplaces.json`; a missing or unreadable file is empty.
+    /// Load `dir/marketplaces.json`.
+    ///
+    /// A missing file is an empty store. A corrupt file is kept exactly as it
+    /// is, the store starts empty, and an error diagnostic explains why: the
+    /// seed must never destroy the user's marketplace records.
     pub fn load(dir: &Path) -> Self {
-        std::fs::read_to_string(dir.join("marketplaces.json"))
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default()
+        let path = dir.join("marketplaces.json");
+        match std::fs::read_to_string(&path) {
+            Ok(text) => match serde_json::from_str::<Self>(&text) {
+                Ok(store) => store,
+                Err(err) => Self::corrupt(format!("cannot parse marketplaces.json: {err}")),
+            },
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Self::default(),
+            Err(err) => Self::corrupt(format!("cannot read marketplaces.json: {err}")),
+        }
+    }
+
+    fn corrupt(message: String) -> Self {
+        let mut store = Self::default();
+        store.diagnostics.push(error("marketplaces.json", message));
+        store.poisoned = true;
+        store
     }
 
     /// Write `dir/marketplaces.json` through a temp file plus rename.
     pub fn save(&self, dir: &Path) -> io::Result<()> {
+        if self.poisoned {
+            let detail = self
+                .diagnostics
+                .first()
+                .map(|diag| diag.message.as_str())
+                .unwrap_or("unknown error");
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "corrupt marketplace store ({detail}): refusing to overwrite marketplaces.json"
+                ),
+            ));
+        }
         std::fs::create_dir_all(dir)?;
         let file = dir.join("marketplaces.json");
         let tmp = temp_sibling(&file);

@@ -264,9 +264,14 @@ impl PluginManager {
         let marketplaces_dir = data_dir.join("marketplaces");
         // Seed the bundled marketplace before the first reload (Task 11). An
         // existing record is left alone, so the file is only written when the
-        // seed actually adds it (design §5).
+        // seed actually adds it (design §5). A corrupt store is never seeded
+        // or saved: overwriting it would lose every marketplace record.
         let mut marketplaces = MarketplaceStore::load(&marketplaces_dir);
-        if bundled::ensure_seeded(&mut marketplaces, resource_dir) {
+        if marketplaces.poisoned {
+            for diag in &marketplaces.diagnostics {
+                tracing::warn!("{}: {}", diag.target, diag.message);
+            }
+        } else if bundled::ensure_seeded(&mut marketplaces, resource_dir) {
             if let Err(err) = marketplaces.save(&marketplaces_dir) {
                 tracing::warn!("cannot write marketplaces.json: {err}");
             }
