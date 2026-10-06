@@ -10,3 +10,7 @@ Files use the format `NNNN-kebab-case-title.md`. Review the relevant ADR before 
 - [0003: Prepend the login shell's PATH to stdio MCP server spawns](0003-stdio-server-spawn-path.md)
 - [0004: Trust the MCP `readOnlyHint` annotation inside read-only agent modes](0004-trust-mcp-readonly-hint-for-readonly-modes.md)
 - [0005: Group membership and order live inside the group record](0005-chat-group-layout-model.md)
+- [0006: Chat references are id-backed and read on demand](0006-chat-session-references.md)
+- [0007: Plugin packages are the source of truth](0007-plugin-packages-are-the-source-of-truth.md)
+- [0008: Marketplace registry compatibility](0008-marketplace-registry-compatibility.md)
+- [0009: Plugin trust model](0009-plugin-trust-model.md)

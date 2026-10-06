@@ -2003,15 +2003,28 @@ pub fn plugin_rollback(
     state.plugins.rollback(&id)
 }
 
-/// Reveal the package (`which = "package"`, the default) or data directory.
+/// Reveal a plugin's package (`which = "package"`, the default) or data
+/// directory, or the plugins root that holds every package (`which = "root"`,
+/// no plugin id needed).
 #[tauri::command]
 pub fn plugin_open_folder(
     app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
-    id: String,
+    id: Option<String>,
     which: Option<String>,
 ) -> Result<(), String> {
-    let path = state.plugins.folder(&id, which.as_deref())?;
+    let path = match (id.as_deref(), which.as_deref()) {
+        (Some(id), which) => state.plugins.folder(id, which)?,
+        (None, Some("root")) => {
+            // The folder may not exist before the first install.
+            let root = state.plugins.plugins_dir.clone();
+            std::fs::create_dir_all(&root).map_err(|err| err.to_string())?;
+            root
+        }
+        (None, _) => {
+            return Err("plugin_open_folder needs a plugin id, or which = \"root\"".into())
+        }
+    };
     use tauri_plugin_opener::OpenerExt;
     app.opener()
         .reveal_item_in_dir(path)

@@ -10,6 +10,7 @@ import {
   hoursToInterval,
   marketplaceRemovable,
   pluginSkillRows,
+  pluginServerOwner,
   pluginStatusLabel,
   pluginStatusTone,
   pluginTrustSummary,
@@ -549,4 +550,21 @@ test("pluginTrustSummary lists what will run", () => {
     { name: "local", line: "stdio — node index.js" },
   ]);
   assert.deepEqual(summary.subagents, ["Helper"]);
+});
+
+test("pluginServerOwner badges plugin servers and nothing else", () => {
+  assert.equal(pluginServerOwner(undefined), null);
+  assert.equal(pluginServerOwner(null), null);
+  assert.equal(pluginServerOwner({ kind: "user" }), null);
+  assert.deepEqual(
+    pluginServerOwner({ kind: "plugin", plugin_id: "acme", plugin_name: "Acme Tools" }),
+    { id: "acme", name: "Acme Tools" },
+  );
+  // a plugin server without a display name still shows and routes by id
+  assert.deepEqual(pluginServerOwner({ kind: "plugin", plugin_id: "acme" }), {
+    id: "acme",
+    name: "acme",
+  });
+  // a malformed origin is not a plugin row: never route by a missing id
+  assert.equal(pluginServerOwner({ kind: "plugin", plugin_name: "Acme" }), null);
 });

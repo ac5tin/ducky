@@ -273,6 +273,14 @@ export function SettingsView() {
           <SubagentsSection />
         </Section>
 
+        {/* Plugins */}
+        <Section
+          title="Plugins"
+          description="Plugins add skills, subagents and MCP servers. A plugin stays off until you enable it, and each of its MCP servers starts only when you allow it."
+        >
+          <PluginsSection />
+        </Section>
+
         {/* Working directory */}
         <Section
           title="Working directory"
@@ -546,6 +554,104 @@ function Section({
       )}
       {description ? children : <div className="mt-4">{children}</div>}
     </section>
+  );
+}
+
+function PluginsSection() {
+  const config = useStore((s) => s.config);
+  const refreshConfig = useStore((s) => s.refreshConfig);
+  const toast = useStore((s) => s.toast);
+
+  if (!config) return null;
+  const plugins = config.settings.plugins;
+
+  // `settings_set` replaces the whole `plugins` object, so each write sends
+  // the current value with the one changed field.
+  const patchPlugins = (p: Partial<typeof plugins>) =>
+    api
+      .settingsSet({ plugins: { ...plugins, ...p } })
+      .then(refreshConfig)
+      .catch((err) => toast("error", `${err}`));
+
+  return (
+    <div className="space-y-4">
+      <label className="flex items-center gap-2 text-sm">
+        <input
+          type="checkbox"
+          checked={plugins.skills_enabled}
+          onChange={(e) =>
+            void patchPlugins({ skills_enabled: e.target.checked })
+          }
+        />
+        Offer skills to the AI
+      </label>
+      <div className="flex flex-wrap gap-6">
+        <div>
+          <div className="mb-1.5 text-sm font-medium">New plugins update</div>
+          <select
+            className={inputClass + " w-64"}
+            value={plugins.policy_default}
+            onChange={(e) =>
+              void patchPlugins({
+                policy_default: e.target
+                  .value as typeof plugins.policy_default,
+              })
+            }
+          >
+            <option value="content">
+              Match the content — no MCP servers means automatic
+            </option>
+            <option value="auto">Automatically</option>
+            <option value="manual">Only when I ask</option>
+          </select>
+        </div>
+        <div>
+          <div className="mb-1.5 text-sm font-medium">Refresh marketplaces</div>
+          <select
+            className={inputClass + " w-44"}
+            value={String(plugins.marketplace_refresh_hours)}
+            onChange={(e) =>
+              void patchPlugins({
+                marketplace_refresh_hours: Number(e.target.value),
+              })
+            }
+          >
+            <option value="0">Never</option>
+            <option value="1">Every hour</option>
+            <option value="6">Every 6 hours</option>
+            <option value="24">Every day</option>
+          </select>
+        </div>
+        <div>
+          <div className="mb-1.5 text-sm font-medium">
+            Check for plugin updates
+          </div>
+          <select
+            className={inputClass + " w-44"}
+            value={String(plugins.update_check_hours)}
+            onChange={(e) =>
+              void patchPlugins({
+                update_check_hours: Number(e.target.value),
+              })
+            }
+          >
+            <option value="0">Never</option>
+            <option value="1">Every hour</option>
+            <option value="6">Every 6 hours</option>
+            <option value="24">Every day</option>
+          </select>
+        </div>
+      </div>
+      <Button
+        variant="secondary"
+        onClick={() =>
+          api.pluginOpenRootFolder().catch((e) => toast("error", `${e}`))
+        }
+      >
+        <Icon name="folder" className="h-4 w-4" />
+        Open plugins folder
+      </Button>
+    </div>
   );
 }
 

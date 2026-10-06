@@ -17,6 +17,7 @@ import type {
   McpServerConfig,
   PluginDetail,
   PluginInstallRequest,
+  PluginSettings,
   PluginSummary,
   PluginUpdateInfo,
   SkillSummary,
@@ -114,6 +115,8 @@ export const settingsSet = (settings: {
   update_mode?: "prompt" | "auto";
   update_check_interval_hours?: number;
   system_prompt?: string;
+  /** Replaces the whole `plugins` object; send the current value with one field changed. */
+  plugins?: PluginSettings;
 }) => invoke<void>("settings_set", { settings });
 
 export const toolRuleSet = (key: string, rule: ToolRule | null) =>
@@ -444,6 +447,10 @@ export const pluginRollback = (id: string) =>
 /** Reveal the package (`which = "package"`, the default) or data directory. */
 export const pluginOpenFolder = (id: string, which: "package" | "data" = "package") =>
   invoke<void>("plugin_open_folder", { id, which });
+
+/** Reveal the plugins folder that holds every installed package. */
+export const pluginOpenRootFolder = () =>
+  invoke<void>("plugin_open_folder", { id: null, which: "root" });
 
 export const marketplacesList = () =>
   invoke<MarketplaceSummary[]>("marketplaces_list");

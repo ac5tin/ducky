@@ -218,6 +218,13 @@ export interface ToolEntry {
         icons: any | null;
 }
 
+/** Where a connector row came from: the user's own config or an enabled plugin. */
+export interface ServerOrigin {
+        kind: "user" | "plugin";
+        plugin_id?: string;
+        plugin_name?: string;
+}
+
 export interface ServerSummary {
         id: string;
         name: string;
@@ -234,6 +241,8 @@ export interface ServerSummary {
         protocol_version: string | null;
         capabilities: any | null;
         logs: string[];
+        /** User config or plugin-provided (`ServerOrigin` in `mcp/manager.rs`). */
+        origin: ServerOrigin;
 }
 
 // ---------------------------------------------------------------------------

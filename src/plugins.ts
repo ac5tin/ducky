@@ -11,6 +11,7 @@ import type {
   PluginSource,
   PluginSummary,
   PluginUpdateAvailableEvent,
+  ServerOrigin,
   SkillSummary,
 } from "./types";
 
@@ -273,6 +274,18 @@ export function sourceLabel(source: PluginSource): string {
     case "unsupported":
       return `${source.sourceKind} (unsupported)`;
   }
+}
+
+/**
+ * The plugin that owns a connector row, or null for a user server. A plugin
+ * origin without an id is not treated as a plugin row: the row routes by the
+ * plugin id, never by a display name.
+ */
+export function pluginServerOwner(
+  origin?: ServerOrigin | null,
+): { id: string; name: string } | null {
+  if (origin?.kind !== "plugin" || !origin.plugin_id) return null;
+  return { id: origin.plugin_id, name: origin.plugin_name || origin.plugin_id };
 }
 
 /**

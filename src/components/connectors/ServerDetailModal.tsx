@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useStore } from "../../store";
 import * as api from "../../api";
+import { pluginServerOwner } from "../../plugins";
 import { Button, Modal } from "../modals/Modal";
 import { Icon, StatusDot } from "../icons";
 
@@ -15,6 +16,7 @@ export function ServerDetailModal({
 }) {
   const servers = useStore((s) => s.servers);
   const refreshServer = useStore((s) => s.refreshServer);
+  const setView = useStore((s) => s.setView);
   const toast = useStore((s) => s.toast);
   const [tab, setTab] = useState<Tab>("tools");
   const [resourceText, setResourceText] = useState<{ uri: string; text: string } | null>(null);
@@ -34,6 +36,7 @@ export function ServerDetailModal({
 
   if (!serverId || !summary) return null;
 
+  const owner = pluginServerOwner(summary.origin);
   const st = summary.status;
   const statusKind =
     st === "connected" ? "connected" : typeof st === "object" ? ("needs_auth" in st ? "needs_auth" : "error") : st;
@@ -311,6 +314,29 @@ export function ServerDetailModal({
             </div>
           )}
           <InfoRow label="Status" value={statusKind} />
+          {owner && (
+            <div className="rounded-xl bg-slate-50 p-3 dark:bg-slate-800">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+                    Source
+                  </div>
+                  <div className="mt-0.5 text-xs">
+                    Provided by the {owner.name} plugin — read-only here.
+                  </div>
+                </div>
+                <Button
+                  variant="secondary"
+                  onClick={() => {
+                    onClose();
+                    setView("plugins");
+                  }}
+                >
+                  Edit in Plugins
+                </Button>
+              </div>
+            </div>
+          )}
           <InfoRow label="Protocol version" value={summary.protocol_version ?? "—"} />
           <InfoRow
             label="Server"

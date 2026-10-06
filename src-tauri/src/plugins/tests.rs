@@ -1,26 +1,28 @@
 //! Plugin manifest, path containment, layout and marketplace tests
 //! (design §1–§2, §5, §13).
 
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::diagnostics::DiagLevel;
+use super::diagnostics::{DiagLevel, Diagnostic};
 use super::install::{
     assign_id, derive_policy, fetch_to_staging, install, package_dir, resolve_version, tree_hash,
     uninstall, AvailableUpdate, InstallRecord, InstallStore, PluginStatus, UpdatePolicy,
 };
 use super::layout::{discover, to_subagent_config, PluginSubagent, PluginTransport, RemoteKind};
-use super::manifest::{load, Layout};
+use super::manager::{display_host, MarketplaceInput, PluginIndex, PluginManager};
+use super::manifest::{load, Layout, PluginManifest};
 use super::marketplace::{
     parse_git_remote, parse_registry, parse_source, refresh, Change, Entry, HttpClient,
     HttpResponse, MarketplaceRecord, MarketplaceStore, PluginSource, Registry,
 };
-use super::manager::{display_host, MarketplaceInput, PluginIndex, PluginManager};
 use super::skills::{collect, load_body, prompt_block, summarize, ResolvedSkill, SkillOrigin};
 use super::update::{apply, check_one, rollback};
 use crate::config::{EffortLevel, PluginSettings, PolicyDefault};
 use crate::events::{BackendEvent, CollectingSink};
+use crate::mcp::manager::spawn_spec;
 
 const SPEC_100: &str = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
 
@@ -46,35 +48,113 @@ fn write_skill(root: &Path, dir: &str, name: &str) {
     );
 }
 
-/// An Agent Plugins plugin with optional `mcpServers` JSON, discovered.
-fn discover_agent(root: &Path, servers: Option<&str>) -> super::layout::Discovered {
-    write(root, "plugin.json", &agent_manifest("demo-plugin", ""));
-    if let Some(servers) = servers {
-        write(
-            root,
-            "mcp.json",
-            &format!(r#"{{"$schema": "{SPEC_100}", "mcpServers": {servers}}}"#),
-        );
-    }
-    let manifest = load(root).unwrap();
-    discover(root, &manifest)
+/// A plugin package under construction. The constructors write the manifest
+/// into one of the three probe locations (design §1); the component methods
+/// write the fixed locations (design §2). Every fixture in this suite goes
+/// through this builder, so a layout change is one edit.
+struct Conformant {
+    root: PathBuf,
 }
 
-/// An Agent Plugins manifest with `extra` appended to the object.
-fn agent_manifest(name: &str, extra: &str) -> String {
-    format!(r#"{{"$schema": "{SPEC_100}", "name": "{name}"{extra}}}"#)
+impl Conformant {
+    /// The Agent Plugins manifest body the builder writes. `extra` is
+    /// appended inside the JSON object, so a test can extend or break it.
+    fn agent_json(name: &str, extra: &str) -> String {
+        format!(r#"{{"$schema": "{SPEC_100}", "name": "{name}"{extra}}}"#)
+    }
+
+    /// A spec-layout package: root `plugin.json` with the required `$schema`,
+    /// plus whichever fixed component locations the test adds.
+    fn agent(root: &Path, name: &str, extra: &str) -> Self {
+        Self::raw(root, &Self::agent_json(name, extra))
+    }
+
+    /// A package whose `plugin.json` is exactly `body` (invalid fixtures).
+    fn raw(root: &Path, body: &str) -> Self {
+        write(root, "plugin.json", body);
+        Self::bare(root)
+    }
+
+    /// A package with no manifest yet, for tests that write or link it.
+    fn bare(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+        }
+    }
+
+    /// `.claude-plugin/plugin.json`, exactly `body`.
+    fn claude(root: &Path, body: &str) -> Self {
+        write(root, ".claude-plugin/plugin.json", body);
+        Self::bare(root)
+    }
+
+    /// `.zcode-plugin/plugin.json`, exactly `body`.
+    fn zcode(root: &Path, body: &str) -> Self {
+        write(root, ".zcode-plugin/plugin.json", body);
+        Self::bare(root)
+    }
+
+    /// `skills/<dir>/SKILL.md` with the standard frontmatter.
+    fn skill(self, dir: &str, name: &str) -> Self {
+        write_skill(&self.root, &format!("skills/{dir}"), name);
+        self
+    }
+
+    /// `skills/<dir>/SKILL.md` with a caller-written body.
+    fn skill_file(self, dir: &str, body: &str) -> Self {
+        write(&self.root, &format!("skills/{dir}/SKILL.md"), body);
+        self
+    }
+
+    /// `mcp.json` with the required `$schema` and the given servers object.
+    fn mcp(self, servers: &str) -> Self {
+        self.mcp_file(
+            "mcp.json",
+            &format!(r#"{{"$schema": "{SPEC_100}", "mcpServers": {servers}}}"#),
+        )
+    }
+
+    /// An MCP file at a caller-chosen path (`mcp.json` for the spec layout,
+    /// `.mcp.json` for the Claude layout).
+    fn mcp_file(self, rel: &str, body: &str) -> Self {
+        write(&self.root, rel, body);
+        self
+    }
+
+    /// `mcp.json` exactly as given, for schema-mismatch fixtures.
+    fn mcp_json(self, body: &str) -> Self {
+        self.mcp_file("mcp.json", body)
+    }
+
+    fn load(&self) -> PluginManifest {
+        load(&self.root).unwrap_or_else(|diagnostics| panic!("manifest must load: {diagnostics:?}"))
+    }
+
+    fn load_err(&self) -> Vec<Diagnostic> {
+        load(&self.root).expect_err("manifest must be rejected")
+    }
+
+    fn discover(&self) -> super::layout::Discovered {
+        let manifest = self.load();
+        discover(&self.root, &manifest)
+    }
+}
+
+/// An Agent Plugins plugin with optional `mcpServers` JSON, discovered. A
+/// wrapper over [`Conformant`], so no test builds the package layout itself.
+fn discover_agent(root: &Path, servers: Option<&str>) -> super::layout::Discovered {
+    let package = Conformant::agent(root, "demo-plugin", "");
+    let package = match servers {
+        Some(servers) => package.mcp(servers),
+        None => package,
+    };
+    package.discover()
 }
 
 #[test]
 fn loads_minimal_manifest() {
     let tmp = tempfile::tempdir().unwrap();
-    write(
-        tmp.path(),
-        "plugin.json",
-        &agent_manifest("minimal-plugin", ""),
-    );
-
-    let manifest = load(tmp.path()).unwrap();
+    let manifest = Conformant::agent(tmp.path(), "minimal-plugin", "").load();
 
     assert_eq!(manifest.name, "minimal-plugin");
     assert_eq!(manifest.layout, Layout::AgentPlugins);
@@ -85,9 +165,7 @@ fn loads_minimal_manifest() {
 #[test]
 fn rejects_missing_schema() {
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "plugin.json", r#"{"name": "no-schema"}"#);
-
-    let diagnostics = load(tmp.path()).unwrap_err();
+    let diagnostics = Conformant::raw(tmp.path(), r#"{"name": "no-schema"}"#).load_err();
 
     assert!(diagnostics
         .iter()
@@ -98,9 +176,7 @@ fn rejects_missing_schema() {
 fn rejects_unknown_schema_version() {
     let tmp = tempfile::tempdir().unwrap();
     let body = r#"{"$schema": "https://agent-plugins.org/schemas/2.0.0/plugin.schema.json", "name": "future"}"#;
-    write(tmp.path(), "plugin.json", body);
-
-    let diagnostics = load(tmp.path()).unwrap_err();
+    let diagnostics = Conformant::raw(tmp.path(), body).load_err();
 
     assert!(diagnostics
         .iter()
@@ -111,7 +187,7 @@ fn rejects_unknown_schema_version() {
 fn rejects_bad_name() {
     for name in ["My-Plugin", "-start", "has--double", "a..b", ""] {
         let tmp = tempfile::tempdir().unwrap();
-        write(tmp.path(), "plugin.json", &agent_manifest(name, ""));
+        Conformant::agent(tmp.path(), name, "");
         assert!(
             load(tmp.path()).is_err(),
             "expected {name:?} to be rejected"
@@ -122,13 +198,7 @@ fn rejects_bad_name() {
 #[test]
 fn unknown_top_level_key_is_non_fatal() {
     let tmp = tempfile::tempdir().unwrap();
-    write(
-        tmp.path(),
-        "plugin.json",
-        &agent_manifest("ok-plugin", r#", "futureField": 1"#),
-    );
-
-    let manifest = load(tmp.path()).unwrap();
+    let manifest = Conformant::agent(tmp.path(), "ok-plugin", r#", "futureField": 1"#).load();
 
     assert!(manifest
         .unsupported
@@ -139,13 +209,7 @@ fn unknown_top_level_key_is_non_fatal() {
 #[test]
 fn non_object_extensions_is_non_fatal() {
     let tmp = tempfile::tempdir().unwrap();
-    write(
-        tmp.path(),
-        "plugin.json",
-        &agent_manifest("ext-plugin", r#", "extensions": []"#),
-    );
-
-    let manifest = load(tmp.path()).unwrap();
+    let manifest = Conformant::agent(tmp.path(), "ext-plugin", r#", "extensions": []"#).load();
 
     assert!(manifest.extensions.is_empty());
     assert!(manifest
@@ -157,16 +221,14 @@ fn non_object_extensions_is_non_fatal() {
 #[test]
 fn bad_author_field_is_fatal() {
     let tmp = tempfile::tempdir().unwrap();
-    write(
+    let diagnostics = Conformant::raw(
         tmp.path(),
-        "plugin.json",
-        &agent_manifest(
+        &Conformant::agent_json(
             "bad-author",
             r#", "author": {"name": "x", "url": "y", "extra": 1}"#,
         ),
-    );
-
-    let diagnostics = load(tmp.path()).unwrap_err();
+    )
+    .load_err();
 
     assert!(diagnostics.iter().any(|d| d.level == DiagLevel::Error));
 }
@@ -174,13 +236,7 @@ fn bad_author_field_is_fatal() {
 #[test]
 fn non_semver_version_still_loads() {
     let tmp = tempfile::tempdir().unwrap();
-    write(
-        tmp.path(),
-        "plugin.json",
-        &agent_manifest("versioned", r#", "version": "banana""#),
-    );
-
-    let manifest = load(tmp.path()).unwrap();
+    let manifest = Conformant::agent(tmp.path(), "versioned", r#", "version": "banana""#).load();
 
     assert_eq!(manifest.version.as_deref(), Some("banana"));
 }
@@ -189,13 +245,9 @@ fn non_semver_version_still_loads() {
 fn invalid_plugin_json_does_not_fall_through() {
     let tmp = tempfile::tempdir().unwrap();
     // Root manifest exists but is invalid...
-    write(tmp.path(), "plugin.json", r#"{"name": "broken"}"#);
+    Conformant::raw(tmp.path(), r#"{"name": "broken"}"#);
     // ...while a valid compat manifest sits beside it.
-    write(
-        tmp.path(),
-        ".claude-plugin/plugin.json",
-        r#"{"name": "valid-legacy"}"#,
-    );
+    Conformant::claude(tmp.path(), r#"{"name": "valid-legacy"}"#);
 
     assert!(load(tmp.path()).is_err());
 }
@@ -203,13 +255,7 @@ fn invalid_plugin_json_does_not_fall_through() {
 #[test]
 fn claude_layout_loads_without_schema() {
     let tmp = tempfile::tempdir().unwrap();
-    write(
-        tmp.path(),
-        ".claude-plugin/plugin.json",
-        r#"{"name": "legacy-plugin"}"#,
-    );
-
-    let manifest = load(tmp.path()).unwrap();
+    let manifest = Conformant::claude(tmp.path(), r#"{"name": "legacy-plugin"}"#).load();
 
     assert_eq!(manifest.name, "legacy-plugin");
     assert_eq!(manifest.layout, Layout::ClaudeCode);
@@ -223,9 +269,7 @@ fn zcode_layout_reads_inline_components() {
         "mcpServers": {"local": {"command": "node", "args": ["server.js"]}},
         "agents": ["reviewer"]
     }"#;
-    write(tmp.path(), ".zcode-plugin/plugin.json", body);
-
-    let manifest = load(tmp.path()).unwrap();
+    let manifest = Conformant::zcode(tmp.path(), body).load();
 
     assert_eq!(manifest.layout, Layout::ClaudeCode);
     assert!(manifest.inline_servers.is_some());
@@ -332,12 +376,11 @@ fn resolve_within_maybe_missing_rejects_symlink_dotdot() {
 #[test]
 fn discovers_skills_and_mcp() {
     let tmp = tempfile::tempdir().unwrap();
-    write_skill(tmp.path(), "skills/a", "a");
 
-    let found = discover_agent(
-        tmp.path(),
-        Some(r#"{"local": {"type": "stdio", "command": "node", "args": ["server.js"]}}"#),
-    );
+    let found = Conformant::agent(tmp.path(), "demo-plugin", "")
+        .skill("a", "a")
+        .mcp(r#"{"local": {"type": "stdio", "command": "node", "args": ["server.js"]}}"#)
+        .discover();
 
     assert_eq!(found.skills.len(), 1);
     assert_eq!(found.skills[0].name, "a");
@@ -349,15 +392,12 @@ fn discovers_skills_and_mcp() {
 #[test]
 fn parses_block_style_skill_allowed_tools() {
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "plugin.json", &agent_manifest("block-skills", ""));
-    write(
-        tmp.path(),
-        "skills/reviewer/SKILL.md",
+    let package = Conformant::agent(tmp.path(), "block-skills", "").skill_file(
+        "reviewer",
         "---\nname: reviewer\ndescription: demo\nallowed-tools:\n  - Read\n  - Grep\n---\nBody.",
     );
 
-    let manifest = load(tmp.path()).unwrap();
-    let found = discover(tmp.path(), &manifest);
+    let found = package.discover();
 
     assert_eq!(found.skills.len(), 1, "{:?}", found.diagnostics);
     assert_eq!(found.skills[0].allowed_tools.as_deref(), Some("Read, Grep"));
@@ -367,7 +407,7 @@ fn parses_block_style_skill_allowed_tools() {
 fn missing_locations_ok() {
     let tmp = tempfile::tempdir().unwrap();
 
-    let found = discover_agent(tmp.path(), None);
+    let found = Conformant::agent(tmp.path(), "demo-plugin", "").discover();
 
     assert!(found.skills.is_empty());
     assert!(found.servers.is_empty());
@@ -378,9 +418,10 @@ fn missing_locations_ok() {
 #[test]
 fn no_recursive_skill_search() {
     let tmp = tempfile::tempdir().unwrap();
-    write_skill(tmp.path(), "skills/group/a", "a");
 
-    let found = discover_agent(tmp.path(), None);
+    let found = Conformant::agent(tmp.path(), "demo-plugin", "")
+        .skill("group/a", "a")
+        .discover();
 
     assert!(found.skills.is_empty());
     assert!(found.diagnostics.is_empty());
@@ -389,9 +430,10 @@ fn no_recursive_skill_search() {
 #[test]
 fn invalid_skill_skipped() {
     let tmp = tempfile::tempdir().unwrap();
-    write_skill(tmp.path(), "skills/a", "b");
 
-    let found = discover_agent(tmp.path(), None);
+    let found = Conformant::agent(tmp.path(), "demo-plugin", "")
+        .skill("a", "b")
+        .discover();
 
     assert!(found.skills.is_empty());
     assert!(found
@@ -405,17 +447,13 @@ fn invalid_skill_skipped() {
 fn rejecting_manifest_path_rejects_plugin() {
     let tmp = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
-    write(
-        outside.path(),
-        "plugin.json",
-        &agent_manifest("escapee", ""),
-    );
+    Conformant::agent(outside.path(), "escapee", "");
     symlink(
         &outside.path().join("plugin.json"),
         &tmp.path().join("plugin.json"),
     );
 
-    let diagnostics = load(tmp.path()).unwrap_err();
+    let diagnostics = Conformant::bare(tmp.path()).load_err();
 
     assert!(diagnostics
         .iter()
@@ -433,7 +471,9 @@ fn mcp_variants_parse() {
         "legacy": {"type": "sse", "url": "https://example.com/sse"}
     }"#;
 
-    let found = discover_agent(tmp.path(), Some(servers));
+    let found = Conformant::agent(tmp.path(), "demo-plugin", "")
+        .mcp(servers)
+        .discover();
 
     assert_eq!(found.servers.len(), 3);
     let server = |name: &str| {
@@ -465,7 +505,9 @@ fn bad_server_entry_skipped() {
         "bad": {"type": "stdio", "command": "node", "bogus": 1}
     }"#;
 
-    let found = discover_agent(tmp.path(), Some(servers));
+    let found = Conformant::agent(tmp.path(), "demo-plugin", "")
+        .mcp(servers)
+        .discover();
 
     assert_eq!(found.servers.len(), 1);
     assert_eq!(found.servers[0].name, "good");
@@ -483,7 +525,9 @@ fn reserved_env_key_invalidates_server() {
         let servers =
             format!(r#"{{"s": {{"type": "stdio", "command": "node", "env": {{"{key}": "/x"}}}}}}"#);
 
-        let found = discover_agent(tmp.path(), Some(&servers));
+        let found = Conformant::agent(tmp.path(), "demo-plugin", "")
+            .mcp(&servers)
+            .discover();
 
         assert!(
             found.servers.is_empty(),
@@ -508,7 +552,9 @@ fn cwd_escape_invalidates_server() {
         let tmp = tempfile::tempdir().unwrap();
         let servers = format!(r#"{{"s": {{"type": "stdio", "command": "node", "cwd": {cwd:?}}}}}"#);
 
-        let found = discover_agent(tmp.path(), Some(&servers));
+        let found = Conformant::agent(tmp.path(), "demo-plugin", "")
+            .mcp(&servers)
+            .discover();
 
         assert!(
             found.servers.is_empty(),
@@ -522,10 +568,9 @@ fn cwd_escape_invalidates_server() {
     }
 
     let tmp = tempfile::tempdir().unwrap();
-    let found = discover_agent(
-        tmp.path(),
-        Some(r#"{"ok": {"type": "stdio", "command": "node", "cwd": "./sub"}}"#),
-    );
+    let found = Conformant::agent(tmp.path(), "demo-plugin", "")
+        .mcp(r#"{"ok": {"type": "stdio", "command": "node", "cwd": "./sub"}}"#)
+        .discover();
     assert_eq!(found.servers.len(), 1);
     assert_eq!(found.servers[0].name, "ok");
 }
@@ -533,20 +578,12 @@ fn cwd_escape_invalidates_server() {
 #[test]
 fn mismatched_mcp_schema_disables_mcp_only() {
     let tmp = tempfile::tempdir().unwrap();
-    write_skill(tmp.path(), "skills/a", "a");
-    write(
-        tmp.path(),
-        "plugin.json",
-        &agent_manifest("demo-plugin", ""),
-    );
-    write(
-        tmp.path(),
-        "mcp.json",
-        r#"{"$schema": "https://agent-plugins.org/schemas/2.0.0/plugin.schema.json", "mcpServers": {"local": {"type": "stdio", "command": "node"}}}"#,
-    );
-    let manifest = load(tmp.path()).unwrap();
-
-    let found = discover(tmp.path(), &manifest);
+    let found = Conformant::agent(tmp.path(), "demo-plugin", "")
+        .skill("a", "a")
+        .mcp_json(
+            r#"{"$schema": "https://agent-plugins.org/schemas/2.0.0/plugin.schema.json", "mcpServers": {"local": {"type": "stdio", "command": "node"}}}"#,
+        )
+        .discover();
 
     assert_eq!(found.skills.len(), 1);
     assert!(found.servers.is_empty());
@@ -570,7 +607,9 @@ fn remote_url_rules() {
         "ipv6-loopback": {"type": "streamable-http", "url": "http://[::1]/mcp"}
     }"#;
 
-    let found = discover_agent(tmp.path(), Some(servers));
+    let found = Conformant::agent(tmp.path(), "demo-plugin", "")
+        .mcp(servers)
+        .discover();
 
     let mut names: Vec<&str> = found.servers.iter().map(|s| s.name.as_str()).collect();
     names.sort_unstable();
@@ -600,7 +639,9 @@ fn duplicate_header_casing_invalidates_server() {
     let tmp = tempfile::tempdir().unwrap();
     let servers = r#"{"s": {"type": "sse", "url": "https://example.com/mcp", "headers": {"X-A": "1", "x-a": "2"}}}"#;
 
-    let found = discover_agent(tmp.path(), Some(servers));
+    let found = Conformant::agent(tmp.path(), "demo-plugin", "")
+        .mcp(servers)
+        .discover();
 
     assert!(found.servers.is_empty());
     assert!(found
@@ -612,19 +653,12 @@ fn duplicate_header_casing_invalidates_server() {
 #[test]
 fn claude_mcp_json_aliases_normalize() {
     let tmp = tempfile::tempdir().unwrap();
-    write(
-        tmp.path(),
-        ".claude-plugin/plugin.json",
-        r#"{"name": "legacy"}"#,
-    );
-    write(
-        tmp.path(),
+    let package = Conformant::claude(tmp.path(), r#"{"name": "legacy"}"#).mcp_file(
         ".mcp.json",
         r#"{"mcpServers": {"local": {"type": "stdio", "command": "node", "cwd": "${CLAUDE_PLUGIN_ROOT}/tools"}}}"#,
     );
-    let manifest = load(tmp.path()).unwrap();
 
-    let found = discover(tmp.path(), &manifest);
+    let found = package.discover();
 
     assert_eq!(found.servers.len(), 1);
     match &found.servers[0].transport {
@@ -649,7 +683,9 @@ fn plugin_data_cwd_trailing_space_is_syntactic() {
         let tmp = tempfile::tempdir().unwrap();
         let servers = format!(r#"{{"s": {{"type": "stdio", "command": "node", "cwd": {cwd:?}}}}}"#);
 
-        let found = discover_agent(tmp.path(), Some(&servers));
+        let found = Conformant::agent(tmp.path(), "demo-plugin", "")
+            .mcp(&servers)
+            .discover();
 
         assert!(found.servers.is_empty(), "{cwd:?} must be rejected");
         let message = found
@@ -682,7 +718,9 @@ fn command_must_be_one_token() {
         let tmp = tempfile::tempdir().unwrap();
         let servers = format!(r#"{{"s": {{"type": "stdio", "command": {command:?}}}}}"#);
 
-        let found = discover_agent(tmp.path(), Some(&servers));
+        let found = Conformant::agent(tmp.path(), "demo-plugin", "")
+            .mcp(&servers)
+            .discover();
 
         assert_eq!(
             !found.servers.is_empty(),
@@ -707,9 +745,8 @@ fn command_must_be_one_token() {
 fn claude_mcp_json_outside_symlink_skipped() {
     let tmp = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
-    write(
+    let package = Conformant::claude(
         tmp.path(),
-        ".claude-plugin/plugin.json",
         r#"{"name": "legacy", "mcpServers": {"inline": {"type": "stdio", "command": "node"}}}"#,
     );
     write(
@@ -721,9 +758,8 @@ fn claude_mcp_json_outside_symlink_skipped() {
         &outside.path().join("escaped.json"),
         &tmp.path().join(".mcp.json"),
     );
-    let manifest = load(tmp.path()).unwrap();
 
-    let found = discover(tmp.path(), &manifest);
+    let found = package.discover();
 
     assert_eq!(found.servers.len(), 1);
     assert_eq!(found.servers[0].name, "inline");
@@ -732,6 +768,308 @@ fn claude_mcp_json_outside_symlink_skipped() {
             && d.message.contains("outside")
             && !d.message.contains("MCP disabled")
     }));
+}
+
+// ---------------------------------------------------------------------------
+// Conformance (Agent Plugins 1.0.0, design §2 and the mapping table)
+//
+// One test per mapping-table row, named for the requirement, so a spec
+// regression is a named failure. Every package is built through [`Conformant`].
+// ---------------------------------------------------------------------------
+
+#[test]
+fn conformance_loads_plugin_from_directory_path() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let manifest = Conformant::agent(tmp.path(), "conformance-basic", "").load();
+
+    assert_eq!(manifest.name, "conformance-basic");
+    assert_eq!(manifest.layout, Layout::AgentPlugins);
+    assert!(manifest.unsupported.is_empty());
+}
+
+#[test]
+fn conformance_closed_manifest_with_non_fatal_exceptions() {
+    // An unknown top-level key is reported and ignored, never fatal.
+    let tmp = tempfile::tempdir().unwrap();
+    let manifest = Conformant::agent(tmp.path(), "closed-manifest", r#", "futureField": 1"#).load();
+    assert!(manifest
+        .unsupported
+        .iter()
+        .any(|d| d.level == DiagLevel::Warning && d.message.contains("futureField")));
+
+    // Everything else in the closed set is fatal to the plugin: a missing or
+    // unrecognised `$schema`, a bad name, and an extra key inside `author`.
+    let fatal = [
+        r#"{"name": "no-schema"}"#.to_string(),
+        r#"{"$schema": "https://agent-plugins.org/schemas/2.0.0/plugin.schema.json", "name": "future"}"#
+            .to_string(),
+        Conformant::agent_json("Bad-Name", ""),
+        Conformant::agent_json("bad-author", r#", "author": {"name": "x", "extra": 1}"#),
+    ];
+    for body in fatal {
+        let tmp = tempfile::tempdir().unwrap();
+        let diagnostics = Conformant::raw(tmp.path(), &body).load_err();
+        assert!(
+            diagnostics.iter().any(|d| d.level == DiagLevel::Error),
+            "{body} must be rejected: {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn conformance_ignores_unimplemented_extensions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let extension = serde_json::json!({"anything": [1, 2, 3], "nested": {"a": true}});
+    let package = Conformant::agent(
+        tmp.path(),
+        "foreign-extension",
+        &format!(r#", "extensions": {{"com.example.other": {extension}}}"#),
+    );
+
+    let manifest = package.load();
+    let found = package.discover();
+
+    // The member is kept verbatim and never validated or diagnosed.
+    assert_eq!(manifest.extensions["com.example.other"], extension);
+    assert!(found.diagnostics.is_empty(), "{:?}", found.diagnostics);
+    assert!(found.skills.is_empty() && found.servers.is_empty() && found.subagents.is_empty());
+}
+
+#[test]
+fn conformance_discovers_fixed_component_locations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let package = Conformant::agent(tmp.path(), "locations", "")
+        .skill("alpha", "alpha")
+        // A nested SKILL.md is not at a fixed location: no recursive search.
+        .skill("group/nested", "nested")
+        .mcp(r#"{"local": {"type": "stdio", "command": "node"}}"#);
+
+    let found = package.discover();
+
+    assert_eq!(
+        found.skills.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+        ["alpha"]
+    );
+    assert_eq!(found.servers.len(), 1);
+    assert!(found.diagnostics.is_empty(), "{:?}", found.diagnostics);
+}
+
+#[test]
+fn conformance_supports_all_three_mcp_variants() {
+    let tmp = tempfile::tempdir().unwrap();
+    let found = Conformant::agent(tmp.path(), "transports", "")
+        .mcp(
+            r#"{
+                "local": {"type": "stdio", "command": "node"},
+                "http": {"type": "streamable-http", "url": "https://example.com/mcp"},
+                "legacy": {"type": "sse", "url": "https://example.com/sse"}
+            }"#,
+        )
+        .discover();
+
+    assert_eq!(found.servers.len(), 3);
+    let kind = |name: &str| {
+        found
+            .servers
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| match &s.transport {
+                PluginTransport::Stdio { .. } => "stdio",
+                PluginTransport::Remote { kind, .. } => match kind {
+                    RemoteKind::StreamableHttp => "streamable-http",
+                    RemoteKind::Sse => "sse",
+                },
+            })
+    };
+    assert_eq!(kind("local"), Some("stdio"));
+    assert_eq!(kind("http"), Some("streamable-http"));
+    assert_eq!(kind("legacy"), Some("sse"));
+    assert!(found.diagnostics.is_empty(), "{:?}", found.diagnostics);
+}
+
+#[test]
+fn conformance_provides_and_expands_plugin_vars() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("plugin-root");
+    let data = tmp.path().join("plugin-data");
+    let package = Conformant::agent(&root, "vars", "").mcp(
+        r#"{"local": {"type": "stdio", "command": "./bin/tool", "args": ["${PLUGIN_ROOT}/a", "${PLUGIN_DATA}/b"], "env": {"CACHE": "${PLUGIN_DATA}/cache"}}}"#,
+    );
+
+    // Parse keeps the placeholders; expansion happens at launch.
+    let found = package.discover();
+    assert_eq!(found.servers.len(), 1);
+    let PluginTransport::Stdio { args, env, .. } = &found.servers[0].transport else {
+        panic!("expected a stdio server");
+    };
+    assert_eq!(
+        args,
+        &[
+            "${PLUGIN_ROOT}/a".to_string(),
+            "${PLUGIN_DATA}/b".to_string()
+        ]
+    );
+    assert_eq!(env["CACHE"], "${PLUGIN_DATA}/cache");
+
+    write(&root, "bin/tool", "");
+    let spec = spawn_spec("./bin/tool", args, env, None, &root, &data).unwrap();
+
+    assert_eq!(spec.args[0], format!("{}/a", root.display()));
+    assert_eq!(spec.args[1], format!("{}/b", data.display()));
+    let value = |key: &str| {
+        spec.env
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    };
+    let expected_cache = format!("{}/cache", data.display());
+    assert_eq!(value("CACHE"), Some(expected_cache.as_str()));
+    assert_eq!(value("PLUGIN_ROOT"), Some(root.to_string_lossy().as_ref()));
+    assert_eq!(value("PLUGIN_DATA"), Some(data.to_string_lossy().as_ref()));
+}
+
+#[test]
+fn conformance_command_is_single_token_and_root_is_default_cwd() {
+    // `command` is one executable token; a shell string invalidates the server.
+    let tmp = tempfile::tempdir().unwrap();
+    let found = Conformant::agent(tmp.path(), "command", "")
+        .mcp(r#"{"shell": {"type": "stdio", "command": "node -c"}}"#)
+        .discover();
+    assert!(found.servers.is_empty());
+    assert!(found.diagnostics.iter().any(|d| d.target == "shell"));
+
+    // No `cwd` means the plugin root.
+    let root = tmp.path().join("plugin-root");
+    let data = tmp.path().join("plugin-data");
+    write(&root, "bin/tool", "");
+    let spec = spawn_spec("./bin/tool", &[], &BTreeMap::new(), None, &root, &data).unwrap();
+    assert_eq!(spec.cwd, std::fs::canonicalize(&root).unwrap());
+}
+
+#[test]
+fn conformance_path_containment_ladder() {
+    // A server `cwd` that escapes its root invalidates that server only.
+    let tmp = tempfile::tempdir().unwrap();
+    let found = Conformant::agent(tmp.path(), "cwd-ladder", "")
+        .mcp(r#"{"escapee": {"type": "stdio", "command": "node", "cwd": "./../outside"}}"#)
+        .discover();
+    assert!(found.servers.is_empty());
+    assert!(found.diagnostics.iter().any(|d| d.target == "escapee"));
+
+    #[cfg(unix)]
+    {
+        // A manifest outside the root rejects the whole plugin.
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        Conformant::agent(outside.path(), "outside-manifest", "");
+        symlink(
+            &outside.path().join("plugin.json"),
+            &tmp.path().join("plugin.json"),
+        );
+        let diagnostics = Conformant::bare(tmp.path()).load_err();
+        assert!(diagnostics.iter().any(|d| d.message.contains("outside")));
+
+        // A component location outside the root invalidates that component
+        // type only: the skills still load.
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write(
+            outside.path(),
+            "mcp.json",
+            r#"{"mcpServers": {"outside": {"type": "stdio", "command": "node"}}}"#,
+        );
+        let package = Conformant::agent(tmp.path(), "mcp-ladder", "").skill("kept", "kept");
+        symlink(&outside.path().join("mcp.json"), &tmp.path().join("mcp.json"));
+
+        let found = package.discover();
+
+        assert_eq!(found.skills.len(), 1);
+        assert!(found.servers.is_empty());
+        assert!(found
+            .diagnostics
+            .iter()
+            .any(|d| d.target == "mcp.json" && d.message.contains("outside")));
+
+        // A SKILL.md outside the root skips that skill, not the plugin.
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write_skill(outside.path(), "evil", "evil");
+        let package = Conformant::agent(tmp.path(), "skill-ladder", "").skill("good", "good");
+        symlink(&outside.path().join("evil"), &tmp.path().join("skills/evil"));
+
+        let found = package.discover();
+
+        assert_eq!(
+            found.skills.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["good"]
+        );
+        assert!(found
+            .diagnostics
+            .iter()
+            .any(|d| d.target == "skills/evil/SKILL.md" && d.message.contains("outside")));
+    }
+}
+
+#[test]
+fn conformance_missing_locations_not_fatal() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let found = Conformant::agent(tmp.path(), "no-components", "").discover();
+
+    assert!(found.skills.is_empty());
+    assert!(found.servers.is_empty());
+    assert!(found.subagents.is_empty());
+    assert!(found.diagnostics.is_empty(), "{:?}", found.diagnostics);
+}
+
+#[test]
+fn conformance_per_server_failure_isolation() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let found = Conformant::agent(tmp.path(), "server-isolation", "")
+        .mcp(
+            r#"{
+                "good": {"type": "stdio", "command": "node"},
+                "bad": {"type": "stdio", "command": "node", "bogus": 1}
+            }"#,
+        )
+        .discover();
+
+    assert_eq!(found.servers.len(), 1);
+    assert_eq!(found.servers[0].name, "good");
+    assert!(found
+        .diagnostics
+        .iter()
+        .any(|d| d.level == DiagLevel::Warning && d.target == "bad"));
+}
+
+#[test]
+fn conformance_component_failure_isolation() {
+    // A bad mcp.json disables MCP only: the skills still load.
+    let tmp = tempfile::tempdir().unwrap();
+    let found = Conformant::agent(tmp.path(), "mcp-failure", "")
+        .skill("kept", "kept")
+        .mcp_json(
+            r#"{"$schema": "https://agent-plugins.org/schemas/2.0.0/plugin.schema.json", "mcpServers": {}}"#,
+        )
+        .discover();
+    assert_eq!(found.skills.len(), 1);
+    assert!(found.servers.is_empty());
+    assert!(found.diagnostics.iter().any(|d| d.level == DiagLevel::Warning));
+
+    // A bad skill is skipped: the servers still load.
+    let tmp = tempfile::tempdir().unwrap();
+    let found = Conformant::agent(tmp.path(), "skill-failure", "")
+        .skill("a", "b")
+        .mcp(r#"{"kept": {"type": "stdio", "command": "node"}}"#)
+        .discover();
+    assert!(found.skills.is_empty());
+    assert_eq!(found.servers.len(), 1);
+    assert!(found
+        .diagnostics
+        .iter()
+        .any(|d| d.target == "skills/a/SKILL.md"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1376,7 +1714,10 @@ async fn git_refresh_escaping_subdir_is_refused() {
     let err = refresh(&mut rec, &dir, &http).await.unwrap_err();
 
     assert!(err.contains("outside the root"), "{err}");
-    assert!(rec.resolved_sha.is_none(), "a refused refresh records no sha");
+    assert!(
+        rec.resolved_sha.is_none(),
+        "a refused refresh records no sha"
+    );
     assert!(rec.last_refreshed_at.is_none());
 }
 
@@ -1711,8 +2052,7 @@ fn save_is_atomic() {
 
 /// A minimal valid local plugin package with one skill.
 fn plugin_package(root: &Path, name: &str) {
-    write(root, "plugin.json", &agent_manifest(name, ""));
-    write_skill(root, "skills/demo", "demo");
+    Conformant::agent(root, name, "").skill("demo", "demo");
 }
 
 /// An install record with every optional field empty.
@@ -1813,12 +2153,7 @@ fn id_collision_appends_fingerprint() {
 #[test]
 fn policy_is_auto_for_skills_only() {
     let tmp = tempfile::tempdir().unwrap();
-    write(
-        tmp.path(),
-        "plugin.json",
-        &agent_manifest("skills-only", ""),
-    );
-    write_skill(tmp.path(), "skills/demo", "demo");
+    Conformant::agent(tmp.path(), "skills-only", "").skill("demo", "demo");
 
     let manifest = load(tmp.path()).unwrap();
     let discovered = discover(tmp.path(), &manifest);
@@ -1842,11 +2177,7 @@ fn policy_is_manual_with_mcp() {
 #[test]
 fn policy_is_manual_with_extensions() {
     let tmp = tempfile::tempdir().unwrap();
-    write(
-        tmp.path(),
-        "plugin.json",
-        &agent_manifest("with-subagent", ""),
-    );
+    Conformant::agent(tmp.path(), "with-subagent", "");
     write(
         tmp.path(),
         "app.ducky/subagents/reviewer.md",
@@ -1887,7 +2218,7 @@ fn builtin_tool_names() -> Vec<String> {
 #[test]
 fn parses_app_ducky_subagents_dir() {
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "plugin.json", &agent_manifest("with-subagent", ""));
+    Conformant::agent(tmp.path(), "with-subagent", "");
     write(
         tmp.path(),
         "app.ducky/subagents/reviewer.md",
@@ -1921,7 +2252,7 @@ fn parses_app_ducky_subagents_dir() {
 #[test]
 fn parses_block_style_tool_list() {
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "plugin.json", &agent_manifest("block-tools", ""));
+    Conformant::agent(tmp.path(), "block-tools", "");
     write(
         tmp.path(),
         "app.ducky/subagents/reviewer.md",
@@ -1943,17 +2274,15 @@ fn parses_block_style_tool_list() {
 
 #[test]
 fn block_list_skips_empty_items_and_stays_present() {
-    let (frontmatter, _) = super::layout::parse_frontmatter(
-        "---\ntools:\n  - \n  - ducky__fs_read\n---\nBody",
-    )
-    .unwrap();
+    let (frontmatter, _) =
+        super::layout::parse_frontmatter("---\ntools:\n  - \n  - ducky__fs_read\n---\nBody")
+            .unwrap();
     assert_eq!(
         frontmatter.get("tools").map(String::as_str),
         Some("ducky__fs_read")
     );
 
-    let (empty, _) =
-        super::layout::parse_frontmatter("---\ntools:\n  - \n---\nBody").unwrap();
+    let (empty, _) = super::layout::parse_frontmatter("---\ntools:\n  - \n---\nBody").unwrap();
     assert_eq!(
         empty.get("tools").map(String::as_str),
         Some(""),
@@ -1964,13 +2293,10 @@ fn block_list_skips_empty_items_and_stays_present() {
 #[test]
 fn parses_inline_extension_subagents() {
     let tmp = tempfile::tempdir().unwrap();
-    write(
+    Conformant::agent(
         tmp.path(),
-        "plugin.json",
-        &agent_manifest(
-            "inline-subagents",
-            r#", "extensions": {"app.ducky": {"subagents": [{"name": "reviewer", "description": "reviews code", "system_prompt": "Review.", "effort": "low", "tools": ["ducky__fs_read"]}]}}"#,
-        ),
+        "inline-subagents",
+        r#", "extensions": {"app.ducky": {"subagents": [{"name": "reviewer", "description": "reviews code", "system_prompt": "Review.", "effort": "low", "tools": ["ducky__fs_read"]}]}}"#,
     );
 
     let manifest = load(tmp.path()).unwrap();
@@ -1993,20 +2319,16 @@ fn parses_inline_extension_subagents() {
 #[test]
 fn parses_claude_agents_md() {
     let tmp = tempfile::tempdir().unwrap();
-    write(
-        tmp.path(),
-        ".claude-plugin/plugin.json",
-        r#"{"name": "legacy-plugin"}"#,
-    );
+    let package = Conformant::claude(tmp.path(), r#"{"name": "legacy-plugin"}"#);
     write(
         tmp.path(),
         "agents/reviewer.md",
         "---\nname: reviewer\ndescription: reviews code\ntools: Read, Grep\n---\nReview.",
     );
 
-    let manifest = load(tmp.path()).unwrap();
+    let manifest = package.load();
     assert_eq!(manifest.layout, Layout::ClaudeCode);
-    let found = discover(tmp.path(), &manifest);
+    let found = package.discover();
 
     assert_eq!(found.subagents.len(), 1, "{:?}", found.diagnostics);
     assert_eq!(
@@ -2024,9 +2346,9 @@ fn unknown_tool_dropped_with_diagnostic() {
 
     assert_eq!(def.tools, Some(vec!["ducky__fs_read".to_string()]));
     assert!(
-        diagnostics.iter().any(|d| {
-            d.level == DiagLevel::Warning && d.message.contains("ducky__nope")
-        }),
+        diagnostics
+            .iter()
+            .any(|d| { d.level == DiagLevel::Warning && d.message.contains("ducky__nope") }),
         "{diagnostics:?}"
     );
 }
@@ -2069,7 +2391,8 @@ fn control_tools_are_refused() {
 
 #[test]
 fn id_is_namespaced() {
-    let (def, diagnostics) = to_subagent_config(&plugin_subagent("reviewer"), &builtin_tool_names(), &[]);
+    let (def, diagnostics) =
+        to_subagent_config(&plugin_subagent("reviewer"), &builtin_tool_names(), &[]);
     assert_eq!(def.id, "plugin:acme:reviewer");
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
 
@@ -2115,7 +2438,7 @@ fn install_writes_record_disabled() {
 fn install_rejects_invalid_package() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
-    write(&source, "plugin.json", &agent_manifest("Bad--Name", ""));
+    Conformant::agent(&source, "Bad--Name", "");
     let plugins = tmp.path().join("plugins");
 
     let mut store = InstallStore::load(&plugins);
@@ -2198,12 +2521,7 @@ fn install_from_source_without_marketplace() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
     git_init(&repo);
-    write(
-        &repo,
-        "plugin.json",
-        &agent_manifest("git-plugin", r#", "version": "1.2.0""#),
-    );
-    write_skill(&repo, "skills/demo", "demo");
+    Conformant::agent(&repo, "git-plugin", r#", "version": "1.2.0""#).skill("demo", "demo");
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-m", "plugin"]);
     let head = git(&repo, &["rev-parse", "HEAD"]);
@@ -2229,7 +2547,7 @@ fn install_from_source_without_marketplace() {
 fn uninstall_returns_owned_server_ids() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
-    write(&source, "plugin.json", &agent_manifest("with-server", ""));
+    Conformant::agent(&source, "with-server", "");
     write(
         &source,
         "mcp.json",
@@ -2252,7 +2570,7 @@ fn install_checks_out_the_named_sha() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
     git_init(&repo);
-    write(&repo, "plugin.json", &agent_manifest("pinned", ""));
+    Conformant::agent(&repo, "pinned", "");
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-m", "first"]);
     let first = git(&repo, &["rev-parse", "HEAD"]);
@@ -2282,7 +2600,7 @@ fn fetch_to_staging_records_git_sha() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
     git_init(&repo);
-    write(&repo, "plugin.json", &agent_manifest("staged", ""));
+    Conformant::agent(&repo, "staged", "");
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-m", "plugin"]);
     let head = git(&repo, &["rev-parse", "HEAD"]);
@@ -2303,11 +2621,7 @@ fn fetch_to_staging_takes_git_subdir() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
     git_init(&repo);
-    write(
-        &repo,
-        "packages/plug/plugin.json",
-        &agent_manifest("sub", ""),
-    );
+    Conformant::agent(&repo.join("packages/plug"), "sub", "");
     write(&repo, "README.md", "not the package");
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-m", "plugin"]);
@@ -2464,11 +2778,7 @@ fn concurrent_record_writes_never_corrupt() {
 
 /// A Claude Code package. `name` is not an Agent Plugins name.
 fn claude_package(root: &Path, name: &str) {
-    write(
-        root,
-        ".claude-plugin/plugin.json",
-        &format!(r#"{{"name": "{name}"}}"#),
-    );
+    Conformant::claude(root, &format!(r#"{{"name": "{name}"}}"#));
 }
 
 /// Install `keeper`, then a Claude package whose name slugs to an unsafe id.
@@ -2867,19 +3177,13 @@ fn install_keeps_in_root_symlink() {
 
 /// A local package whose manifest version and marker file the update tests read.
 fn versioned_package(root: &Path, name: &str, version: &str, marker: &str) {
-    write(
-        root,
-        "plugin.json",
-        &agent_manifest(name, &format!(r#", "version": "{version}""#)),
-    );
-    write_skill(root, "skills/demo", "demo");
+    Conformant::agent(root, name, &format!(r#", "version": "{version}""#)).skill("demo", "demo");
     write(root, "marker.txt", marker);
 }
 
 /// No manifest version. The ladder's last rung is the literal `unknown`.
 fn unversioned_package(root: &Path, name: &str, marker: &str) {
-    write(root, "plugin.json", &agent_manifest(name, ""));
-    write_skill(root, "skills/demo", "demo");
+    Conformant::agent(root, name, "").skill("demo", "demo");
     write(root, "marker.txt", marker);
 }
 
@@ -2990,7 +3294,7 @@ fn update_detected_by_ls_remote_sha() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
     git_init(&repo);
-    write(&repo, "plugin.json", &agent_manifest("remote-plugin", ""));
+    Conformant::agent(&repo, "remote-plugin", "");
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-m", "first"]);
     let first = git(&repo, &["rev-parse", "HEAD"]);
@@ -3366,7 +3670,7 @@ fn ls_remote_missing_ref_is_an_error() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
     git_init(&repo);
-    write(&repo, "plugin.json", &agent_manifest("remote-plugin", ""));
+    Conformant::agent(&repo, "remote-plugin", "");
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-m", "first"]);
     let source = PluginSource::Git {
@@ -3407,7 +3711,7 @@ fn check_one_head_ref_tracks_the_default_branch() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
     git_init(&repo);
-    write(&repo, "plugin.json", &agent_manifest("remote-plugin", ""));
+    Conformant::agent(&repo, "remote-plugin", "");
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-m", "first"]);
     let first = git(&repo, &["rev-parse", "HEAD"]);
@@ -4899,10 +5203,9 @@ async fn missing_packaged_file_is_not_masked_by_the_dev_copy() {
         .expect("the bundled record is seeded");
     assert!(record.error.is_none(), "{record:?}");
     match &record.source {
-        PluginSource::Path { path } => assert!(
-            path.ends_with("resources/ducky-official.json"),
-            "{path}"
-        ),
+        PluginSource::Path { path } => {
+            assert!(path.ends_with("resources/ducky-official.json"), "{path}")
+        }
         other => panic!("expected a path source, got {other:?}"),
     }
 }
@@ -5131,7 +5434,11 @@ async fn update_switches_new_servers_off() {
 
     let index = manager.index();
     assert_eq!(index.servers.len(), 1, "{:?}", index.servers);
-    assert!(index.servers[0].id.ends_with(":demo"), "{}", index.servers[0].id);
+    assert!(
+        index.servers[0].id.ends_with(":demo"),
+        "{}",
+        index.servers[0].id
+    );
 }
 
 /// A local-edit refusal writes `ModifiedLocally` to the record before it
@@ -5215,10 +5522,7 @@ async fn unsafe_id_is_refused_by_detail_folder_and_the_view() {
             "id `{id}`: {}",
             row.package_dir
         );
-        assert!(
-            manager.detail(&keeper.id).unwrap().is_some(),
-            "id `{id}`"
-        );
+        assert!(manager.detail(&keeper.id).unwrap().is_some(), "id `{id}`");
         assert!(manager.folder(&keeper.id, None).is_ok(), "id `{id}`");
     }
 }
@@ -5410,7 +5714,8 @@ fn bare_name_resolves_by_precedence() {
         true,
     );
 
-    let resolved = crate::builtin::skills::resolve_id(&skills, "deploy").expect("bare name resolves");
+    let resolved =
+        crate::builtin::skills::resolve_id(&skills, "deploy").expect("bare name resolves");
     assert_eq!(resolved.id, "user:deploy");
     assert_eq!(resolved.description, "user deploy");
 }
@@ -5584,7 +5889,10 @@ fn read_skill_file_refuses_escape() {
 
     #[cfg(unix)]
     {
-        symlink(&tmp.path().join("outside.txt"), &tmp.path().join("demo/link.txt"));
+        symlink(
+            &tmp.path().join("outside.txt"),
+            &tmp.path().join("demo/link.txt"),
+        );
         assert!(
             crate::builtin::skills::read_skill_file(&skill, "link.txt").is_err(),
             "a symlink escape must not be followed"
@@ -5646,7 +5954,10 @@ fn escaping_skill_md_symlink_is_skipped_and_refused() {
         &tmp.path().join("agents"),
         true,
     );
-    assert!(skills.is_empty(), "discovery skipped the escape: {skills:?}");
+    assert!(
+        skills.is_empty(),
+        "discovery skipped the escape: {skills:?}"
+    );
 
     let err = load_body(&skill).unwrap_err();
     assert!(err.contains("outside the skill directory"), "{err}");
@@ -5662,8 +5973,7 @@ fn read_skill_file_reads_references() {
     );
     let skill = skill_at("demo", "demo", &tmp.path().join("demo"), SkillOrigin::User);
 
-    let text =
-        crate::builtin::skills::read_skill_file(&skill, "references/REFERENCE.md").unwrap();
+    let text = crate::builtin::skills::read_skill_file(&skill, "references/REFERENCE.md").unwrap();
 
     assert!(text.contains("Hello."), "{text}");
 }
@@ -5672,7 +5982,12 @@ fn read_skill_file_reads_references() {
 fn unknown_skill_id_lists_close_matches() {
     let skills = vec![
         skill_at("deploy", "ship it", Path::new("/tmp"), SkillOrigin::User),
-        skill_at("debug", "find bugs", Path::new("/tmp"), SkillOrigin::Workspace),
+        skill_at(
+            "debug",
+            "find bugs",
+            Path::new("/tmp"),
+            SkillOrigin::Workspace,
+        ),
     ];
 
     let err = crate::builtin::skills::execute(
