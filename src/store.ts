@@ -772,12 +772,13 @@ export const useStore = create<StoreState>((set, get) => ({
   async updateAllPlugins(force = false) {
     // The batch swaps every plugin with a check result the update will
     // actually proceed for; a locally modified package is refused unforced,
-    // so its servers must not be stopped and restarted for nothing. The
+    // so its servers must not be stopped and restarted for nothing. A forced
+    // batch overwrites those packages, so it stops their servers too. The
     // same disconnect/restart sequence applies to each (design §7).
     const targets = get().plugins.filter(
       (plugin) =>
         plugin.available_update !== null &&
-        plugin.status !== "modified_locally",
+        (force || plugin.status !== "modified_locally"),
     );
     const live = new Map(
       targets.map((plugin) => [
