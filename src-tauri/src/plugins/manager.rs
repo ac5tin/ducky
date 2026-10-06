@@ -20,6 +20,7 @@ use super::marketplace::{
     self, join_diagnostics, Entry, HttpClient, HttpResponse, MarketplaceRecord, MarketplaceStore,
     PluginSource, Registry,
 };
+use super::path::resolve_within;
 use super::skills::{self, ResolvedSkill};
 use super::update;
 use crate::config::{expand_tilde, PolicyDefault, SubagentConfig};
@@ -518,12 +519,13 @@ impl PluginManager {
                         .clone()
                         .unwrap_or_else(|| format!("entry `{name}` is not available")));
                 }
-                let root = self.marketplace_root(marketplace_id);
-                (
-                    resolve_entry_source(entry.source.clone(), root.as_deref()),
-                    Some(entry),
-                    Some(marketplace_id.to_string()),
-                )
+                let location = self.marketplace_root(marketplace_id);
+                let resolved = resolve_entry_source(
+                    entry.source.clone(),
+                    location.as_ref().map(|(root, _)| root.as_path()),
+                    location.as_ref().is_some_and(|(_, local)| *local),
+                )?;
+                (resolved, Some(entry), Some(marketplace_id.to_string()))
             }
             (None, None, Some(source)) => (source.clone(), None, None),
             _ => {
@@ -1228,9 +1230,10 @@ impl PluginManager {
         }
     }
 
-    /// The directory a marketplace's relative entry paths resolve against.
-    /// `None` for an unknown or unsupported marketplace.
-    fn marketplace_root(&self, id: &str) -> Option<PathBuf> {
+    /// The directory a marketplace's relative entry paths resolve against,
+    /// and whether the marketplace source itself is a local path the user
+    /// typed. `None` for an unknown or unsupported marketplace.
+    fn marketplace_root(&self, id: &str) -> Option<(PathBuf, bool)> {
         let record = {
             let store = self.marketplaces.lock().unwrap();
             store.records.iter().find(|record| record.id == id).cloned()
@@ -1238,11 +1241,12 @@ impl PluginManager {
         match &record.source {
             PluginSource::Path { path } => {
                 let path = PathBuf::from(path);
-                if path.is_file() {
-                    path.parent().map(Path::to_path_buf)
+                let root = if path.is_file() {
+                    path.parent().map(Path::to_path_buf)?
                 } else {
-                    Some(path)
-                }
+                    path
+                };
+                Some((root, true))
             }
             PluginSource::Github { .. }
             | PluginSource::Git { .. }
@@ -1251,9 +1255,9 @@ impl PluginManager {
                 if let Some(sub) = source_path(&record.source) {
                     root = root.join(sub);
                 }
-                Some(root)
+                Some((root, false))
             }
-            PluginSource::Url { .. } => Some(self.marketplaces_dir.join(&record.id)),
+            PluginSource::Url { .. } => Some((self.marketplaces_dir.join(&record.id), false)),
             PluginSource::Unsupported { .. } => None,
         }
     }
@@ -1556,17 +1560,42 @@ fn is_windows_path(input: &str) -> bool {
 }
 
 /// A marketplace entry's `./relative` path means "inside the marketplace
-/// root" (design §5); absolute paths pass through.
-fn resolve_entry_source(source: PluginSource, root: Option<&Path>) -> PluginSource {
-    match source {
-        PluginSource::Path { path } if !Path::new(&path).is_absolute() => match root {
-            Some(root) => PluginSource::Path {
-                path: root.join(path).display().to_string(),
-            },
-            None => PluginSource::Path { path },
-        },
-        other => other,
+/// root" (design §5). The join goes through `resolve_within`, so a registry
+/// the user added cannot name a directory outside the marketplace; an
+/// absolute path is refused unless the marketplace source itself is a local
+/// path the user typed.
+fn resolve_entry_source(
+    source: PluginSource,
+    root: Option<&Path>,
+    local_marketplace: bool,
+) -> Result<PluginSource, String> {
+    let PluginSource::Path { path } = source else {
+        return Ok(source);
+    };
+    let wanted = Path::new(&path);
+    if wanted.is_absolute() {
+        if local_marketplace {
+            return Ok(PluginSource::Path { path });
+        }
+        return Err(format!(
+            "marketplace entry path `{path}` is absolute; only a local marketplace can name one"
+        ));
     }
+    let Some(root) = root else {
+        return Err(format!(
+            "marketplace entry path `{path}` has no marketplace root to resolve against"
+        ));
+    };
+    let joined = root.join(&path);
+    if !joined.exists() {
+        return Err(format!("marketplace entry path `{path}` is missing"));
+    }
+    let resolved = resolve_within(root, &joined).ok_or_else(|| {
+        format!("marketplace entry path `{path}` resolves outside the marketplace root")
+    })?;
+    Ok(PluginSource::Path {
+        path: resolved.display().to_string(),
+    })
 }
 
 fn now() -> String {

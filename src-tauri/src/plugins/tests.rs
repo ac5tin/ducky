@@ -5188,6 +5188,135 @@ async fn install_from_marketplace_resolves_relative_path() {
         .is_file());
 }
 
+/// Design §5: a `./relative` entry path means inside the marketplace root.
+/// `./../outside` starts with `./`, so without containment it installs a
+/// package the user never chose (final review, Important 3).
+#[tokio::test]
+async fn install_from_marketplace_refuses_an_escaping_entry_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let market = tmp.path().join("market");
+    write(
+        &market,
+        "marketplace.json",
+        r#"{"name": "Acme", "plugins": [{"name": "demo-entry", "source": "./../outside"}]}"#,
+    );
+    plugin_package(&tmp.path().join("outside"), "outside-plugin");
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+    manager
+        .add_marketplace(
+            MarketplaceInput {
+                source: market.display().to_string(),
+                path: None,
+            },
+            None,
+        )
+        .unwrap();
+
+    let err = manager
+        .install(
+            Some("market"),
+            Some("demo-entry"),
+            None,
+            PolicyDefault::Content,
+        )
+        .unwrap_err();
+
+    assert!(err.contains("outside"), "{err}");
+    assert!(manager.list().is_empty());
+    assert!(!tmp.path().join("plugins/outside-plugin").exists());
+}
+
+/// A registry the user added as a git marketplace must not name an absolute
+/// local directory (final review, Important 3).
+#[tokio::test]
+async fn install_from_a_git_marketplace_refuses_an_absolute_entry_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tmp.path().join("outside");
+    plugin_package(&outside, "outside-plugin");
+    let repo = tmp.path().join("repo");
+    git_init(&repo);
+    write(
+        &repo,
+        "marketplace.json",
+        &registry_body(
+            "git-market",
+            &format!(
+                r#"{{"name": "demo-entry", "source": {{"source": "directory", "path": "{}"}}}}"#,
+                outside.display()
+            ),
+        ),
+    );
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-m", "registry"]);
+    // Seed the record on disk: `add_marketplace` has no `file://` input form.
+    let marketplaces_dir = tmp.path().join("marketplaces");
+    let mut store = MarketplaceStore::default();
+    store
+        .records
+        .push(marketplace_record("git-market", git_source(&repo)));
+    store.save(&marketplaces_dir).unwrap();
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+    manager
+        .refresh_marketplace(Some("git-market"))
+        .await
+        .unwrap();
+
+    let err = manager
+        .install(
+            Some("git-market"),
+            Some("demo-entry"),
+            None,
+            PolicyDefault::Content,
+        )
+        .unwrap_err();
+
+    assert!(err.contains("absolute"), "{err}");
+    assert!(manager.list().is_empty());
+    assert!(!tmp.path().join("plugins/outside-plugin").exists());
+}
+
+/// The exception is deliberate: a local marketplace is the user's own file,
+/// so an absolute `directory` path in it is the documented local form.
+#[tokio::test]
+async fn install_from_a_local_marketplace_allows_an_absolute_entry_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let package = tmp.path().join("outside");
+    plugin_package(&package, "outside-plugin");
+    let market = tmp.path().join("market");
+    write(
+        &market,
+        "marketplace.json",
+        &registry_body(
+            "Acme",
+            &format!(
+                r#"{{"name": "demo-entry", "source": {{"source": "directory", "path": "{}"}}}}"#,
+                package.display()
+            ),
+        ),
+    );
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+    manager
+        .add_marketplace(
+            MarketplaceInput {
+                source: market.display().to_string(),
+                path: None,
+            },
+            None,
+        )
+        .unwrap();
+
+    let id = manager
+        .install(
+            Some("market"),
+            Some("demo-entry"),
+            None,
+            PolicyDefault::Content,
+        )
+        .unwrap();
+
+    assert_eq!(id, "outside-plugin");
+}
+
 #[tokio::test]
 async fn add_marketplace_rejects_bundled_id() {
     let tmp = tempfile::tempdir().unwrap();
