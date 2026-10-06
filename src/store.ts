@@ -11,6 +11,7 @@ import {
 import { resolveDraftModel } from "./chatDraft";
 import { toLayout } from "./groups";
 import {
+  autoUpdateIds,
   formatVersion,
   hoursToInterval,
   pluginServerOwner,
@@ -725,6 +726,12 @@ export const useStore = create<StoreState>((set, get) => ({
     try {
       const updates = await api.pluginCheckUpdates();
       await reloadPluginState(get);
+      // An `auto` plugin applies here, after the check (design §7). Manual
+      // plugins keep the toast action; a locally modified package is skipped,
+      // because an unforced update refuses it anyway.
+      for (const id of autoUpdateIds(updates, get().plugins)) {
+        await get().updatePlugin(id, false);
+      }
       return updates;
     } catch (err) {
       get().toast("error", `Update check failed: ${err}`);

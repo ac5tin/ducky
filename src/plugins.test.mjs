@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  autoUpdateIds,
   availableUpdates,
   catalogEntryAction,
   filterCatalog,
@@ -703,6 +704,23 @@ test("plugin server toggle surfaces a disconnect failure", async () => {
   );
   assert.equal(toasts.length, 1);
   assert.match(toasts[0], /ipc gone/);
+});
+
+test("autoUpdateIds applies only auto plugins that are not locally modified", () => {
+  const updates = [
+    { plugin_id: "a" },
+    { plugin_id: "b" },
+    { plugin_id: "c" },
+    { plugin_id: "missing" },
+    { plugin_id: "d" },
+  ];
+  const plugins = [
+    { id: "a", update_policy: "auto", status: "update_available" },
+    { id: "b", update_policy: "manual", status: "update_available" },
+    { id: "c", update_policy: "auto", status: "modified_locally" },
+    { id: "d", update_policy: "auto", status: "update_available" },
+  ];
+  assert.deepEqual(autoUpdateIds(updates, plugins), ["a", "d"]);
 });
 
 test("plugin swap stops live servers before the swap and restarts them after", async () => {

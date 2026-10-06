@@ -539,6 +539,26 @@ export async function runPluginSwap(
   return info;
 }
 
+/**
+ * The plugins an automatic pass updates, in check order: policy `auto` and
+ * not locally modified (design §7). A manual plugin stays a toast action; a
+ * locally modified one is skipped, because an unforced update refuses it.
+ */
+export function autoUpdateIds(
+  updates: Pick<PluginUpdateInfo, "plugin_id">[],
+  plugins: Pick<PluginSummary, "id" | "update_policy" | "status">[],
+): string[] {
+  const ids: string[] = [];
+  for (const update of updates) {
+    const plugin = plugins.find((p) => p.id === update.plugin_id);
+    if (!plugin) continue;
+    if (plugin.update_policy !== "auto") continue;
+    if (plugin.status === "modified_locally") continue;
+    ids.push(update.plugin_id);
+  }
+  return ids;
+}
+
 async function restartPluginServers(
   api: PluginSwapLifecycleApi,
   serverIds: string[],
