@@ -11,6 +11,7 @@ import type {
   PluginSource,
   PluginSummary,
   PluginUpdateAvailableEvent,
+  PluginUpdateInfo,
   ServerOrigin,
   SkillSummary,
 } from "./types";
@@ -496,4 +497,62 @@ export async function runPluginServerToggle(
     api.toast(`Could not connect ${server}: ${err}`);
   }
   return true;
+}
+
+/** The api one update or rollback needs to stop and restart its servers. */
+export interface PluginSwapLifecycleApi {
+  /** Live `plugin:<id>:<server>` ids for one plugin, from the server list. */
+  liveServers: (pluginId: string) => string[];
+  disconnect: (serverId: string) => Promise<void>;
+  connect: (serverId: string) => Promise<string>;
+  toast: (message: string) => void;
+}
+
+/**
+ * Stop a plugin's live servers, run one package swap, then restart the servers
+ * that were enabled before it (design §7). The swap's own return names those
+ * servers, so a server the new revision removed is not guessed at. A failed
+ * swap still restarts what was stopped, so a failed update never leaves the
+ * plugin dead.
+ */
+export async function runPluginSwap(
+  api: PluginSwapLifecycleApi,
+  pluginId: string,
+  swap: () => Promise<PluginUpdateInfo>,
+): Promise<PluginUpdateInfo> {
+  const live = api.liveServers(pluginId);
+  for (const serverId of live) {
+    try {
+      await api.disconnect(serverId);
+    } catch (err) {
+      api.toast(`Could not stop ${serverId}: ${err}`);
+    }
+  }
+  let info: PluginUpdateInfo;
+  try {
+    info = await swap();
+  } catch (err) {
+    await restartPluginServers(api, live);
+    throw err;
+  }
+  await restartPluginServers(api, info.enabled_servers);
+  return info;
+}
+
+async function restartPluginServers(
+  api: PluginSwapLifecycleApi,
+  serverIds: string[],
+): Promise<void> {
+  for (const serverId of serverIds) {
+    try {
+      const result = await api.connect(serverId);
+      if (result === "error") {
+        api.toast(
+          `${serverId} failed to reconnect — see its detail view for logs.`,
+        );
+      }
+    } catch (err) {
+      api.toast(`Could not reconnect ${serverId}: ${err}`);
+    }
+  }
 }

@@ -175,7 +175,10 @@ pub fn apply(
 
 /// Swap `package.previous-<version>` back to `package/` and clear
 /// `previous_version`. One previous revision, not a history.
-pub fn rollback(record: &mut InstallRecord, plugins_dir: &Path) -> Result<(), String> {
+///
+/// Returns the `plugin:<id>:<server>` ids that were enabled before the swap,
+/// so the command layer can reconnect them after it.
+pub fn rollback(record: &mut InstallRecord, plugins_dir: &Path) -> Result<Vec<String>, String> {
     let plugin_dir = package_dir(plugins_dir, &record.id)?;
     let live = plugin_dir.join("package");
     recover_missing_package(&plugin_dir, &live, record)?;
@@ -188,6 +191,7 @@ pub fn rollback(record: &mut InstallRecord, plugins_dir: &Path) -> Result<(), St
     }
     ensure_record_slot(record, plugins_dir)?;
 
+    let enabled_servers = enabled_server_ids(&live, &record.id, &record.disabled_servers);
     let aside = swap_back(&live, &previous)?;
     let mut updated = record.clone();
     updated.version = record.previous_version.clone();
@@ -213,7 +217,7 @@ pub fn rollback(record: &mut InstallRecord, plugins_dir: &Path) -> Result<(), St
     }
     *record = updated;
     let _ = std::fs::remove_dir_all(&aside);
-    Ok(())
+    Ok(enabled_servers)
 }
 
 fn matching_version<'a>(record: &InstallRecord, registry: Option<&'a Registry>) -> Option<&'a str> {

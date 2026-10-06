@@ -198,6 +198,9 @@ pub struct PluginUpdateInfo {
     pub plugin_id: String,
     pub from: Option<String>,
     pub to: Option<String>,
+    /// `plugin:<id>:<server>` ids that were enabled before the swap, so the
+    /// frontend can restart the servers the swap stopped (design §7).
+    pub enabled_servers: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -706,6 +709,8 @@ impl PluginManager {
                         plugin_id: record.id.clone(),
                         from: record.version.clone(),
                         to: found.version.clone().or(found.resolved_sha.clone()),
+                        // A check applies nothing: no server was stopped.
+                        enabled_servers: Vec::new(),
                     }),
                     Ok(None) => {}
                     Err(err) => tracing::warn!("update check for `{}` failed: {err}", record.id),
@@ -758,6 +763,7 @@ impl PluginManager {
                             plugin_id: id.to_string(),
                             from,
                             to: outcome.to,
+                            enabled_servers: outcome.enabled_servers,
                         }),
                         Err(err) => Err(format!("cannot write the install record: {err}")),
                     }
@@ -797,7 +803,7 @@ impl PluginManager {
 
     /// Swap the one kept previous revision back into place.
     pub fn rollback(&self, id: &str) -> Result<PluginUpdateInfo, String> {
-        let (from, to);
+        let (from, to, enabled_servers);
         {
             let mut store = self.install.lock().unwrap();
             store
@@ -805,7 +811,7 @@ impl PluginManager {
                 .map_err(|err| format!("cannot write the install record: {err}"))?;
             let record = record_mut(&mut store, id)?;
             from = record.version.clone();
-            update::rollback(record, &self.plugins_dir)?;
+            enabled_servers = update::rollback(record, &self.plugins_dir)?;
             to = record.version.clone();
             store
                 .save(&self.plugins_dir)
@@ -817,6 +823,7 @@ impl PluginManager {
             plugin_id: id.to_string(),
             from,
             to,
+            enabled_servers,
         })
     }
 

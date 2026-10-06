@@ -19,6 +19,7 @@ import {
   runInstallPlugin,
   runInstallPluginAction,
   runPluginServerToggle,
+  runPluginSwap,
   serverTrustLine,
   shouldSchedulePluginMaintenance,
   skillCount,
@@ -702,6 +703,130 @@ test("plugin server toggle surfaces a disconnect failure", async () => {
   );
   assert.equal(toasts.length, 1);
   assert.match(toasts[0], /ipc gone/);
+});
+
+test("plugin swap stops live servers before the swap and restarts them after", async () => {
+  const events = [];
+  const toasts = [];
+  const info = await runPluginSwap(
+    {
+      liveServers: () => ["plugin:acme:alpha"],
+      disconnect: async (serverId) => {
+        events.push(`disconnect:${serverId}`);
+      },
+      connect: async (serverId) => {
+        events.push(`connect:${serverId}`);
+        return "connected";
+      },
+      toast: (message) => toasts.push(message),
+    },
+    "acme",
+    async () => {
+      events.push("swap");
+      return {
+        plugin_id: "acme",
+        from: "1.0.0",
+        to: "1.1.0",
+        enabled_servers: ["plugin:acme:alpha"],
+      };
+    },
+  );
+  assert.equal(info.to, "1.1.0");
+  assert.deepEqual(events, [
+    "disconnect:plugin:acme:alpha",
+    "swap",
+    "connect:plugin:acme:alpha",
+  ]);
+  assert.deepEqual(toasts, []);
+});
+
+test("plugin swap restarts the stopped servers when the swap fails", async () => {
+  const events = [];
+  const toasts = [];
+  await assert.rejects(
+    runPluginSwap(
+      {
+        liveServers: () => ["plugin:acme:alpha"],
+        disconnect: async (serverId) => {
+          events.push(`disconnect:${serverId}`);
+        },
+        connect: async (serverId) => {
+          events.push(`connect:${serverId}`);
+          return "connected";
+        },
+        toast: (message) => toasts.push(message),
+      },
+      "acme",
+      async () => {
+        events.push("swap");
+        throw new Error("no network");
+      },
+    ),
+    /no network/,
+  );
+  assert.deepEqual(events, [
+    "disconnect:plugin:acme:alpha",
+    "swap",
+    "connect:plugin:acme:alpha",
+  ]);
+  assert.deepEqual(toasts, []);
+});
+
+test("plugin swap reconnects only the ids the swap reports as enabled", async () => {
+  const events = [];
+  await runPluginSwap(
+    {
+      liveServers: () => ["plugin:acme:alpha", "plugin:acme:beta"],
+      disconnect: async (serverId) => {
+        events.push(`disconnect:${serverId}`);
+      },
+      connect: async (serverId) => {
+        events.push(`connect:${serverId}`);
+        return "connected";
+      },
+      toast: () => {},
+    },
+    "acme",
+    async () => {
+      events.push("swap");
+      return {
+        plugin_id: "acme",
+        from: "1.0.0",
+        to: "1.1.0",
+        enabled_servers: ["plugin:acme:alpha"],
+      };
+    },
+  );
+  assert.deepEqual(events, [
+    "disconnect:plugin:acme:alpha",
+    "disconnect:plugin:acme:beta",
+    "swap",
+    "connect:plugin:acme:alpha",
+  ]);
+});
+
+test("plugin swap reports a failed reconnect without failing the swap", async () => {
+  const toasts = [];
+  const info = await runPluginSwap(
+    {
+      liveServers: () => [],
+      disconnect: async () => {},
+      connect: async () => {
+        throw new Error("server gone");
+      },
+      toast: (message) => toasts.push(message),
+    },
+    "acme",
+    async () => ({
+      plugin_id: "acme",
+      from: null,
+      to: "1.1.0",
+      enabled_servers: ["plugin:acme:alpha"],
+    }),
+  );
+  assert.equal(info.to, "1.1.0");
+  assert.equal(toasts.length, 1);
+  assert.match(toasts[0], /server gone/);
 });
 
 test("pluginServerOwner badges plugin servers and nothing else", () => {

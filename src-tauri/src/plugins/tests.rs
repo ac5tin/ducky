@@ -5610,7 +5610,11 @@ async fn update_switches_new_servers_off() {
     Conformant::bare(&source).mcp(
         r#"{"demo": {"type": "stdio", "command": "node"}, "added": {"type": "stdio", "command": "node"}}"#,
     );
-    manager.update(&id, false).unwrap();
+    let info = manager.update(&id, false).unwrap();
+
+    // The swap names the servers it stopped, so the caller can restart them
+    // (design §7); "added" was never enabled and is not in the list.
+    assert_eq!(info.enabled_servers, vec![format!("plugin:{id}:demo")]);
 
     let list = manager.list();
     assert!(
@@ -5631,6 +5635,34 @@ async fn update_switches_new_servers_off() {
         "{}",
         index.servers[0].id
     );
+}
+
+/// Rollback returns the enabled server ids before the swap, exactly like an
+/// update, so the caller can restart them (design §7).
+#[tokio::test]
+async fn rollback_returns_enabled_server_ids() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    versioned_package(&source, "with-server", "1.0.0", "old")
+        .mcp(r#"{"alpha": {"type": "stdio", "command": "node"}}"#);
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+    let id = manager
+        .install(
+            None,
+            None,
+            Some(&path_source(&source)),
+            PolicyDefault::Content,
+        )
+        .unwrap();
+    manager.set_enabled(&id, true).unwrap();
+    manager.set_server_enabled(&id, "alpha", true).unwrap();
+    versioned_package(&source, "with-server", "1.1.0", "new")
+        .mcp(r#"{"alpha": {"type": "stdio", "command": "node"}}"#);
+    manager.update(&id, false).unwrap();
+
+    let info = manager.rollback(&id).unwrap();
+
+    assert_eq!(info.enabled_servers, vec![format!("plugin:{id}:alpha")]);
 }
 
 /// A local-edit refusal writes `ModifiedLocally` to the record before it

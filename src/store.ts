@@ -13,8 +13,10 @@ import { toLayout } from "./groups";
 import {
   formatVersion,
   hoursToInterval,
+  pluginServerOwner,
   runInstallPluginAction,
   runPluginServerToggle,
+  runPluginSwap,
   shouldSchedulePluginMaintenance,
   withPluginProgress,
   withUpdateAvailable,
@@ -637,8 +639,34 @@ export const useStore = create<StoreState>((set, get) => ({
   },
 
   async setPluginEnabled(id, enabled) {
+    // Read the servers before the flag changes: a disable drops them from the
+    // index and the Connectors row disappears with them, so this action is the
+    // only place left that can stop the processes (design §9).
+    const plugin = get().plugins.find((p) => p.id === id);
+    const servers = plugin?.servers ?? [];
+    const consented = servers.filter(
+      (server) =>
+        !(plugin?.disabled_servers ?? []).includes(server.name) &&
+        !(plugin?.disabled_servers ?? []).includes(server.id),
+    );
     try {
       await api.pluginSetEnabled(id, enabled);
+      if (enabled) {
+        // The shared per-server action owns consent and connect, so the
+        // plugin switch cannot drift from the server switch.
+        for (const server of consented) {
+          await get().setPluginServerEnabled(id, server.name, true);
+        }
+      } else {
+        for (const server of servers) {
+          try {
+            await api.mcpDisconnect(server.id);
+          } catch (err) {
+            get().toast("error", `Could not stop ${server.name}: ${err}`);
+          }
+        }
+        await get().refreshServers().catch(() => {});
+      }
       await reloadPluginState(get);
       get().toast("success", enabled ? "Plugin enabled" : "Plugin disabled");
     } catch (err) {
@@ -706,7 +734,16 @@ export const useStore = create<StoreState>((set, get) => ({
 
   async updatePlugin(id, force = false) {
     try {
-      const info = await api.pluginUpdate(id, force);
+      const info = await runPluginSwap(
+        {
+          liveServers: (pluginId) => livePluginServerIds(get, pluginId),
+          disconnect: api.mcpDisconnect,
+          connect: api.mcpConnect,
+          toast: (message) => get().toast("error", message),
+        },
+        id,
+        () => api.pluginUpdate(id, force),
+      );
       await reloadPluginState(get);
       await get().loadCatalog(get().catalogMarketplace);
       get().toast(
@@ -744,7 +781,16 @@ export const useStore = create<StoreState>((set, get) => ({
 
   async rollbackPlugin(id) {
     try {
-      const info = await api.pluginRollback(id);
+      const info = await runPluginSwap(
+        {
+          liveServers: (pluginId) => livePluginServerIds(get, pluginId),
+          disconnect: api.mcpDisconnect,
+          connect: api.mcpConnect,
+          toast: (message) => get().toast("error", message),
+        },
+        id,
+        () => api.pluginRollback(id),
+      );
       await reloadPluginState(get);
       await get().loadCatalog(get().catalogMarketplace);
       get().toast(
@@ -1713,6 +1759,17 @@ function flushSteering(convId: string, set: SetFn, get: GetFn) {
 /** Refresh the two slices the plugin index feeds: rows and skills. */
 async function reloadPluginState(get: GetFn) {
   await Promise.all([get().refreshPlugins(), get().refreshSkills()]);
+}
+
+/** Live `plugin:<id>:<server>` ids for one plugin, from the server list. */
+function livePluginServerIds(get: GetFn, pluginId: string): string[] {
+  return get()
+    .servers.filter(
+      (server) =>
+        pluginServerOwner(server.origin)?.id === pluginId &&
+        (server.status === "connected" || server.status === "connecting"),
+    )
+    .map((server) => server.id);
 }
 
 function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {

@@ -694,6 +694,11 @@ export interface PluginUpdateInfo {
         plugin_id: string;
         from: string | null;
         to: string | null;
+        /**
+         * `plugin:<id>:<server>` ids that were enabled before the swap, so the
+         * frontend can restart the servers the swap stopped (design §7).
+         */
+        enabled_servers: string[];
 }
 
 /** `marketplaces_list` / `marketplace_add` / `marketplace_refresh`. */
