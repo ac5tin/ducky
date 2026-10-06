@@ -1669,6 +1669,39 @@ async fn marketplace_refresh_ref_that_looks_like_a_git_option_runs_nothing() {
     );
 }
 
+/// The clone URL is registry-derived too: install must execute nothing when
+/// it is option-shaped. `parse_source` names the `url` field; this is the
+/// end-to-end marker test for the same value, matching the sha and ref paths.
+#[cfg(unix)]
+#[test]
+fn install_url_that_looks_like_a_git_option_runs_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let marker = tmp.path().join("pwned.txt");
+    repo_with_evil(&repo, &marker);
+    let plugins = tmp.path().join("plugins");
+    let mut store = InstallStore::load(&plugins);
+    let source = PluginSource::Git {
+        url: "--upload-pack=./evil.sh".to_string(),
+        path: None,
+        git_ref: None,
+        sha: None,
+    };
+
+    let err = install(&mut store, &plugins, &source, None, None).unwrap_err();
+
+    // The install choke point refuses the value and names the field, so the
+    // test has teeth even though the clone shape alone cannot execute it.
+    assert!(
+        err.contains("url") && err.contains("must not start with `-`"),
+        "{err}"
+    );
+    assert!(
+        !marker.exists(),
+        "install ran the option-shaped url as a program"
+    );
+}
+
 /// The `--` separator, on its own. `validate_source` is bypassed here — the
 /// guarded helper is called directly — so deleting `--` from `git_guarded`
 /// makes the marker appear and this test fail.
