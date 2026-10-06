@@ -5396,6 +5396,55 @@ async fn install_from_a_git_marketplace_refuses_an_absolute_entry_path() {
     assert!(!tmp.path().join("plugins/outside-plugin").exists());
 }
 
+/// A relative entry that is a symlink out of the clone is refused, not
+/// copied: the same attack shape as the escaping package symlink, through a
+/// marketplace the user added (final review, Important 3).
+#[cfg(unix)]
+#[tokio::test]
+async fn install_from_a_git_marketplace_refuses_an_escaping_symlink_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tmp.path().join("outside");
+    plugin_package(&outside, "outside-plugin");
+    let repo = tmp.path().join("repo");
+    git_init(&repo);
+    write(
+        &repo,
+        "marketplace.json",
+        &registry_body(
+            "git-market",
+            r#"{"name": "demo-entry", "source": "./linked-plugin"}"#,
+        ),
+    );
+    symlink(&outside, &repo.join("linked-plugin"));
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-m", "registry with an escaping link"]);
+    // Seed the record on disk: `add_marketplace` has no `file://` input form.
+    let marketplaces_dir = tmp.path().join("marketplaces");
+    let mut store = MarketplaceStore::default();
+    store
+        .records
+        .push(marketplace_record("git-market", git_source(&repo)));
+    store.save(&marketplaces_dir).unwrap();
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+    manager
+        .refresh_marketplace(Some("git-market"))
+        .await
+        .unwrap();
+
+    let err = manager
+        .install(
+            Some("git-market"),
+            Some("demo-entry"),
+            None,
+            PolicyDefault::Content,
+        )
+        .unwrap_err();
+
+    assert!(err.contains("resolves outside the marketplace root"), "{err}");
+    assert!(manager.list().is_empty());
+    assert!(!tmp.path().join("plugins/outside-plugin").exists());
+}
+
 /// The exception is deliberate: a local marketplace is the user's own file,
 /// so an absolute `directory` path in it is the documented local form.
 #[tokio::test]
