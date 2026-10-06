@@ -501,8 +501,6 @@ export async function runPluginServerToggle(
 
 /** The api one update or rollback needs to stop and restart its servers. */
 export interface PluginSwapLifecycleApi {
-  /** Live `plugin:<id>:<server>` ids for one plugin, from the server list. */
-  liveServers: (pluginId: string) => string[];
   disconnect: (serverId: string) => Promise<void>;
   connect: (serverId: string) => Promise<string>;
   toast: (message: string) => void;
@@ -517,17 +515,10 @@ export interface PluginSwapLifecycleApi {
  */
 export async function runPluginSwap(
   api: PluginSwapLifecycleApi,
-  pluginId: string,
+  live: string[],
   swap: () => Promise<PluginUpdateInfo>,
 ): Promise<PluginUpdateInfo> {
-  const live = api.liveServers(pluginId);
-  for (const serverId of live) {
-    try {
-      await api.disconnect(serverId);
-    } catch (err) {
-      api.toast(`Could not stop ${serverId}: ${err}`);
-    }
-  }
+  await stopPluginServers(api, live);
   let info: PluginUpdateInfo;
   try {
     info = await swap();
@@ -537,6 +528,50 @@ export async function runPluginSwap(
   }
   await restartPluginServers(api, info.enabled_servers);
   return info;
+}
+
+/** Live `plugin:<id>:<server>` ids for a batch of plugins, keyed by plugin. */
+export type PluginLiveServers = Map<string, string[]>;
+
+/**
+ * The `plugin_update_all` shape of the same swap (design §7). The stopped
+ * servers of a plugin the batch did not return belong to a failed update, and
+ * they restart too: a failure keeps the plugin working on the old revision.
+ */
+export async function runPluginBatchSwap(
+  api: PluginSwapLifecycleApi,
+  live: PluginLiveServers,
+  swap: () => Promise<PluginUpdateInfo[]>,
+): Promise<PluginUpdateInfo[]> {
+  const stopped = [...live.values()].flat();
+  await stopPluginServers(api, stopped);
+  let updates: PluginUpdateInfo[];
+  try {
+    updates = await swap();
+  } catch (err) {
+    await restartPluginServers(api, stopped);
+    throw err;
+  }
+  const done = new Set(updates.map((info) => info.plugin_id));
+  const reconnect = updates.flatMap((info) => info.enabled_servers);
+  for (const [pluginId, ids] of live) {
+    if (!done.has(pluginId)) reconnect.push(...ids);
+  }
+  await restartPluginServers(api, reconnect);
+  return updates;
+}
+
+async function stopPluginServers(
+  api: PluginSwapLifecycleApi,
+  serverIds: string[],
+): Promise<void> {
+  for (const serverId of serverIds) {
+    try {
+      await api.disconnect(serverId);
+    } catch (err) {
+      api.toast(`Could not stop ${serverId}: ${err}`);
+    }
+  }
 }
 
 /**

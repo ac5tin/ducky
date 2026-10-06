@@ -16,6 +16,7 @@ import {
   hoursToInterval,
   pluginServerOwner,
   runInstallPluginAction,
+  runPluginBatchSwap,
   runPluginServerToggle,
   runPluginSwap,
   shouldSchedulePluginMaintenance,
@@ -743,12 +744,11 @@ export const useStore = create<StoreState>((set, get) => ({
     try {
       const info = await runPluginSwap(
         {
-          liveServers: (pluginId) => livePluginServerIds(get, pluginId),
           disconnect: api.mcpDisconnect,
           connect: api.mcpConnect,
           toast: (message) => get().toast("error", message),
         },
-        id,
+        livePluginServerIds(get, id),
         () => api.pluginUpdate(id, force),
       );
       await reloadPluginState(get);
@@ -769,8 +769,27 @@ export const useStore = create<StoreState>((set, get) => ({
   },
 
   async updateAllPlugins(force = false) {
+    // The batch swaps every plugin with a check result; the same
+    // disconnect/restart sequence applies to each (design §7).
+    const targets = get().plugins.filter(
+      (plugin) => plugin.available_update !== null,
+    );
+    const live = new Map(
+      targets.map((plugin) => [
+        plugin.id,
+        livePluginServerIds(get, plugin.id),
+      ]),
+    );
     try {
-      const updates = await api.pluginUpdateAll(force);
+      const updates = await runPluginBatchSwap(
+        {
+          disconnect: api.mcpDisconnect,
+          connect: api.mcpConnect,
+          toast: (message) => get().toast("error", message),
+        },
+        live,
+        () => api.pluginUpdateAll(force),
+      );
       await reloadPluginState(get);
       await get().loadCatalog(get().catalogMarketplace);
       get().toast(
@@ -790,12 +809,11 @@ export const useStore = create<StoreState>((set, get) => ({
     try {
       const info = await runPluginSwap(
         {
-          liveServers: (pluginId) => livePluginServerIds(get, pluginId),
           disconnect: api.mcpDisconnect,
           connect: api.mcpConnect,
           toast: (message) => get().toast("error", message),
         },
-        id,
+        livePluginServerIds(get, id),
         () => api.pluginRollback(id),
       );
       await reloadPluginState(get);
