@@ -1919,7 +1919,14 @@ pub fn plugin_install(
     name: Option<String>,
     source: Option<PluginSource>,
 ) -> Result<PluginDetail, String> {
-    let policy_default = state.store.config.lock().unwrap().settings.plugins.policy_default;
+    let policy_default = state
+        .store
+        .config
+        .lock()
+        .unwrap()
+        .settings
+        .plugins
+        .policy_default;
     let id = state.plugins.install(
         marketplace.as_deref(),
         name.as_deref(),
@@ -2021,9 +2028,7 @@ pub fn plugin_open_folder(
             std::fs::create_dir_all(&root).map_err(|err| err.to_string())?;
             root
         }
-        (None, _) => {
-            return Err("plugin_open_folder needs a plugin id, or which = \"root\"".into())
-        }
+        (None, _) => return Err("plugin_open_folder needs a plugin id, or which = \"root\"".into()),
     };
     use tauri_plugin_opener::OpenerExt;
     app.opener()
@@ -2051,7 +2056,9 @@ pub fn marketplace_remove(
     id: String,
     confirm: Option<bool>,
 ) -> Result<(), String> {
-    state.plugins.remove_marketplace(&id, confirm.unwrap_or(false))
+    state
+        .plugins
+        .remove_marketplace(&id, confirm.unwrap_or(false))
 }
 
 #[tauri::command]
@@ -2224,7 +2231,8 @@ mod tests {
             .map(|t| t.name.to_string())
             .collect();
 
-        let (created, warnings) = clone_plugin_subagent(&mut cfg, &sub, &builtin, &[], "t").unwrap();
+        let (created, warnings) =
+            clone_plugin_subagent(&mut cfg, &sub, &builtin, &[], "t").unwrap();
 
         assert!(!created.id.starts_with("plugin:"), "{}", created.id);
         assert!(
@@ -2259,7 +2267,8 @@ mod tests {
             .map(|t| t.name.to_string())
             .collect();
 
-        let (created, warnings) = clone_plugin_subagent(&mut cfg, &sub, &builtin, &[], "t").unwrap();
+        let (created, warnings) =
+            clone_plugin_subagent(&mut cfg, &sub, &builtin, &[], "t").unwrap();
 
         assert_eq!(created.tools, Some(vec!["ducky__fs_read".to_string()]));
         assert!(

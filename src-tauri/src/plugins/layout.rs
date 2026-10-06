@@ -695,9 +695,7 @@ fn subagent_inline(manifest: &PluginManifest, out: &mut Discovered) {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        if let Some(subagent) =
-            parse_subagent(&frontmatter, &system_prompt, PathBuf::new(), out)
-        {
+        if let Some(subagent) = parse_subagent(&frontmatter, &system_prompt, PathBuf::new(), out) {
             out.subagents.push(subagent);
         }
     }
@@ -734,9 +732,7 @@ fn parse_subagent(
             None => {
                 out.diagnostics.push(warning(
                     &target,
-                    format!(
-                        "unknown `effort` value `{raw}`; inheriting the conversation's effort"
-                    ),
+                    format!("unknown `effort` value `{raw}`; inheriting the conversation's effort"),
                 ));
                 None
             }

@@ -2589,9 +2589,8 @@ fn install_from_source_without_marketplace() {
 fn uninstall_returns_owned_server_ids() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
-    Conformant::agent(&source, "with-server", "").mcp(
-        r#"{"local-validator": {"type": "stdio", "command": "node"}}"#,
-    );
+    Conformant::agent(&source, "with-server", "")
+        .mcp(r#"{"local-validator": {"type": "stdio", "command": "node"}}"#);
     let plugins = tmp.path().join("plugins");
     let data = tmp.path().join("plugin-data/with-server");
 
@@ -3214,8 +3213,8 @@ fn install_keeps_in_root_symlink() {
 
 /// A local package whose manifest version and marker file the update tests read.
 fn versioned_package(root: &Path, name: &str, version: &str, marker: &str) -> Conformant {
-    let package =
-        Conformant::agent(root, name, &format!(r#", "version": "{version}""#)).skill("demo", "demo");
+    let package = Conformant::agent(root, name, &format!(r#", "version": "{version}""#))
+        .skill("demo", "demo");
     write(root, "marker.txt", marker);
     package
 }

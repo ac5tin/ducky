@@ -94,8 +94,8 @@ pub fn read_skill_file(skill: &ResolvedSkill, path: &str) -> Result<String, Stri
             "cannot read `{path}`: no such file in the skill directory"
         ));
     }
-    let text = std::fs::read_to_string(&resolved)
-        .map_err(|err| format!("cannot read `{path}`: {err}"))?;
+    let text =
+        std::fs::read_to_string(&resolved).map_err(|err| format!("cannot read `{path}`: {err}"))?;
     Ok(cap_file(&text))
 }
 
@@ -111,7 +111,10 @@ fn unknown_skill(asked: &str, skills: &[ResolvedSkill]) -> String {
             .take(3)
             .map(|skill| skill.id.as_str())
             .collect();
-        format!("unknown skill \"{asked}\". Closest ids: {}", close.join(", "))
+        format!(
+            "unknown skill \"{asked}\". Closest ids: {}",
+            close.join(", ")
+        )
     }
 }
 

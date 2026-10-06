@@ -365,11 +365,13 @@ impl PluginManager {
             let (plugin, discovered) = self.scan(record);
             if record.enabled {
                 index.skills.extend(discovered.skills.iter().cloned());
-                index.subagents.extend(discovered.subagents.iter().cloned().map(|mut sub| {
-                    // discovery is id-agnostic; the record owns the plugin id
-                    sub.plugin_id = record.id.clone();
-                    sub
-                }));
+                index
+                    .subagents
+                    .extend(discovered.subagents.iter().cloned().map(|mut sub| {
+                        // discovery is id-agnostic; the record owns the plugin id
+                        sub.plugin_id = record.id.clone();
+                        sub
+                    }));
                 for server in &discovered.servers {
                     if !is_server_disabled(record, &server.name) {
                         index.servers.push(PluginServerRef {
@@ -476,8 +478,7 @@ impl PluginManager {
                     source_kind: source_kind(&entry.source).to_string(),
                     installed: installed.map(|item| item.id.clone()),
                     installed_version: installed.and_then(|item| item.version.clone()),
-                    update_available: installed
-                        .is_some_and(|item| item.available_update.is_some()),
+                    update_available: installed.is_some_and(|item| item.available_update.is_some()),
                     trust_warning: TRUST_WARNING.to_string(),
                 });
             }
@@ -628,7 +629,11 @@ impl PluginManager {
                 .map_err(|err| format!("cannot write the install record: {err}"))?;
         }
         self.reload()?;
-        self.changed(if on { "server_enable" } else { "server_disable" });
+        self.changed(if on {
+            "server_enable"
+        } else {
+            "server_disable"
+        });
         Ok(())
     }
 
@@ -692,7 +697,10 @@ impl PluginManager {
         {
             let mut store = self.install.lock().unwrap();
             for record in store.records.iter_mut() {
-                let registry = record.marketplace.as_deref().and_then(|id| registries.get(id));
+                let registry = record
+                    .marketplace
+                    .as_deref()
+                    .and_then(|id| registries.get(id));
                 match update::check_one(record, registry, &self.plugins_dir) {
                     Ok(Some(found)) => updates.push(PluginUpdateInfo {
                         plugin_id: record.id.clone(),
@@ -856,13 +864,17 @@ impl PluginManager {
             // The sub-path is validated where it is used: `read_git_registry`
             // runs it through `resolve_within` at refresh time.
             match &mut source {
-                PluginSource::Github { path: slot, .. }
-                | PluginSource::Git { path: slot, .. } => *slot = Some(path.to_string()),
+                PluginSource::Github { path: slot, .. } | PluginSource::Git { path: slot, .. } => {
+                    *slot = Some(path.to_string())
+                }
                 _ => {}
             }
         }
         let fallback = source_name(&source);
-        let explicit = name.as_deref().map(str::trim).filter(|name| !name.is_empty());
+        let explicit = name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
         let id = install::slug(explicit.unwrap_or(&fallback));
         if id.is_empty() {
             return Err("marketplace name must contain a letter or digit".to_string());
@@ -1018,7 +1030,8 @@ impl PluginManager {
             store.records.iter().find(|record| record.id == id).cloned()
         };
         let mut record = record?;
-        let result = marketplace::refresh(&mut record, &self.marketplaces_dir, self.http.as_ref()).await;
+        let result =
+            marketplace::refresh(&mut record, &self.marketplaces_dir, self.http.as_ref()).await;
         {
             let mut store = self.marketplaces.lock().unwrap();
             if let Some(slot) = store.records.iter_mut().find(|item| item.id == id) {
@@ -1437,7 +1450,13 @@ fn source_path(source: &PluginSource) -> Option<&str> {
 /// A short name for the source, used for the record id and for progress when
 /// no entry name is known.
 fn source_name(source: &PluginSource) -> String {
-    let tail = |value: &str| value.rsplit(['/', ':']).next().unwrap_or_default().to_string();
+    let tail = |value: &str| {
+        value
+            .rsplit(['/', ':'])
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    };
     let strip = |value: String| {
         value
             .trim_end_matches(".git")
@@ -1455,7 +1474,10 @@ fn source_name(source: &PluginSource) -> String {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            if matches!(name.as_str(), "marketplace.json" | ".claude-plugin" | ".ducky") {
+            if matches!(
+                name.as_str(),
+                "marketplace.json" | ".claude-plugin" | ".ducky"
+            ) {
                 path.parent()
                     .and_then(Path::file_name)
                     .map(|name| name.to_string_lossy().into_owned())
