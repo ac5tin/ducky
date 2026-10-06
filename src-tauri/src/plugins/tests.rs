@@ -1555,6 +1555,181 @@ fn url_source(url: &str) -> PluginSource {
     }
 }
 
+/// A git repo holding a plugin package plus `evil.sh`. `evil.sh` writes
+/// `marker`; git runs it if a registry-derived value is parsed as an option.
+#[cfg(unix)]
+fn repo_with_evil(dir: &Path, marker: &Path) -> String {
+    use std::os::unix::fs::PermissionsExt;
+
+    git_init(dir);
+    Conformant::agent(dir, "evil-plugin", "");
+    write(
+        dir,
+        "evil.sh",
+        &format!("#!/bin/sh\necho pwned > {}\nexit 0\n", marker.display()),
+    );
+    let script = dir.join("evil.sh");
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-m", "plugin with evil.sh"]);
+    git(dir, &["rev-parse", "HEAD"])
+}
+
+/// The final-review Critical: `git fetch --depth 1 origin --upload-pack=./evil.sh`
+/// RUNS `evil.sh` from the clone. Install must execute nothing (spec §6).
+#[cfg(unix)]
+#[test]
+fn install_sha_that_looks_like_a_git_option_runs_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let marker = tmp.path().join("pwned.txt");
+    repo_with_evil(&repo, &marker);
+    let plugins = tmp.path().join("plugins");
+    let mut store = InstallStore::load(&plugins);
+    let source = PluginSource::Git {
+        url: file_url(&repo),
+        path: None,
+        git_ref: None,
+        sha: Some("--upload-pack=./evil.sh".to_string()),
+    };
+
+    let result = install(&mut store, &plugins, &source, None, None);
+
+    assert!(result.is_err(), "an option-shaped sha must not install");
+    assert!(
+        !marker.exists(),
+        "install ran the option-shaped sha as a program"
+    );
+}
+
+/// The same injection through the update path: the record's sha is re-fetched
+/// before the swap (spec §7).
+#[cfg(unix)]
+#[test]
+fn update_sha_that_looks_like_a_git_option_runs_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let marker = tmp.path().join("pwned.txt");
+    repo_with_evil(&repo, &marker);
+    let plugins = tmp.path().join("plugins");
+    let mut store = InstallStore::load(&plugins);
+    let mut record = install(&mut store, &plugins, &git_source(&repo), None, None).unwrap();
+    record.source = PluginSource::Git {
+        url: file_url(&repo),
+        path: None,
+        git_ref: None,
+        sha: Some("--upload-pack=./evil.sh".to_string()),
+    };
+
+    let result = apply(&mut record, &plugins, None, true);
+
+    assert!(result.is_err(), "an option-shaped sha must not update");
+    assert!(
+        !marker.exists(),
+        "update ran the option-shaped sha as a program"
+    );
+}
+
+/// A marketplace `ref` lands in `git fetch` as a positional too: the second
+/// refresh fetches into an existing clone.
+#[cfg(unix)]
+#[tokio::test]
+async fn marketplace_refresh_ref_that_looks_like_a_git_option_runs_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    let marker = tmp.path().join("pwned.txt");
+    repo_with_evil(&repo, &marker);
+    write(
+        &repo,
+        "marketplace.json",
+        &registry_body("evil-marketplace", ""),
+    );
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-m", "registry"]);
+    let dir = tmp.path().join("marketplaces");
+    let mut record = marketplace_record("evil", git_source(&repo));
+    let http = FakeHttp::new(Vec::new());
+    // First refresh clones the repo, so the next one fetches into it.
+    refresh(&mut record, &dir, &http).await.unwrap();
+    record.source = PluginSource::Git {
+        url: file_url(&repo),
+        path: None,
+        git_ref: Some("--upload-pack=./evil.sh".to_string()),
+        sha: None,
+    };
+
+    let result = refresh(&mut record, &dir, &http).await;
+
+    assert!(result.is_err(), "an option-shaped ref must not refresh");
+    assert!(
+        !marker.exists(),
+        "refresh ran the option-shaped ref as a program"
+    );
+}
+
+/// Defence in depth: a `-`-prefixed git value never reaches git, and the
+/// diagnostic names the field the user must fix.
+#[test]
+fn parse_source_rejects_option_shaped_git_values() {
+    let cases = [
+        (
+            r#"{"source": "git", "url": "--upload-pack=./evil.sh"}"#,
+            "url",
+        ),
+        (
+            r#"{"source": "git", "url": "file:///repo", "ref": "--upload-pack=./evil.sh"}"#,
+            "ref",
+        ),
+        (
+            r#"{"source": "git", "url": "file:///repo", "sha": "--upload-pack=./evil.sh"}"#,
+            "sha",
+        ),
+        (
+            r#"{"source": "url", "url": "--upload-pack=./evil.sh"}"#,
+            "url",
+        ),
+        (
+            r#"{"source": "github", "repo": "--upload-pack=./evil.sh"}"#,
+            "repo",
+        ),
+    ];
+    for (json, field) in cases {
+        let value: serde_json::Value = serde_json::from_str(json).unwrap();
+        let err = parse_source(&value, false).unwrap_err();
+        assert!(
+            err.contains(field) && err.contains("must not start with `-`"),
+            "field `{field}`: {err}"
+        );
+    }
+}
+
+/// The same refusal reaches the user through a registry entry: unavailable,
+/// with the parse diagnostic as the reason.
+#[test]
+fn a_registry_entry_with_an_option_shaped_sha_is_unavailable() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "marketplace.json",
+        &registry_body(
+            "acme",
+            r#"{"name": "demo", "source": {"source": "git", "url": "file:///repo", "sha": "--upload-pack=./evil.sh"}}"#,
+        ),
+    );
+
+    let registry = parse_registry(tmp.path()).unwrap();
+
+    assert_eq!(registry.entries.len(), 1);
+    assert!(!registry.entries[0].available);
+    let reason = registry.entries[0].reason.as_deref().unwrap_or_default();
+    assert!(
+        reason.contains("sha") && reason.contains("must not start with `-`"),
+        "{reason}"
+    );
+}
+
 /// A registry fixture with one plugin entry.
 fn one_entry() -> String {
     r#"{"name": "one", "source": "./one"}"#.to_string()

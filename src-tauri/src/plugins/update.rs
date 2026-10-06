@@ -5,8 +5,8 @@
 //! next `apply` or `rollback`. A failed record write puts that directory back,
 //! then returns, so the record still describes the revision on disk.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -17,9 +17,8 @@ use super::install::{
 use super::layout::discover;
 use super::manifest;
 use super::marketplace::{
-    git_target, join_diagnostics, parse_git_remote, Entry, PluginSource, Registry,
+    git_guarded, git_target, join_diagnostics, parse_git_remote, Entry, PluginSource, Registry,
 };
-use crate::snapshot::GIT_ENV_TO_CLEAR;
 
 /// Result of a successful swap. The command layer reconnects `enabled_servers`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -259,20 +258,20 @@ fn ls_remote_target(source: &PluginSource) -> Option<(String, String)> {
 }
 
 fn git_ls_remote(url: &str, git_ref: &str) -> Result<String, String> {
-    let mut command = Command::new("git");
-    for var in GIT_ENV_TO_CLEAR {
-        command.env_remove(var);
-    }
-    command.env("GIT_TERMINAL_PROMPT", "0");
-    command
-        .arg("ls-remote")
-        .arg(url)
-        .arg(format!("refs/heads/{git_ref}"))
-        .arg(format!("refs/tags/{git_ref}"))
-        .arg(format!("refs/tags/{git_ref}^{{}}"));
+    // The URL came from a source, never from us: it goes after `--`, so a
+    // leading `-` is a URL and not an option (final-review Critical).
+    let mut refs = vec![
+        format!("refs/heads/{git_ref}"),
+        format!("refs/tags/{git_ref}"),
+        format!("refs/tags/{git_ref}^{{}}"),
+    ];
     if git_ref == "HEAD" {
-        command.arg("HEAD");
+        refs.push("HEAD".to_string());
     }
+    let mut positionals: Vec<&OsStr> = vec![OsStr::new(url)];
+    positionals.extend(refs.iter().map(|git_ref| OsStr::new(git_ref.as_str())));
+    let mut command = git_guarded(None, &["ls-remote"], &positionals);
+    command.env("GIT_TERMINAL_PROMPT", "0");
     let output = command
         .output()
         .map_err(|err| format!("could not run git: {err}"))?;

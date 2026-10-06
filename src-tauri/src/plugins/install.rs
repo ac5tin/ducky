@@ -2,6 +2,7 @@
 //! (design §3, §6, §7).
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,7 +16,8 @@ use super::diagnostics::{DiagLevel, Diagnostic};
 use super::layout::{discover, Discovered};
 use super::manifest::{self, Layout};
 use super::marketplace::{
-    clone_repo, git_in, git_target, join_diagnostics, parse_git_remote, Entry, PluginSource,
+    clone_repo, git_guarded_refs, git_in, git_target, join_diagnostics, parse_git_remote,
+    validate_source, Entry, PluginSource,
 };
 use super::path::resolve_within;
 
@@ -328,6 +330,7 @@ pub(crate) fn fetch_to_staging(
     resolved_sha: &mut Option<String>,
     resolved_sha256: &mut Option<String>,
 ) -> Result<(), String> {
+    validate_source(source)?;
     *resolved_sha = None;
     *resolved_sha256 = None;
     match source {
@@ -396,9 +399,13 @@ fn fetch_git(
 }
 
 /// Check out an exact commit, fetched after the shallow clone.
+///
+/// The SHA came from a marketplace entry, so it goes after `--`: git must
+/// never read it as an option (final-review Critical).
 fn checkout_sha(repo: &Path, sha: &str) -> Result<(), String> {
-    if git_in(repo, &["fetch", "--depth", "1", "origin", sha]).is_err() {
-        git_in(repo, &["fetch", "origin", sha])?;
+    let refspec = [OsStr::new("origin"), OsStr::new(sha)];
+    if git_guarded_refs(repo, &["fetch", "--depth", "1"], &refspec).is_err() {
+        git_guarded_refs(repo, &["fetch"], &refspec)?;
     }
     git_in(repo, &["checkout", "--detach", "FETCH_HEAD"]).map(|_| ())
 }

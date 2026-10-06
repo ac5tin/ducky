@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::io;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -265,11 +266,78 @@ pub(super) fn parse_source(
     value: &Value,
     is_marketplace_source: bool,
 ) -> Result<PluginSource, String> {
-    match value {
+    let source = match value {
         Value::String(text) => parse_source_string(text, is_marketplace_source),
         Value::Object(map) => parse_source_object(map),
-        _ => Err("source must be a string or an object".to_string()),
+        _ => return Err("source must be a string or an object".to_string()),
+    }?;
+    validate_source(&source)?;
+    Ok(source)
+}
+
+/// Reject a source whose git-facing value starts with `-`.
+///
+/// Git reads a leading `-` as an option, never as a URL, ref or SHA: the
+/// final-review Critical showed `--upload-pack=./evil.sh` running a program
+/// at install time. The field is named in the error, and the value never
+/// reaches git.
+pub(crate) fn validate_source(source: &PluginSource) -> Result<(), String> {
+    match source {
+        PluginSource::Github {
+            repo,
+            git_ref,
+            sha,
+            ..
+        } => {
+            no_leading_dash("repo", repo)?;
+            no_dash_fragment("ref", repo)?;
+            no_leading_dash_opt("ref", git_ref.as_deref())?;
+            no_leading_dash_opt("sha", sha.as_deref())
+        }
+        PluginSource::Git {
+            url,
+            git_ref,
+            sha,
+            ..
+        }
+        | PluginSource::GitSubdir {
+            url,
+            git_ref,
+            sha,
+            ..
+        } => {
+            no_leading_dash("url", url)?;
+            no_dash_fragment("ref", url)?;
+            no_leading_dash_opt("ref", git_ref.as_deref())?;
+            no_leading_dash_opt("sha", sha.as_deref())
+        }
+        // A `url` source is git over HTTPS, and it may carry a `#ref`.
+        PluginSource::Url { url } => {
+            no_leading_dash("url", url)?;
+            no_dash_fragment("ref", url)
+        }
+        PluginSource::Path { .. } | PluginSource::Unsupported { .. } => Ok(()),
     }
+}
+
+fn no_leading_dash(field: &str, value: &str) -> Result<(), String> {
+    if value.starts_with('-') {
+        return Err(format!("field `{field}` must not start with `-`"));
+    }
+    Ok(())
+}
+
+fn no_leading_dash_opt(field: &str, value: Option<&str>) -> Result<(), String> {
+    match value {
+        Some(value) => no_leading_dash(field, value),
+        None => Ok(()),
+    }
+}
+
+/// The optional `#ref` of a git URL or `owner/repo` shorthand is a ref too.
+fn no_dash_fragment(field: &str, value: &str) -> Result<(), String> {
+    let (_, fragment) = parse_git_remote(value);
+    no_leading_dash_opt(field, fragment.as_deref())
 }
 
 fn parse_source_string(text: &str, is_marketplace_source: bool) -> Result<PluginSource, String> {
@@ -811,6 +879,7 @@ fn refresh_git(
     dir: &Path,
     source: &PluginSource,
 ) -> Result<RefreshOutcome, String> {
+    validate_source(source)?;
     let (url, sub_path, git_ref) = git_target(source)?;
     let repo = dir.join(&record.id).join("repo");
     // Read HEAD before the fetch so a bad new commit can be checked out back.
@@ -941,15 +1010,16 @@ fn clone_attempts(
                 .map_err(|err| format!("cannot create {}: {err}", parent.display()))?;
         }
         let _ = std::fs::remove_dir_all(repo);
-        let mut command = git_command();
-        command.arg("clone").arg("--depth").arg("1");
+        // One token, so a `-`-prefixed ref cannot be mistaken for an option.
+        let branch = git_ref.map(|git_ref| format!("--branch={git_ref}"));
+        let mut options = vec!["clone", "--depth", "1"];
         if filtered {
-            command.arg("--filter=blob:none");
+            options.push("--filter=blob:none");
         }
-        if let Some(git_ref) = git_ref {
-            command.arg("--branch").arg(git_ref);
+        if let Some(branch) = branch.as_deref() {
+            options.push(branch);
         }
-        command.arg(url).arg(repo);
+        let command = git_guarded(None, &options, &[OsStr::new(url), repo.as_os_str()]);
         match git_output(command) {
             Ok(_) => {
                 note_clone_form(filtered);
@@ -987,12 +1057,40 @@ fn note_clone_form(filtered: bool) {
 
 /// Fetch the wanted ref and detach the work tree onto it.
 fn update_repo(repo: &Path, git_ref: Option<&str>) -> Result<(), String> {
-    git_in(
+    git_guarded_refs(
         repo,
-        &["fetch", "--depth", "1", "origin", git_ref.unwrap_or("HEAD")],
+        &["fetch", "--depth", "1"],
+        &[OsStr::new("origin"), OsStr::new(git_ref.unwrap_or("HEAD"))],
     )?;
     git_in(repo, &["checkout", "--detach", "FETCH_HEAD"])?;
     Ok(())
+}
+
+/// Build a `git` invocation with `-C repo` (when given), then `options`, then
+/// `--`, then `positionals`.
+///
+/// Every registry-derived value is a positional after the separator, so git
+/// can never read a leading `-` as an option (final-review Critical).
+pub(crate) fn git_guarded(
+    repo: Option<&Path>,
+    options: &[&str],
+    positionals: &[&OsStr],
+) -> Command {
+    let mut command = git_command();
+    if let Some(repo) = repo {
+        command.arg("-C").arg(repo);
+    }
+    command.args(options).arg("--").args(positionals);
+    command
+}
+
+/// [`git_guarded`] in one repository, useful when the result is needed.
+pub(crate) fn git_guarded_refs(
+    repo: &Path,
+    options: &[&str],
+    positionals: &[&OsStr],
+) -> Result<String, String> {
+    git_output(git_guarded(Some(repo), options, positionals))
 }
 
 /// A `git` command with the repository-redirecting environment removed
