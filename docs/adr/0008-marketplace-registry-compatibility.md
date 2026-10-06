@@ -35,13 +35,16 @@ Read the ecosystem dialects and normalise them into one internal model.
   unavailable entry with the reason, never a failed registry.
 - `entries[].defaultEnabled` is deliberately not parsed (ruling R13).
   Honouring the Claude Code hint would let a registry influence what runs on
-  install, which would contradict ADR-0009: install writes `enabled: false` and
-  leaves every owned server in `disabled_servers`. The rejected alternative was
-  to read it as an enable hint or as the update-policy hint; the update policy
-  instead derives from the package content (`derive_policy`) with the user's
-  `PluginSettings.policy_default` (Content/Auto/Manual) as the only override.
-  Consequence: an entry that sets `defaultEnabled` installs disabled under the
-  content-derived policy, exactly like an entry that omits the field.
+  install, which would contradict ADR-0009. The rejected alternative was to
+  read it as an enable hint or as the update-policy hint; the update policy
+  instead comes from `derive_policy` (content-derived), which the user's
+  `PluginSettings.policy_default` overwrites only for `Auto` and `Manual` —
+  `Content` keeps the derived policy. Two layers own the disable:
+  `install::install` writes `enabled: false` and `disabled_servers: Vec::new()`,
+  and then `PluginManager::install` sets `disabled_servers` to every owned
+  server name. Consequence: an entry that sets `defaultEnabled` installs
+  disabled under the content-derived policy, exactly like an entry that omits
+  the field.
 - A failed refresh is recorded on the marketplace record and the previous
   snapshot is kept, so a network outage cannot empty the catalog.
 
