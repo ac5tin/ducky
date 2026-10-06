@@ -6063,6 +6063,80 @@ async fn a_check_reports_and_keeps_a_local_modification() {
     );
 }
 
+/// A refused unforced apply leaves `ModifiedLocally` on the record. Once the
+/// user restores the recorded tree, the next check clears that stale status,
+/// so the automatic pass selects the plugin again instead of skipping it
+/// forever (final fix round 3).
+#[tokio::test]
+async fn a_check_clears_a_stale_local_modification_when_the_tree_matches_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let market = tmp.path().join("market");
+    versioned_package(&market.join("demo"), "demo-plugin", "1.0.0", "old-bytes");
+    write(
+        &market,
+        "marketplace.json",
+        &registry_body(
+            "Acme",
+            r#"{"name": "demo-plugin", "version": "1.1.0", "source": "./demo"}"#,
+        ),
+    );
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+    manager
+        .add_marketplace(
+            MarketplaceInput {
+                source: market.display().to_string(),
+                path: None,
+            },
+            None,
+        )
+        .unwrap();
+    let id = manager
+        .install(
+            Some("market"),
+            Some("demo-plugin"),
+            None,
+            PolicyDefault::Content,
+        )
+        .unwrap();
+    manager.set_policy(&id, UpdatePolicy::Auto).unwrap();
+    let package = tmp.path().join("plugins").join(&id).join("package");
+    let recorded = std::fs::read_to_string(package.join("marker.txt")).unwrap();
+
+    // One refused unforced apply marks the record.
+    write(&package, "marker.txt", "local-edit");
+    let err = manager.update(&id, false).unwrap_err();
+    assert!(err.contains("modified locally"), "{err}");
+    assert_eq!(manager.list()[0].status, PluginStatus::ModifiedLocally);
+
+    // The user restores the recorded tree. The status is now stale: the tree
+    // matches `record.tree_hash` again.
+    std::fs::write(package.join("marker.txt"), &recorded).unwrap();
+
+    let updates = manager.check_updates().await.unwrap();
+
+    // The check's own verdict is clean, and the status no longer blocks the
+    // automatic pass: the plugin satisfies every `autoUpdateIds` filter
+    // (policy auto, check flag false, no `modified_locally` status).
+    let found = updates
+        .iter()
+        .find(|update| update.plugin_id == id)
+        .expect("the check still reports the cached update");
+    assert!(!found.modified_locally, "{found:?}");
+    let plugin = manager
+        .list()
+        .into_iter()
+        .find(|plugin| plugin.id == id)
+        .unwrap();
+    assert_ne!(
+        plugin.status,
+        PluginStatus::ModifiedLocally,
+        "{:?}",
+        plugin.status
+    );
+    assert_eq!(plugin.update_policy, UpdatePolicy::Auto);
+    assert!(plugin.available_update.is_some());
+}
+
 /// A hand-edited unsafe id must not publish or reveal a path outside the
 /// plugins directory, and must not break the other records (Task 5 class,
 /// review fix round 1).

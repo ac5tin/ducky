@@ -40,39 +40,42 @@ pub fn check_one(
     registry: Option<&Registry>,
     plugins_dir: &Path,
 ) -> Result<Option<AvailableUpdate>, String> {
-    package_dir(plugins_dir, &record.id)?;
+    let package = package_dir(plugins_dir, &record.id)?.join("package");
+    // The tree is hashed only to re-check a `ModifiedLocally` status; every
+    // other status follows the check result alone.
+    let modified =
+        record.status == PluginStatus::ModifiedLocally && locally_modified(record, &package);
     if let Some(version) = matching_version(record, registry) {
         record.last_checked_at = Some(now());
         if record.version.as_deref() == Some(version) {
-            clear_available(record);
-            return Ok(None);
+            return Ok(settle(record, None, modified));
         }
-        return Ok(Some(note_update(
+        return Ok(settle(
             record,
-            AvailableUpdate {
+            Some(AvailableUpdate {
                 version: Some(version.to_string()),
                 resolved_sha: None,
-            },
-        )));
+            }),
+            modified,
+        ));
     }
     if let Some((url, git_ref)) = ls_remote_target(&record.source) {
         let sha = git_ls_remote(&url, &git_ref)?;
         record.last_checked_at = Some(now());
         if record.resolved_sha.as_deref() == Some(sha.as_str()) {
-            clear_available(record);
-            return Ok(None);
+            return Ok(settle(record, None, modified));
         }
-        return Ok(Some(note_update(
+        return Ok(settle(
             record,
-            AvailableUpdate {
+            Some(AvailableUpdate {
                 version: None,
                 resolved_sha: Some(sha),
-            },
-        )));
+            }),
+            modified,
+        ));
     }
     record.last_checked_at = Some(now());
-    clear_available(record);
-    Ok(None)
+    Ok(settle(record, None, modified))
 }
 
 /// Fetch the next revision, validate it, and swap it into `package/`.
@@ -230,26 +233,28 @@ fn matching_version<'a>(record: &InstallRecord, registry: Option<&'a Registry>) 
         .filter(|version| !version.is_empty())
 }
 
-fn note_update(record: &mut InstallRecord, update: AvailableUpdate) -> AvailableUpdate {
-    record.available_update = Some(update.clone());
-    // A local edit outranks "update available" (design §7): keep the status,
-    // because the automatic pass reads it to skip the plugin, and every
-    // unforced update refuses a modified package anyway.
-    if record.status != PluginStatus::ModifiedLocally {
-        record.status = PluginStatus::UpdateAvailable;
-    }
+/// One place decides the status after a check. A local edit outranks an
+/// update (design §7): the automatic pass reads the status to skip the
+/// plugin, and every unforced update refuses a modified package anyway. A
+/// tree that matches `record.tree_hash` again clears a stale
+/// `ModifiedLocally`; an available update then shows through as
+/// `UpdateAvailable`, and otherwise the status follows `enabled`.
+fn settle(
+    record: &mut InstallRecord,
+    update: Option<AvailableUpdate>,
+    modified: bool,
+) -> Option<AvailableUpdate> {
+    record.available_update = update.clone();
+    record.status = if modified {
+        PluginStatus::ModifiedLocally
+    } else if update.is_some() {
+        PluginStatus::UpdateAvailable
+    } else if record.enabled {
+        PluginStatus::Enabled
+    } else {
+        PluginStatus::InstalledDisabled
+    };
     update
-}
-
-fn clear_available(record: &mut InstallRecord) {
-    record.available_update = None;
-    if record.status == PluginStatus::UpdateAvailable {
-        record.status = if record.enabled {
-            PluginStatus::Enabled
-        } else {
-            PluginStatus::InstalledDisabled
-        };
-    }
 }
 
 fn ls_remote_target(source: &PluginSource) -> Option<(String, String)> {
@@ -334,7 +339,8 @@ fn resolve_remote_sha(stdout: &[u8], git_ref: &str) -> Result<String, String> {
 
 /// The package no longer matches `record.tree_hash`. `apply` refuses an
 /// unforced update on this; the check reports the same verdict to the caller
-/// without writing it, so a later check cannot overwrite it.
+/// and settles the status from it, so a stale `ModifiedLocally` cannot
+/// outlive the edit it describes.
 pub(super) fn locally_modified(record: &InstallRecord, package: &Path) -> bool {
     let Some(recorded) = record.tree_hash.as_deref() else {
         return false;
