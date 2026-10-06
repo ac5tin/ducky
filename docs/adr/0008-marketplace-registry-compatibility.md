@@ -26,13 +26,22 @@ Read the ecosystem dialects and normalise them into one internal model.
 - A `source` may be `"./relative/path"`, `github`, `git`, `git-subdir`,
   `directory`/`file`, `url` (git over HTTPS), or the `owner/repo` / bare git
   URL shorthand used by marketplace sources.
-- Entry fields are read as a superset of the Claude Code and ZCode shapes;
-  unknown fields are ignored, and known-but-unimplemented dependencies are
-  reported as unsupported rather than as errors.
+- Entry fields are read as a superset of the Claude Code and ZCode shapes.
+  Unknown fields are ignored, including `dependencies`: `parse_entry` reads no
+  dependency field and install never checks one, so an entry that names
+  dependencies installs exactly as if the field were absent. (Cross-marketplace
+  dependencies are out of scope in the design.)
 - An unsupported `source` kind (`npm`, `archive`, `command`) produces an
   unavailable entry with the reason, never a failed registry.
-- `entries[].defaultEnabled` is honoured only as the installed plugin's update
-  policy hint — Ducky still installs every plugin disabled (ADR-0009).
+- `entries[].defaultEnabled` is deliberately not parsed (ruling R13).
+  Honouring the Claude Code hint would let a registry influence what runs on
+  install, which would contradict ADR-0009: install writes `enabled: false` and
+  leaves every owned server in `disabled_servers`. The rejected alternative was
+  to read it as an enable hint or as the update-policy hint; the update policy
+  instead derives from the package content (`derive_policy`) with the user's
+  `PluginSettings.policy_default` (Content/Auto/Manual) as the only override.
+  Consequence: an entry that sets `defaultEnabled` installs disabled under the
+  content-derived policy, exactly like an entry that omits the field.
 - A failed refresh is recorded on the marketplace record and the previous
   snapshot is kept, so a network outage cannot empty the catalog.
 
@@ -40,12 +49,15 @@ Read the ecosystem dialects and normalise them into one internal model.
 
 - A Claude Code, ZCode or Copilot CLI marketplace installs from without a
   conversion step.
-- Ducky-specific behaviour (policy hints, extra entry fields) must be
-  additive: a registry written for another client keeps working, and a Ducky
-  registry that uses only Ducky fields is still valid.
-- The normalised `Entry` carries `raw_name` next to `name`, so an entry whose
-  display name is not a valid plugin id can still be installed under a
-  derived id.
+- Ducky-specific behaviour (extra entry fields) must be additive: a registry
+  written for another client keeps working, and a Ducky registry that uses only
+  Ducky fields is still valid.
+- The normalised `Entry` carries `name` and `display_name` (`marketplace.rs`),
+  with no third name field. `name` is the registry key a marketplace install
+  selects by and `display_name` is the label the UI shows; the install id comes
+  from the package manifest's own `name` (`assign_id` slugs it for the Claude
+  layout and uses it unchanged for the Agent Plugins layout), never from the
+  entry.
 - The probe order is a compatibility contract. A repository that ships two
   registries gets the Claude Code one; moving a file between the three paths
   can change what a marketplace lists.

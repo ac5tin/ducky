@@ -50,9 +50,9 @@ export function ConnectorsView() {
     // their one-time consent and refreshes the merged server list.
     const owner = pluginServerOwner(s.origin);
     if (owner) {
+      // the shared store action owns the consent, the connect and the
+      // disconnect, so a failed consent write never disconnects
       await setPluginServerEnabled(owner.id, s.name, !s.enabled);
-      // disabling removes it from the merged list; close the live connection
-      if (s.enabled) await api.mcpDisconnect(s.id).catch(() => undefined);
       return;
     }
     try {

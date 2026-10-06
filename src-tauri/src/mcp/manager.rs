@@ -966,16 +966,7 @@ impl McpManager {
                     // Plugin servers get their own launch rules (design §2/§9):
                     // placeholder expansion, the plugin root as the cwd
                     // default, and no login-shell PATH augmentation.
-                    let env: BTreeMap<String, String> =
-                        env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                    let spec = spawn_spec(
-                        command,
-                        args,
-                        &env,
-                        launch.cwd.as_deref(),
-                        &launch.root,
-                        &launch.data,
-                    )?;
+                    let spec = plugin_spawn_spec(command, args, env, launch)?;
                     let mut cmd = tokio::process::Command::new(&spec.program);
                     cmd.args(&spec.args);
                     for (key, value) in &spec.env {
@@ -1794,6 +1785,24 @@ pub(crate) fn spawn_spec(
         env: env_out,
         cwd: resolved_cwd,
     })
+}
+
+/// One plugin stdio launch, exactly as `build_transport` performs it: the
+/// config's env into a `BTreeMap`, then the manifest's raw `cwd` through
+/// `spawn_spec`'s default-to-root rule (design §2/§9). Extracted so the
+/// conformance tests drive the same call the manager does, not `spawn_spec`
+/// with a second literal `None`.
+pub(crate) fn plugin_spawn_spec(
+    command: &str,
+    args: &[String],
+    env: &HashMap<String, String>,
+    launch: &PluginLaunch,
+) -> Result<CommandSpec, String> {
+    let env: BTreeMap<String, String> = env
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    spawn_spec(command, args, &env, launch.cwd.as_deref(), &launch.root, &launch.data)
 }
 
 /// The subtitle a server row shows. A plugin-provided URL can carry a

@@ -18,6 +18,7 @@ import {
   progressRowViews,
   runInstallPlugin,
   runInstallPluginAction,
+  runPluginServerToggle,
   serverTrustLine,
   shouldSchedulePluginMaintenance,
   skillCount,
@@ -550,6 +551,157 @@ test("pluginTrustSummary lists what will run", () => {
     { name: "local", line: "stdio — node index.js" },
   ]);
   assert.deepEqual(summary.subagents, ["Helper"]);
+});
+
+// The plugin-server switch: the consent write owns the record, the connect
+// follows only a successful enable, and the disconnect follows a successful
+// disable. The store action injects the real api; these drive a fake.
+function toggleApi(events, toasts, over = {}) {
+  return {
+    setServerEnabled: async (id, server, enabled) => {
+      events.push(`consent:${id}:${server}:${enabled}`);
+    },
+    connect: async (serverId) => {
+      events.push(`connect:${serverId}`);
+      return "connected";
+    },
+    disconnect: async (serverId) => {
+      events.push(`disconnect:${serverId}`);
+    },
+    isLive: () => false,
+    toast: (message) => toasts.push(message),
+    ...over,
+  };
+}
+
+test("plugin server toggle connects after a successful enable", async () => {
+  const events = [];
+  const toasts = [];
+  const ok = await runPluginServerToggle(
+    toggleApi(events, toasts),
+    "acme",
+    "alpha",
+    true,
+  );
+  assert.equal(ok, true);
+  assert.deepEqual(events, [
+    "consent:acme:alpha:true",
+    "connect:plugin:acme:alpha",
+  ]);
+  assert.deepEqual(toasts, []);
+});
+
+test("plugin server toggle does not connect after a rejected enable", async () => {
+  const events = [];
+  const toasts = [];
+  const ok = await runPluginServerToggle(
+    toggleApi(events, toasts, {
+      setServerEnabled: async () => {
+        events.push("consent");
+        throw new Error("read-only store");
+      },
+    }),
+    "acme",
+    "alpha",
+    true,
+  );
+  assert.equal(ok, false);
+  assert.deepEqual(events, ["consent"]);
+  assert.equal(toasts.length, 1);
+  assert.match(toasts[0], /read-only store/);
+});
+
+test("plugin server toggle skips connect when the server is already live", async () => {
+  const events = [];
+  const toasts = [];
+  const ok = await runPluginServerToggle(
+    toggleApi(events, toasts, { isLive: () => true }),
+    "acme",
+    "alpha",
+    true,
+  );
+  assert.equal(ok, true);
+  assert.deepEqual(events, ["consent:acme:alpha:true"]);
+  assert.deepEqual(toasts, []);
+});
+
+test("plugin server toggle disconnects only after a successful disable", async () => {
+  const events = [];
+  const toasts = [];
+  const ok = await runPluginServerToggle(
+    toggleApi(events, toasts),
+    "acme",
+    "alpha",
+    false,
+  );
+  assert.equal(ok, true);
+  // the backend disconnect is infallible and clears a not-connected id too
+  assert.deepEqual(events, [
+    "consent:acme:alpha:false",
+    "disconnect:plugin:acme:alpha",
+  ]);
+  assert.deepEqual(toasts, []);
+});
+
+test("plugin server toggle does not disconnect after a rejected disable", async () => {
+  const events = [];
+  const toasts = [];
+  const ok = await runPluginServerToggle(
+    toggleApi(events, toasts, {
+      setServerEnabled: async () => {
+        events.push("consent");
+        throw new Error("record not written");
+      },
+    }),
+    "acme",
+    "alpha",
+    false,
+  );
+  assert.equal(ok, false);
+  assert.deepEqual(events, ["consent"]);
+  assert.equal(toasts.length, 1);
+});
+
+test("plugin server toggle surfaces a failed connect", async () => {
+  const toasts = [];
+  await runPluginServerToggle(
+    toggleApi([], toasts, { connect: async () => "error" }),
+    "acme",
+    "alpha",
+    true,
+  );
+  assert.equal(toasts.length, 1);
+  assert.match(toasts[0], /alpha failed to connect/);
+
+  const thrown = [];
+  await runPluginServerToggle(
+    toggleApi([], thrown, {
+      connect: async () => {
+        throw new Error("spawn refused");
+      },
+    }),
+    "acme",
+    "alpha",
+    true,
+  );
+  assert.equal(thrown.length, 1);
+  assert.match(thrown[0], /spawn refused/);
+});
+
+test("plugin server toggle surfaces a disconnect failure", async () => {
+  const toasts = [];
+  await runPluginServerToggle(
+    toggleApi([], toasts, {
+      disconnect: async () => {
+        throw new Error("ipc gone");
+      },
+    }),
+    "acme",
+    "alpha",
+    false,
+  );
+  assert.equal(toasts.length, 1);
+  assert.match(toasts[0], /ipc gone/);
 });
 
 test("pluginServerOwner badges plugin servers and nothing else", () => {

@@ -1,7 +1,6 @@
 //! Plugin manifest, path containment, layout and marketplace tests
 //! (design §1–§2, §5, §13).
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -22,7 +21,7 @@ use super::skills::{collect, load_body, prompt_block, summarize, ResolvedSkill, 
 use super::update::{apply, check_one, rollback};
 use crate::config::{EffortLevel, PluginSettings, PolicyDefault};
 use crate::events::{BackendEvent, CollectingSink};
-use crate::mcp::manager::spawn_spec;
+use crate::mcp::manager::{merge_servers, plugin_spawn_spec, spawn_spec};
 
 const SPEC_100: &str = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json";
 
@@ -848,7 +847,11 @@ fn conformance_discovers_fixed_component_locations() {
     let found = package.discover();
 
     assert_eq!(
-        found.skills.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+        found
+            .skills
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>(),
         ["alpha"]
     );
     assert_eq!(found.servers.len(), 1);
@@ -939,12 +942,39 @@ fn conformance_command_is_single_token_and_root_is_default_cwd() {
     assert!(found.servers.is_empty());
     assert!(found.diagnostics.iter().any(|d| d.target == "shell"));
 
-    // No `cwd` means the plugin root.
-    let root = tmp.path().join("plugin-root");
-    let data = tmp.path().join("plugin-data");
-    write(&root, "bin/tool", "");
-    let spec = spawn_spec("./bin/tool", &[], &BTreeMap::new(), None, &root, &data).unwrap();
-    assert_eq!(spec.cwd, std::fs::canonicalize(&root).unwrap());
+    // No `cwd` means the plugin root. Driven through discovery and the
+    // manager's own launch resolution, so a caller that stops passing the
+    // discovered `None` to the spawn fails this test.
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    Conformant::agent(&source, "default-cwd", "")
+        .mcp(r#"{"demo": {"type": "stdio", "command": "./bin/tool"}}"#);
+    write(&source, "bin/tool", "");
+    let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
+    let id = manager
+        .install(
+            None,
+            None,
+            Some(&path_source(&source)),
+            PolicyDefault::Content,
+        )
+        .unwrap();
+    manager.set_enabled(&id, true).unwrap();
+    manager.set_server_enabled(&id, "demo", true).unwrap();
+
+    let resolved = merge_servers(&[], &manager.index(), &manager.data_dir);
+    let server = resolved
+        .iter()
+        .find(|server| server.launch.is_some())
+        .expect("the enabled server must resolve");
+    let launch = server.launch.as_ref().unwrap();
+    let crate::config::McpTransport::Stdio { command, args, env } = &server.config.transport else {
+        panic!("expected a stdio server");
+    };
+    let spec = plugin_spawn_spec(command, args, env, launch).unwrap();
+
+    assert!(launch.cwd.is_none());
+    assert_eq!(spec.cwd, std::fs::canonicalize(&launch.root).unwrap());
 }
 
 #[test]
@@ -974,13 +1004,15 @@ fn conformance_path_containment_ladder() {
         // type only: the skills still load.
         let tmp = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        write(
-            outside.path(),
+        Conformant::bare(outside.path()).mcp_file(
             "mcp.json",
             r#"{"mcpServers": {"outside": {"type": "stdio", "command": "node"}}}"#,
         );
         let package = Conformant::agent(tmp.path(), "mcp-ladder", "").skill("kept", "kept");
-        symlink(&outside.path().join("mcp.json"), &tmp.path().join("mcp.json"));
+        symlink(
+            &outside.path().join("mcp.json"),
+            &tmp.path().join("mcp.json"),
+        );
 
         let found = package.discover();
 
@@ -996,12 +1028,19 @@ fn conformance_path_containment_ladder() {
         let outside = tempfile::tempdir().unwrap();
         write_skill(outside.path(), "evil", "evil");
         let package = Conformant::agent(tmp.path(), "skill-ladder", "").skill("good", "good");
-        symlink(&outside.path().join("evil"), &tmp.path().join("skills/evil"));
+        symlink(
+            &outside.path().join("evil"),
+            &tmp.path().join("skills/evil"),
+        );
 
         let found = package.discover();
 
         assert_eq!(
-            found.skills.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            found
+                .skills
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
             ["good"]
         );
         assert!(found
@@ -1056,7 +1095,10 @@ fn conformance_component_failure_isolation() {
         .discover();
     assert_eq!(found.skills.len(), 1);
     assert!(found.servers.is_empty());
-    assert!(found.diagnostics.iter().any(|d| d.level == DiagLevel::Warning));
+    assert!(found
+        .diagnostics
+        .iter()
+        .any(|d| d.level == DiagLevel::Warning));
 
     // A bad skill is skipped: the servers still load.
     let tmp = tempfile::tempdir().unwrap();
@@ -2051,8 +2093,8 @@ fn save_is_atomic() {
 // ---------------------------------------------------------------------------
 
 /// A minimal valid local plugin package with one skill.
-fn plugin_package(root: &Path, name: &str) {
-    Conformant::agent(root, name, "").skill("demo", "demo");
+fn plugin_package(root: &Path, name: &str) -> Conformant {
+    Conformant::agent(root, name, "").skill("demo", "demo")
 }
 
 /// An install record with every optional field empty.
@@ -2547,13 +2589,8 @@ fn install_from_source_without_marketplace() {
 fn uninstall_returns_owned_server_ids() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
-    Conformant::agent(&source, "with-server", "");
-    write(
-        &source,
-        "mcp.json",
-        &format!(
-            r#"{{"$schema": "{SPEC_100}", "mcpServers": {{"local-validator": {{"type": "stdio", "command": "node"}}}}}}"#
-        ),
+    Conformant::agent(&source, "with-server", "").mcp(
+        r#"{"local-validator": {"type": "stdio", "command": "node"}}"#,
     );
     let plugins = tmp.path().join("plugins");
     let data = tmp.path().join("plugin-data/with-server");
@@ -3176,9 +3213,11 @@ fn install_keeps_in_root_symlink() {
 // ---------------------------------------------------------------------------
 
 /// A local package whose manifest version and marker file the update tests read.
-fn versioned_package(root: &Path, name: &str, version: &str, marker: &str) {
-    Conformant::agent(root, name, &format!(r#", "version": "{version}""#)).skill("demo", "demo");
+fn versioned_package(root: &Path, name: &str, version: &str, marker: &str) -> Conformant {
+    let package =
+        Conformant::agent(root, name, &format!(r#", "version": "{version}""#)).skill("demo", "demo");
     write(root, "marker.txt", marker);
+    package
 }
 
 /// No manifest version. The ladder's last rung is the literal `unknown`.
@@ -3525,25 +3564,14 @@ fn rollback_without_previous_is_a_clear_error() {
 fn apply_reconnects_only_owned_servers() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
-    versioned_package(&source, "with-server", "1.0.0", "old");
-    write(
-        &source,
-        "mcp.json",
-        &format!(
-            r#"{{"$schema": "{SPEC_100}", "mcpServers": {{"alpha": {{"type": "stdio", "command": "node"}}, "beta": {{"type": "stdio", "command": "node"}}}}}}"#
-        ),
+    versioned_package(&source, "with-server", "1.0.0", "old").mcp(
+        r#"{"alpha": {"type": "stdio", "command": "node"}, "beta": {"type": "stdio", "command": "node"}}"#,
     );
     let plugins = tmp.path().join("plugins");
     let mut store = InstallStore::load(&plugins);
     let mut record = install(&mut store, &plugins, &path_source(&source), None, None).unwrap();
     record.disabled_servers = vec!["beta".to_string(), "not-owned".to_string()];
-    write(
-        &source,
-        "mcp.json",
-        &format!(
-            r#"{{"$schema": "{SPEC_100}", "mcpServers": {{"gamma": {{"type": "stdio", "command": "node"}}}}}}"#
-        ),
-    );
+    Conformant::bare(&source).mcp(r#"{"gamma": {"type": "stdio", "command": "node"}}"#);
 
     let outcome = apply(&mut record, &plugins, None, false).unwrap();
 
@@ -4629,13 +4657,7 @@ fn edit_record(tmp: &Path, id: &str, edit: impl FnOnce(&mut InstallRecord)) {
 
 /// A `mcp.json` declaring one stdio server named `demo`.
 fn write_demo_server(root: &Path) {
-    write(
-        root,
-        "mcp.json",
-        &format!(
-            r#"{{"$schema": "{SPEC_100}", "mcpServers": {{"demo": {{"type": "stdio", "command": "node"}}}}}}"#
-        ),
-    );
+    Conformant::bare(root).mcp(r#"{"demo": {"type": "stdio", "command": "node"}}"#);
 }
 
 #[tokio::test]
@@ -5411,12 +5433,8 @@ async fn update_switches_new_servers_off() {
     manager.set_server_enabled(&id, "demo", true).unwrap();
 
     // The new revision adds "added".
-    write(
-        &source,
-        "mcp.json",
-        &format!(
-            r#"{{"$schema": "{SPEC_100}", "mcpServers": {{"demo": {{"type": "stdio", "command": "node"}}, "added": {{"type": "stdio", "command": "node"}}}}}}"#
-        ),
+    Conformant::bare(&source).mcp(
+        r#"{"demo": {"type": "stdio", "command": "node"}, "added": {"type": "stdio", "command": "node"}}"#,
     );
     manager.update(&id, false).unwrap();
 
@@ -5533,13 +5551,8 @@ async fn unsafe_id_is_refused_by_detail_folder_and_the_view() {
 async fn remote_server_view_shows_host_only() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
-    plugin_package(&source, "demo-plugin");
-    write(
-        &source,
-        "mcp.json",
-        &format!(
-            r#"{{"$schema": "{SPEC_100}", "mcpServers": {{"remote": {{"type": "streamable-http", "url": "https://mcp.example.com:8443/mcp?token=secret"}}}}}}"#
-        ),
+    plugin_package(&source, "demo-plugin").mcp(
+        r#"{"remote": {"type": "streamable-http", "url": "https://mcp.example.com:8443/mcp?token=secret"}}"#,
     );
     let manager = test_manager(tmp.path(), Arc::new(CollectingSink::default()));
     manager

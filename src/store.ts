@@ -14,6 +14,7 @@ import {
   formatVersion,
   hoursToInterval,
   runInstallPluginAction,
+  runPluginServerToggle,
   shouldSchedulePluginMaintenance,
   withPluginProgress,
   withUpdateAvailable,
@@ -649,17 +650,37 @@ export const useStore = create<StoreState>((set, get) => ({
   },
 
   async setPluginServerEnabled(id, server, enabled) {
+    // one place connects and disconnects: both the Connectors row and the
+    // Plugins list route here, so the two surfaces cannot disagree
+    const consented = await runPluginServerToggle(
+      {
+        setServerEnabled: api.pluginSetServerEnabled,
+        connect: api.mcpConnect,
+        disconnect: api.mcpDisconnect,
+        isLive: (serverId) =>
+          get().servers.some(
+            (s) =>
+              s.id === serverId &&
+              (s.status === "connected" || s.status === "connecting"),
+          ),
+        toast: (message) => get().toast("error", message),
+      },
+      id,
+      server,
+      enabled,
+    );
+    if (!consented) return;
+    // the consent write succeeded, so the slices move even if the connect
+    // failed; a reload failure must not undo anything above
     try {
-      await api.pluginSetServerEnabled(id, server, enabled);
       await reloadPluginState(get);
-      await get()
-        .refreshServers()
-        .catch(() => {});
-    } catch (err) {
-      get().toast(
-        "error",
-        `Could not ${enabled ? "start" : "stop"} the server: ${err}`,
-      );
+    } catch {
+      // the switch already stands; the list refresh below still runs
+    }
+    try {
+      await get().refreshServers();
+    } catch {
+      // the connect status still stands
     }
   },
 

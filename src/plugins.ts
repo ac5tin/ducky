@@ -442,3 +442,58 @@ export async function runInstallPluginAction(
   ]);
   return { installed, plugins, skills, catalog };
 }
+
+/** The api one plugin-server switch needs, so tests can inject a fake. */
+export interface PluginServerToggleApi {
+  setServerEnabled: (
+    id: string,
+    server: string,
+    enabled: boolean,
+  ) => Promise<void>;
+  connect: (serverId: string) => Promise<string>;
+  disconnect: (serverId: string) => Promise<void>;
+  isLive: (serverId: string) => boolean;
+  toast: (message: string) => void;
+}
+
+/**
+ * One plugin-server switch (design §6/§9). The consent write owns the record:
+ * nothing else runs when it fails. A successful enable connects the server
+ * unless it is already live; a successful disable always disconnects it (the
+ * backend disconnect is infallible and clears a not-connected id too).
+ *
+ * Returns true when the consent write succeeded, so the caller reloads its
+ * slices even when the connect or disconnect failed.
+ */
+export async function runPluginServerToggle(
+  api: PluginServerToggleApi,
+  id: string,
+  server: string,
+  enabled: boolean,
+): Promise<boolean> {
+  try {
+    await api.setServerEnabled(id, server, enabled);
+  } catch (err) {
+    api.toast(`Could not ${enabled ? "start" : "stop"} the server: ${err}`);
+    return false;
+  }
+  const serverId = `plugin:${id}:${server}`;
+  if (!enabled) {
+    try {
+      await api.disconnect(serverId);
+    } catch (err) {
+      api.toast(`Could not stop ${server}: ${err}`);
+    }
+    return true;
+  }
+  if (api.isLive(serverId)) return true;
+  try {
+    const result = await api.connect(serverId);
+    if (result === "error") {
+      api.toast(`${server} failed to connect — see its detail view for logs.`);
+    }
+  } catch (err) {
+    api.toast(`Could not connect ${server}: ${err}`);
+  }
+  return true;
+}
