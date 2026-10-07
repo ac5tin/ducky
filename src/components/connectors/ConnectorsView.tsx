@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useStore } from "../../store";
 import * as api from "../../api";
 import type { ServerSummary } from "../../types";
+import { pluginServerOwner } from "../../plugins";
 import { Button } from "../modals/Modal";
 import { Icon, StatusDot } from "../icons";
 import { AddConnectorModal } from "./AddConnectorModal";
@@ -38,11 +39,22 @@ function statusLabel(s: ServerSummary["status"]): {
 export function ConnectorsView() {
   const servers = useStore((s) => s.servers);
   const refreshServers = useStore((s) => s.refreshServers);
+  const setPluginServerEnabled = useStore((s) => s.setPluginServerEnabled);
+  const setView = useStore((s) => s.setView);
   const toast = useStore((s) => s.toast);
   const [adding, setAdding] = useState(false);
   const [detailId, setDetailId] = useState<string | null>(null);
 
   const toggleEnabled = async (s: ServerSummary) => {
+    // Plugin servers live on the install record; the plugin action owns
+    // their one-time consent and refreshes the merged server list.
+    const owner = pluginServerOwner(s.origin);
+    if (owner) {
+      // the shared store action owns the consent, the connect and the
+      // disconnect, so a failed consent write never disconnects
+      await setPluginServerEnabled(owner.id, s.name, !s.enabled);
+      return;
+    }
     try {
       await api.mcpSetEnabled(s.id, !s.enabled);
       if (s.enabled) await api.mcpDisconnect(s.id);
@@ -122,6 +134,7 @@ export function ConnectorsView() {
             const st = statusLabel(s.status);
             const needsAuth =
               typeof s.status === "object" && "needs_auth" in s.status;
+            const owner = pluginServerOwner(s.origin);
             return (
               <div
                 key={s.id}
@@ -140,6 +153,14 @@ export function ConnectorsView() {
                   <div className="flex items-center gap-2">
                     <StatusDot status={st.kind} />
                     <span className="truncate font-semibold">{s.name}</span>
+                    {owner && (
+                      <span
+                        className="shrink-0 rounded-md bg-sky-100 px-1.5 py-0.5 text-[10px] font-medium tracking-wide text-sky-700 dark:bg-sky-950 dark:text-sky-300"
+                        title={`MCP server provided by the ${owner.name} plugin`}
+                      >
+                        Plugin · {owner.name}
+                      </span>
+                    )}
                     <span className="rounded-md bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-slate-400 dark:bg-slate-800">
                       {s.transport_kind}
                     </span>
@@ -193,21 +214,31 @@ export function ConnectorsView() {
                     />
                     <span className="relative block h-5.5 w-10 rounded-full bg-slate-300 transition peer-checked:bg-sky-500 dark:bg-slate-700 after:absolute after:left-0.5 after:top-0.5 after:h-4.5 after:w-4.5 after:rounded-full after:bg-white after:transition peer-checked:after:translate-x-4" />
                   </label>
-                  <Button
-                    variant="ghost"
-                    title="Remove"
-                    onClick={async () => {
-                      try {
-                        await api.mcpRemove(s.id);
-                        setDetailId((id) => (id === s.id ? null : id));
-                        await refreshServers();
-                      } catch (e) {
-                        toast("error", `${e}`);
-                      }
-                    }}
-                  >
-                    <Icon name="trash" className="h-4 w-4" />
-                  </Button>
+                  {owner ? (
+                    <Button
+                      variant="ghost"
+                      title="This server comes from a plugin; edit it in Plugins"
+                      onClick={() => setView("plugins")}
+                    >
+                      Edit in Plugins
+                    </Button>
+                  ) : (
+                    <Button
+                      variant="ghost"
+                      title="Remove"
+                      onClick={async () => {
+                        try {
+                          await api.mcpRemove(s.id);
+                          setDetailId((id) => (id === s.id ? null : id));
+                          await refreshServers();
+                        } catch (e) {
+                          toast("error", `${e}`);
+                        }
+                      }}
+                    >
+                      <Icon name="trash" className="h-4 w-4" />
+                    </Button>
+                  )}
                 </div>
               </div>
             );

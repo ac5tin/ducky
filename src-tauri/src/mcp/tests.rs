@@ -22,9 +22,14 @@ use tokio_util::sync::CancellationToken;
 
 use super::bridge::InteractiveBridge;
 use super::handler::DuckyClientHandler;
-use super::manager::{AuthReason, McpManager, ServerStatus};
+use super::manager::{
+    expand_placeholders, merge_servers, spawn_spec, summary_detail, AuthReason, McpManager,
+    ServerOriginKind, ServerStatus,
+};
 use crate::config::{HttpAuth, McpServerConfig, McpTransport, Store};
 use crate::events::{BackendEvent, CollectingSink};
+use crate::plugins::layout::{PluginServer, PluginTransport, RemoteKind};
+use crate::plugins::manager::{PluginIndex, PluginManager, PluginServerRef};
 
 // ---------------------------------------------------------------------------
 // Test server
@@ -344,7 +349,7 @@ async fn notify_auth_completed_wakes_waiter() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(Store::new(dir.path(), dir.path().to_path_buf()).unwrap());
     let bridge = Arc::new(InteractiveBridge::new(sink.clone(), store.clone()));
-    let manager = Arc::new(McpManager::new(store, bridge, sink));
+    let manager = Arc::new(McpManager::new(store, bridge, sink, plugins_for(dir.path())));
 
     let waiter = tokio::spawn({
         let m = manager.clone();
@@ -409,7 +414,7 @@ async fn oauth_connect_reaches_server_before_needs_auth() {
         });
     let sink = Arc::new(CollectingSink::default());
     let bridge = Arc::new(InteractiveBridge::new(sink.clone(), store.clone()));
-    let manager = McpManager::new(store, bridge, sink);
+    let manager = McpManager::new(store, bridge, sink, plugins_for(dir.path()));
 
     let status = manager.connect("oauth-server").await.unwrap();
     assert!(matches!(
@@ -455,7 +460,7 @@ async fn stdio_connect_failure_quotes_stderr_tail() {
         });
     let sink = Arc::new(CollectingSink::default());
     let bridge = Arc::new(InteractiveBridge::new(sink.clone(), store.clone()));
-    let manager = McpManager::new(store, bridge, sink);
+    let manager = McpManager::new(store, bridge, sink, plugins_for(dir.path()));
 
     let status = manager.connect("die-server").await.unwrap();
     let ServerStatus::Error { message } = status else {
@@ -486,4 +491,596 @@ fn merge_paths_puts_login_shell_first() {
         "/nvm/bin:/usr/bin:/bin"
     );
     assert_eq!(merge_paths("/nvm/bin", ""), "/nvm/bin");
+}
+
+// ---------------------------------------------------------------------------
+// Plugin server merge and launch rules (design §2/§9, rulings R4/R12)
+// ---------------------------------------------------------------------------
+
+fn stdio_config(id: &str, name: &str) -> McpServerConfig {
+    McpServerConfig {
+        id: id.into(),
+        name: name.into(),
+        transport: McpTransport::Stdio {
+            command: "npx".into(),
+            args: vec!["-y".into(), "pkg".into()],
+            env: HashMap::new(),
+        },
+        auth: HttpAuth::None,
+        enabled: true,
+        auto_start: true,
+        oauth_client_id: None,
+        oauth_redirect_port: None,
+        created_at: "now".into(),
+    }
+}
+
+fn plugin_stdio_ref(id: &str, plugin_id: &str, name: &str, cwd: Option<&str>) -> PluginServerRef {
+    PluginServerRef {
+        id: id.into(),
+        plugin_id: plugin_id.into(),
+        server: PluginServer {
+            name: name.into(),
+            transport: PluginTransport::Stdio {
+                command: "./bin/validator".into(),
+                args: vec!["--cache".into(), "${PLUGIN_DATA}/cache".into()],
+                env: BTreeMap::new(),
+                cwd: cwd.map(str::to_string),
+            },
+        },
+    }
+}
+
+fn plugin_remote_ref(id: &str, plugin_id: &str, name: &str) -> PluginServerRef {
+    PluginServerRef {
+        id: id.into(),
+        plugin_id: plugin_id.into(),
+        server: PluginServer {
+            name: name.into(),
+            transport: PluginTransport::Remote {
+                kind: RemoteKind::StreamableHttp,
+                url: "https://example.com/mcp".into(),
+                headers: BTreeMap::from([("X-Plug".to_string(), "1".to_string())]),
+            },
+        },
+    }
+}
+
+fn plugins_for(dir: &std::path::Path) -> Arc<PluginManager> {
+    PluginManager::new(dir, dir, None)
+}
+
+#[test]
+fn merge_keeps_user_servers_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let user = stdio_config("user-1", "Filesystem");
+    let merged = merge_servers(std::slice::from_ref(&user), &PluginIndex::default(), dir.path());
+    assert_eq!(merged.len(), 1);
+    let row = &merged[0];
+    assert_eq!(row.config.id, user.id);
+    assert_eq!(row.config.name, user.name);
+    assert_eq!(row.config.enabled, user.enabled);
+    assert_eq!(row.config.auto_start, user.auto_start);
+    assert!(matches!(
+        &row.config.transport,
+        McpTransport::Stdio { command, args, .. }
+            if command == "npx" && args == &["-y".to_string(), "pkg".to_string()]
+    ));
+    assert_eq!(row.origin.kind, ServerOriginKind::User);
+    assert_eq!(row.origin.plugin_id, None);
+    assert_eq!(row.origin.plugin_name, None);
+    assert!(row.launch.is_none());
+}
+
+#[test]
+fn merge_adds_enabled_plugin_servers() {
+    let dir = tempfile::tempdir().unwrap();
+    let index = PluginIndex {
+        servers: vec![plugin_stdio_ref(
+            "plugin:acme:validator",
+            "acme",
+            "validator",
+            None,
+        )],
+        ..Default::default()
+    };
+    let merged = merge_servers(&[], &index, dir.path());
+    assert_eq!(merged.len(), 1);
+    let row = &merged[0];
+    assert_eq!(row.config.id, "plugin:acme:validator");
+    assert_eq!(row.config.name, "validator");
+    assert!(row.config.enabled && row.config.auto_start);
+    assert!(matches!(row.config.auth, HttpAuth::None));
+    assert_eq!(row.origin.kind, ServerOriginKind::Plugin);
+    assert_eq!(row.origin.plugin_id.as_deref(), Some("acme"));
+    assert_eq!(row.origin.plugin_name.as_deref(), Some("acme"));
+    let launch = row.launch.as_ref().expect("plugin server must carry a launch");
+    assert_eq!(launch.root, dir.path().join("plugins/acme/package"));
+    assert_eq!(launch.data, dir.path().join("plugin-data/acme"));
+}
+
+#[test]
+fn merge_maps_remote_plugin_servers_to_http_auth_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let index = PluginIndex {
+        servers: vec![plugin_remote_ref("plugin:acme:remote", "acme", "remote")],
+        ..Default::default()
+    };
+    let merged = merge_servers(&[], &index, dir.path());
+    let row = merged.first().expect("remote plugin server merged");
+    assert!(matches!(row.config.auth, HttpAuth::None));
+    let McpTransport::Http { url, headers } = &row.config.transport else {
+        panic!("remote plugin server must map to the HTTP transport");
+    };
+    assert_eq!(url, "https://example.com/mcp");
+    assert_eq!(headers.get("X-Plug").map(String::as_str), Some("1"));
+}
+
+/// §6/§9: a plugin URL can carry a query-string token, so the row summary
+/// shows only the host; a user's own URL stays as configured.
+#[test]
+fn plugin_remote_summary_detail_shows_host_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut remote = plugin_remote_ref("plugin:acme:remote", "acme", "remote");
+    let PluginTransport::Remote { url, .. } = &mut remote.server.transport else {
+        panic!("the fixture must be a remote server");
+    };
+    *url = "https://mcp.example.com:8443/mcp?token=secret#frag".into();
+    let index = PluginIndex {
+        servers: vec![remote],
+        ..Default::default()
+    };
+    let merged = merge_servers(&[], &index, dir.path());
+    assert_eq!(summary_detail(&merged[0]), "mcp.example.com:8443");
+
+    let user = McpServerConfig {
+        id: "user-1".into(),
+        name: "User".into(),
+        transport: McpTransport::Http {
+            url: "https://example.com/mcp?token=secret".into(),
+            headers: HashMap::new(),
+        },
+        auth: HttpAuth::None,
+        enabled: true,
+        auto_start: true,
+        oauth_client_id: None,
+        oauth_redirect_port: None,
+        created_at: "now".into(),
+    };
+    let merged = merge_servers(&[user], &PluginIndex::default(), dir.path());
+    assert_eq!(
+        summary_detail(&merged[0]),
+        "https://example.com/mcp?token=secret"
+    );
+}
+
+#[test]
+fn user_server_wins_name_collision() {
+    let dir = tempfile::tempdir().unwrap();
+    let exact = PluginIndex {
+        servers: vec![plugin_stdio_ref(
+            "plugin:acme:validator",
+            "acme",
+            "validator",
+            None,
+        )],
+        ..Default::default()
+    };
+    let merged = merge_servers(&[stdio_config("user-1", "validator")], &exact, dir.path());
+    assert_eq!(merged.len(), 1, "the plugin server must be shadowed");
+    assert_eq!(merged[0].config.id, "user-1");
+    assert_eq!(merged[0].origin.kind, ServerOriginKind::User);
+
+    // the comparison is case-insensitive, like the rest of the UI's naming
+    let cased = PluginIndex {
+        servers: vec![plugin_stdio_ref(
+            "plugin:acme:validator",
+            "acme",
+            "VALIDATOR",
+            None,
+        )],
+        ..Default::default()
+    };
+    let merged = merge_servers(&[stdio_config("user-1", "validator")], &cased, dir.path());
+    assert_eq!(merged.len(), 1, "a case-different name still collides");
+    assert_eq!(merged[0].config.id, "user-1");
+}
+
+/// §9: only a user server may shadow by display name. Two plugin servers with
+/// the same name have different ids, so both must survive (nothing is logged).
+#[test]
+fn plugin_servers_do_not_shadow_each_other_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let index = PluginIndex {
+        servers: vec![
+            plugin_stdio_ref("plugin:acme:validator", "acme", "validator", None),
+            plugin_stdio_ref("plugin:beta:validator", "beta", "validator", None),
+        ],
+        ..Default::default()
+    };
+    let (merged, logged) = capture_warnings(|| merge_servers(&[], &index, dir.path()));
+    let ids: Vec<&str> = merged.iter().map(|row| row.config.id.as_str()).collect();
+    assert_eq!(ids, ["plugin:acme:validator", "plugin:beta:validator"]);
+    assert!(merged
+        .iter()
+        .all(|row| row.origin.kind == ServerOriginKind::Plugin));
+    assert!(logged.is_empty(), "nothing is shadowed: {logged}");
+}
+
+/// The user-server shadow keeps working, and the warning names both rows.
+#[test]
+fn user_server_shadow_warning_names_both_servers() {
+    let dir = tempfile::tempdir().unwrap();
+    let index = PluginIndex {
+        servers: vec![plugin_stdio_ref(
+            "plugin:acme:validator",
+            "acme",
+            "VALIDATOR",
+            None,
+        )],
+        ..Default::default()
+    };
+    let (merged, logged) = capture_warnings(|| {
+        merge_servers(&[stdio_config("user-1", "validator")], &index, dir.path())
+    });
+    assert_eq!(merged.len(), 1, "a user server still shadows a plugin server");
+    assert_eq!(merged[0].config.id, "user-1");
+    assert!(
+        logged.contains("plugin:acme:validator"),
+        "the warning must name the shadowed plugin server: {logged}"
+    );
+    assert!(
+        logged.contains("user-1"),
+        "the warning must name the shadowing user server: {logged}"
+    );
+}
+
+/// Capture `tracing` output produced while `f` runs (WARN and above).
+fn capture_warnings<T>(f: impl FnOnce() -> T) -> (T, String) {
+    struct Buffer(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Buffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let sink = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(std::sync::Mutex::new(Buffer(sink.clone())))
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .finish();
+    let value = tracing::subscriber::with_default(subscriber, f);
+    let logged = String::from_utf8(sink.lock().unwrap().clone()).unwrap_or_default();
+    (value, logged)
+}
+
+#[test]
+fn chat_allow_list_still_filters_plugin_ids() {
+    let meta: crate::config::ConversationMeta = serde_json::from_value(serde_json::json!({
+        "id": "c1",
+        "title": "t",
+        "provider_id": "p",
+        "model": "m",
+        "mcp_ids": ["plugin:acme:validator"],
+        "created_at": "now",
+        "updated_at": "now"
+    }))
+    .unwrap();
+    assert!(meta.allows_mcp("plugin:acme:validator"));
+    assert!(!meta.allows_mcp("plugin:acme:other"));
+    assert!(!meta.allows_mcp("user-1"));
+}
+
+#[test]
+fn expand_placeholders_single_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("${PLUGIN_DATA}").join("plugin");
+    std::fs::create_dir_all(&root).unwrap();
+    let data = dir.path().join("data");
+
+    let expanded = expand_placeholders("${PLUGIN_ROOT}/x", &root, &data);
+    assert_eq!(expanded, format!("{}/x", root.display()));
+    // The replacement text itself carries ${PLUGIN_DATA}; it must not be
+    // rescanned, so the literal survives inside the expanded value.
+    assert!(
+        expanded.contains("${PLUGIN_DATA}"),
+        "introduced text must never be rescanned: {expanded}"
+    );
+
+    let both = expand_placeholders("${PLUGIN_ROOT}-${PLUGIN_DATA}", &root, &data);
+    assert_eq!(both, format!("{}-{}", root.display(), data.display()));
+}
+
+#[test]
+fn expand_leaves_unknown_placeholders_literal() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    let data = dir.path().join("data");
+    assert_eq!(expand_placeholders("${OTHER}/x", &root, &data), "${OTHER}/x");
+    assert_eq!(
+        expand_placeholders("${PLUGIN_ROOT", &root, &data),
+        "${PLUGIN_ROOT"
+    );
+    assert_eq!(
+        expand_placeholders("$PLUGIN_ROOT", &root, &data),
+        "$PLUGIN_ROOT"
+    );
+}
+
+#[test]
+fn expand_does_not_touch_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let data = root.join("plugin-data").join("acme");
+    let spec = spawn_spec(
+        "./bin/${PLUGIN_DATA}",
+        &[],
+        &BTreeMap::new(),
+        None,
+        &root,
+        &data,
+    )
+    .unwrap();
+    assert_eq!(
+        spec.program,
+        root.join("bin/${PLUGIN_DATA}"),
+        "placeholders in `command` stay literal"
+    );
+}
+
+#[test]
+fn stdio_defaults_cwd_to_plugin_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let data = root.join("plugin-data").join("acme");
+    let spec = spawn_spec("./bin/tool", &[], &BTreeMap::new(), None, &root, &data).unwrap();
+    assert_eq!(spec.cwd, root);
+    assert!(data.is_dir(), "spawn_spec must create PLUGIN_DATA");
+}
+
+#[test]
+fn stdio_rejects_reserved_env_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let data = root.join("plugin-data").join("acme");
+    for key in ["PLUGIN_ROOT", "PLUGIN_DATA"] {
+        let env = BTreeMap::from([(key.to_string(), "/tmp/evil".to_string())]);
+        let err = spawn_spec("./bin/tool", &[], &env, None, &root, &data)
+            .expect_err("a server may not declare a reserved variable");
+        assert!(err.contains(key), "the error must name {key}: {err}");
+    }
+}
+
+/// Ruling R8: the reserved-name rule is case-insensitive on every platform,
+/// so the Windows-cased key is rejected on Linux too.
+#[test]
+fn windows_env_key_case_is_reserved() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let data = root.join("plugin-data").join("acme");
+    for key in ["plugin_root", "Plugin_Data"] {
+        let env = BTreeMap::from([(key.to_string(), "/tmp/evil".to_string())]);
+        let err = spawn_spec("./bin/tool", &[], &env, None, &root, &data)
+            .expect_err("a differently-cased reserved name is still reserved");
+        assert!(err.contains(key), "the error must name {key}: {err}");
+    }
+}
+
+#[test]
+fn plugin_data_dir_created_before_spawn() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let data = root.join("plugin-data").join("acme");
+    let spec = spawn_spec(
+        "./bin/tool",
+        &[],
+        &BTreeMap::new(),
+        Some("${PLUGIN_DATA}/sub"),
+        &root,
+        &data,
+    )
+    .unwrap();
+    assert!(data.is_dir(), "PLUGIN_DATA must exist after spawn_spec");
+    assert_eq!(spec.cwd, data.join("sub"));
+    assert!(
+        spec.cwd.is_dir(),
+        "a ${{PLUGIN_DATA}}-rooted cwd must exist after spawn_spec"
+    );
+}
+
+/// Design §2: a `./` cwd resolves against the plugin root, exactly like a
+/// `./` program. It must not be joined to the process working directory.
+#[test]
+fn plugin_cwd_relative_resolves_inside_the_plugin_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let cache = root.join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    let data = root.join("plugin-data").join("acme");
+    let spec = spawn_spec(
+        "./bin/tool",
+        &[],
+        &BTreeMap::new(),
+        Some("./cache"),
+        &root,
+        &data,
+    )
+    .unwrap();
+    assert_eq!(
+        spec.cwd, cache,
+        "`./cache` must resolve against the plugin root"
+    );
+}
+
+#[test]
+fn plugin_cwd_relative_escape_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    std::fs::create_dir_all(root.join("cache")).unwrap();
+    let data = root.join("plugin-data").join("acme");
+    let err = spawn_spec(
+        "./bin/tool",
+        &[],
+        &BTreeMap::new(),
+        Some("./../outside"),
+        &root,
+        &data,
+    )
+    .expect_err("a `./..` cwd must not escape the plugin root");
+    assert!(err.contains("cwd"), "the error must name the cwd: {err}");
+}
+
+#[test]
+fn claude_alias_expanded() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    let data = dir.path().join("data");
+    // layout.rs normalises the claude/zcode aliases at parse time; raw alias
+    // text that still reaches the spawn layer stays literal.
+    assert_eq!(
+        expand_placeholders("${CLAUDE_PLUGIN_ROOT}/x", &root, &data),
+        "${CLAUDE_PLUGIN_ROOT}/x"
+    );
+}
+
+#[test]
+fn spawn_injects_reserved_env_last() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let data = root.join("plugin-data").join("acme");
+    let env = BTreeMap::from([
+        ("FOO".to_string(), "${PLUGIN_ROOT}/x".to_string()),
+        ("BAR".to_string(), "${PLUGIN_DATA}/y".to_string()),
+    ]);
+    let spec = spawn_spec("./bin/tool", &[], &env, None, &root, &data).unwrap();
+    assert_eq!(
+        spec.env.get(spec.env.len() - 2),
+        Some(&("PLUGIN_ROOT".to_string(), root.display().to_string()))
+    );
+    assert_eq!(
+        spec.env.last(),
+        Some(&("PLUGIN_DATA".to_string(), data.display().to_string()))
+    );
+    assert_eq!(
+        spec.env.iter().find(|(key, _)| key == "FOO").map(|(_, value)| value.as_str()),
+        Some(format!("{}/x", root.display()).as_str())
+    );
+    assert_eq!(
+        spec.env.iter().find(|(key, _)| key == "BAR").map(|(_, value)| value.as_str()),
+        Some(format!("{}/y", data.display()).as_str())
+    );
+}
+
+/// Ruling R12: the parse-time `cwd` check in `layout.rs` is syntactic only.
+/// A symlink planted inside the data directory that points outside it defeats
+/// a syntactic check; the canonicalized containment check must reject it.
+#[cfg(unix)]
+#[test]
+fn plugin_cwd_symlink_outside_data_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let data = root.join("plugin-data").join("acme");
+    std::fs::create_dir_all(&data).unwrap();
+    let outside = root.join("package-outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, data.join("escape")).unwrap();
+
+    let err = spawn_spec(
+        "./bin/tool",
+        &[],
+        &BTreeMap::new(),
+        Some("${PLUGIN_DATA}/escape"),
+        &root,
+        &data,
+    )
+    .expect_err("a symlink out of the data directory must be rejected");
+    assert!(err.contains("cwd"), "the error must name the cwd: {err}");
+}
+
+/// A user server keeps today's spawn path: configured working directory,
+/// `~` expansion in args, and no plugin variables injected.
+#[cfg(unix)] // spawns `sh`
+#[tokio::test]
+async fn user_server_spawn_keeps_working_dir_tilde_and_no_plugin_env() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let store = Arc::new(Store::new(dir.path(), home.clone()).unwrap());
+    {
+        let mut cfg = store.config.lock().unwrap();
+        cfg.settings.working_dir = Some(work.display().to_string());
+        cfg.mcp_servers.push(McpServerConfig {
+            id: "user-echo".into(),
+            name: "User Echo".into(),
+            transport: McpTransport::Stdio {
+                command: "sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "printf 'cwd=%s\\narg=%s\\nroot=%s\\n' \"$(pwd -P)\" \"$1\" \"${PLUGIN_ROOT-unset}\" 1>&2; exit 1".into(),
+                    "sh".into(),
+                    "~/sentinel".into(),
+                ],
+                env: HashMap::new(),
+            },
+            auth: HttpAuth::None,
+            enabled: true,
+            auto_start: true,
+            oauth_client_id: None,
+            oauth_redirect_port: None,
+            created_at: "now".into(),
+        });
+    }
+    let sink = Arc::new(CollectingSink::default());
+    let bridge = Arc::new(InteractiveBridge::new(sink.clone(), store.clone()));
+    let manager = McpManager::new(store, bridge, sink, plugins_for(dir.path()));
+
+    let status = manager.connect("user-echo").await.unwrap();
+    let ServerStatus::Error { message } = status else {
+        panic!("expected the immediately-exiting server to error, got {status:?}")
+    };
+    assert!(
+        message.contains(&format!("cwd={}", work.display())),
+        "the user working dir must be used: {message}"
+    );
+    assert!(
+        message.contains(&format!("arg={}", home.join("sentinel").display())),
+        "`~` in args must still expand to the home dir: {message}"
+    );
+    assert!(
+        message.contains("root=unset"),
+        "user servers must not get plugin variables: {message}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_cmd_script_command_resolves() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("tool.cmd"), "@echo off\r\n").unwrap();
+    let data = root.join("plugin-data").join("acme");
+    let spec = spawn_spec(
+        "./bin/tool.cmd",
+        &["--flag".into(), "value".into()],
+        &BTreeMap::new(),
+        None,
+        &root,
+        &data,
+    )
+    .unwrap();
+    assert!(
+        spec.program.ends_with("tool.cmd"),
+        "the .cmd program must resolve inside the plugin root: {:?}",
+        spec.program
+    );
+    assert_eq!(spec.args, vec!["--flag".to_string(), "value".to_string()]);
 }

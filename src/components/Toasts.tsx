@@ -22,6 +22,18 @@ export function Toasts() {
             className={`mt-0.5 h-4 w-4 shrink-0 ${t.kind === "error" ? "text-rose-500" : "text-emerald-500"}`}
           />
           <span className="flex-1 leading-snug">{t.text}</span>
+          {t.action && (
+            <button
+              className="shrink-0 rounded-md border border-current px-2 py-0.5 text-xs font-medium opacity-80 transition hover:opacity-100"
+              onClick={() => {
+                const run = t.action?.run;
+                dismiss(t.id);
+                run?.();
+              }}
+            >
+              {t.action.label}
+            </button>
+          )}
           <button
             className="opacity-50 transition hover:opacity-100"
             aria-label="Dismiss"

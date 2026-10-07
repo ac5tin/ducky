@@ -7,6 +7,7 @@ import {
   SLASH_COMMANDS,
   expandInitPrompt,
   filterCommands,
+  formatSkills,
   parseSlashCommand,
 } from "./slashCommands.ts";
 
@@ -50,6 +51,61 @@ test("parseSlashCommand leaves normal messages and paths alone", () => {
   assert.equal(parseSlashCommand("/compact\nsome note")?.name, "compact");
 });
 
+test("slash_skills_parses", () => {
+  assert.deepEqual(parseSlashCommand("/skills"), {
+    name: "skills",
+    args: "",
+    unknown: false,
+  });
+  assert.deepEqual(parseSlashCommand("/skills now"), {
+    name: "skills",
+    args: "now",
+    unknown: false,
+  });
+  assert.equal(
+    SLASH_COMMANDS.find((c) => c.name === "skills")?.description,
+    "List enabled skills",
+  );
+});
+
+test("formatSkills lists every root with provenance and shadowing", () => {
+  const text = formatSkills([
+    {
+      id: "user:demo",
+      name: "demo",
+      description: "user demo",
+      origin: "user",
+      shadowed: null,
+    },
+    {
+      id: "plugin:acme:demo",
+      name: "demo",
+      description: "plugin demo",
+      origin: "plugin: Acme",
+      shadowed: "user:demo",
+    },
+    {
+      id: "agents:report",
+      name: "report",
+      description: "write a report",
+      origin: "agents",
+      shadowed: null,
+    },
+  ]);
+
+  assert.ok(text.includes("`user:demo`"), text);
+  assert.ok(text.includes("(user)"), text);
+  assert.ok(text.includes("plugin:acme:demo"), text);
+  assert.ok(text.includes("(plugin: Acme)"), text);
+  assert.ok(text.includes("[shadowed by user:demo]"), text);
+  assert.ok(text.includes("agents:report"), text);
+  assert.ok(text.includes("write a report"), text);
+});
+
+test("formatSkills says so when nothing is enabled", () => {
+  assert.equal(formatSkills([]), "No skills are installed and enabled.");
+});
+
 test("filterCommands matches by name prefix", () => {
   assert.deepEqual(
     filterCommands("/").map((c) => c.name),
@@ -62,6 +118,10 @@ test("filterCommands matches by name prefix", () => {
   assert.deepEqual(
     filterCommands("/in").map((c) => c.name),
     ["init"],
+  );
+  assert.deepEqual(
+    filterCommands("/sk").map((c) => c.name),
+    ["skills"],
   );
   assert.deepEqual(filterCommands("/zzz"), []);
 });

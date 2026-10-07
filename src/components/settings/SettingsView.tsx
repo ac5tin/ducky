@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { useStore } from "../../store";
 import * as api from "../../api";
@@ -8,6 +8,7 @@ import type {
   SubagentConfig,
 } from "../../types";
 import { MODE_META, MODE_ORDER } from "../../modes";
+import { pluginSubagentShadowed } from "../../subagents";
 import { Button, Field, Modal, inputClass } from "../modals/Modal";
 import { Icon } from "../icons";
 import {
@@ -326,6 +327,14 @@ export function SettingsView() {
           <SubagentsSection />
         </Section>
 
+        {/* Plugins */}
+        <Section
+          title="Plugins"
+          description="Plugins add skills, subagents and MCP servers. A plugin stays off until you enable it, and each of its MCP servers starts only when you allow it."
+        >
+          <PluginsSection />
+        </Section>
+
         {/* Working directory */}
         <Section
           title="Working directory"
@@ -599,6 +608,104 @@ function Section({
       )}
       {description ? children : <div className="mt-4">{children}</div>}
     </section>
+  );
+}
+
+function PluginsSection() {
+  const config = useStore((s) => s.config);
+  const refreshConfig = useStore((s) => s.refreshConfig);
+  const toast = useStore((s) => s.toast);
+
+  if (!config) return null;
+  const plugins = config.settings.plugins;
+
+  // `settings_set` replaces the whole `plugins` object, so each write sends
+  // the current value with the one changed field.
+  const patchPlugins = (p: Partial<typeof plugins>) =>
+    api
+      .settingsSet({ plugins: { ...plugins, ...p } })
+      .then(refreshConfig)
+      .catch((err) => toast("error", `${err}`));
+
+  return (
+    <div className="space-y-4">
+      <label className="flex items-center gap-2 text-sm">
+        <input
+          type="checkbox"
+          checked={plugins.skills_enabled}
+          onChange={(e) =>
+            void patchPlugins({ skills_enabled: e.target.checked })
+          }
+        />
+        Offer skills to the AI
+      </label>
+      <div className="flex flex-wrap gap-6">
+        <div>
+          <div className="mb-1.5 text-sm font-medium">New plugins update</div>
+          <select
+            className={inputClass + " w-64"}
+            value={plugins.policy_default}
+            onChange={(e) =>
+              void patchPlugins({
+                policy_default: e.target
+                  .value as typeof plugins.policy_default,
+              })
+            }
+          >
+            <option value="content">
+              Match the content — no MCP servers means automatic
+            </option>
+            <option value="auto">Automatically</option>
+            <option value="manual">Only when I ask</option>
+          </select>
+        </div>
+        <div>
+          <div className="mb-1.5 text-sm font-medium">Refresh marketplaces</div>
+          <select
+            className={inputClass + " w-44"}
+            value={String(plugins.marketplace_refresh_hours)}
+            onChange={(e) =>
+              void patchPlugins({
+                marketplace_refresh_hours: Number(e.target.value),
+              })
+            }
+          >
+            <option value="0">Never</option>
+            <option value="1">Every hour</option>
+            <option value="6">Every 6 hours</option>
+            <option value="24">Every day</option>
+          </select>
+        </div>
+        <div>
+          <div className="mb-1.5 text-sm font-medium">
+            Check for plugin updates
+          </div>
+          <select
+            className={inputClass + " w-44"}
+            value={String(plugins.update_check_hours)}
+            onChange={(e) =>
+              void patchPlugins({
+                update_check_hours: Number(e.target.value),
+              })
+            }
+          >
+            <option value="0">Never</option>
+            <option value="1">Every hour</option>
+            <option value="6">Every 6 hours</option>
+            <option value="24">Every day</option>
+          </select>
+        </div>
+      </div>
+      <Button
+        variant="secondary"
+        onClick={() =>
+          api.pluginOpenRootFolder().catch((e) => toast("error", `${e}`))
+        }
+      >
+        <Icon name="folder" className="h-4 w-4" />
+        Open plugins folder
+      </Button>
+    </div>
   );
 }
 
@@ -1206,9 +1313,17 @@ function SystemPromptSection() {
 function SubagentsSection() {
   const config = useStore((s) => s.config);
   const refreshConfig = useStore((s) => s.refreshConfig);
+  const plugins = useStore((s) => s.plugins);
+  const refreshPlugins = useStore((s) => s.refreshPlugins);
   const toast = useStore((s) => s.toast);
   const [editing, setEditing] = useState<SubagentConfig | null>(null);
   const [adding, setAdding] = useState(false);
+
+  // plugin contributions live outside the config payload, so this section
+  // loads them itself (the plugins view refreshes its own copy)
+  useEffect(() => {
+    void refreshPlugins().catch(() => undefined);
+  }, [refreshPlugins]);
 
   if (!config) return null;
 
@@ -1218,11 +1333,32 @@ function SubagentsSection() {
   const missingDefaults = DEFAULT_SUBAGENT_NAMES.filter(
     (n) => !present.has(n.toLowerCase()),
   );
+  const pluginSubagents = plugins
+    .filter((p) => p.enabled)
+    .flatMap((p) =>
+      (p.subagents ?? []).map((sub) => ({
+        ...sub,
+        pluginId: p.id,
+        pluginName: p.name,
+        shadowed: pluginSubagentShadowed(present, sub.slug),
+      })),
+    );
 
   const remove = async (id: string) => {
     try {
       await api.subagentRemove(id);
       await refreshConfig();
+    } catch (e) {
+      toast("error", `${e}`);
+    }
+  };
+
+  const clone = async (pluginId: string, name: string) => {
+    try {
+      const { warnings } = await api.subagentCloneFromPlugin(pluginId, name);
+      await refreshConfig();
+      const dropped = warnings.length > 0 ? ` ${warnings.join("; ")}` : "";
+      toast("success", `Cloned ${name} to your subagents.${dropped}`);
     } catch (e) {
       toast("error", `${e}`);
     }
@@ -1284,6 +1420,48 @@ function SubagentsSection() {
           </div>
         );
       })}
+      {pluginSubagents.length > 0 && (
+        <div className="pt-1 text-xs font-medium tracking-wide text-slate-400 uppercase">
+          From plugins
+        </div>
+      )}
+      {pluginSubagents.map((sub) => (
+        <div
+          key={`${sub.pluginId}:${sub.name}`}
+          className="flex items-center justify-between gap-3 rounded-xl border border-dashed border-slate-200 p-3.5 dark:border-slate-700"
+        >
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="font-semibold">{sub.name}</span>
+              <span className={chipClass()}>Plugin</span>
+              {sub.shadowed && (
+                <span className={chipClass()}>Shadowed by yours</span>
+              )}
+            </div>
+            <div className="truncate text-xs text-slate-400">
+              {sub.description}
+            </div>
+            <div className="mt-1.5 text-xs text-slate-400">
+              From {sub.pluginName}
+            </div>
+          </div>
+          <div className="flex shrink-0 gap-1.5">
+            <Button
+              variant="secondary"
+              disabled
+              title="Plugin subagents are read-only — clone one to edit it"
+            >
+              Edit
+            </Button>
+            <Button
+              variant="secondary"
+              onClick={() => void clone(sub.pluginId, sub.name)}
+            >
+              Clone to my subagents
+            </Button>
+          </div>
+        </div>
+      ))}
       <div className="flex gap-2">
         <Button variant="secondary" onClick={() => setAdding(true)}>
           <Icon name="plus" className="h-4 w-4" />

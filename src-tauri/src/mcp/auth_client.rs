@@ -101,7 +101,7 @@ impl AuthHttpClient {
             cfg,
             store,
             notify,
-            inner: reqwest::Client::new(),
+            inner: http_client(),
         }
     }
 
@@ -215,6 +215,34 @@ fn parse_json_rpc_error(body: &str) -> Option<ServerJsonRpcMessage> {
         Ok(message @ JsonRpcMessage::Error(_)) => Some(message),
         _ => None,
     }
+}
+
+/// The inner HTTP client for MCP requests.
+///
+/// Design §7.2.1: configured headers must never be forwarded to a different
+/// origin through a redirect. reqwest strips only `Authorization`, cookies
+/// and a few proxy headers on a cross-origin hop, so a configured header such
+/// as `X-Api-Key` would otherwise survive one. Same-origin redirects keep
+/// working; every hop that changes scheme, host or port is refused.
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            let same_origin = attempt.previous().first().is_some_and(|origin| {
+                origin.scheme() == attempt.url().scheme()
+                    && origin.host_str() == attempt.url().host_str()
+                    && origin.port_or_known_default() == attempt.url().port_or_known_default()
+            });
+            if same_origin {
+                // A custom policy replaces reqwest's default 10-hop cap, so
+                // delegate the same-origin case to it: a redirect loop must
+                // stop instead of following forever.
+                reqwest::redirect::Policy::limited(10).redirect(attempt)
+            } else {
+                attempt.stop()
+            }
+        }))
+        .build()
+        .expect("building the MCP HTTP client cannot fail")
 }
 
 /// Same as rmcp's reqwest `post_message`, except Accept lists JSON first.
@@ -413,6 +441,178 @@ mod tests {
     use super::*;
     use crate::config::McpTransport;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn client_for(url: &str, dir: &std::path::Path) -> AuthHttpClient {
+        let store = Arc::new(Store::new(dir, dir.to_path_buf()).unwrap());
+        let cfg = McpServerConfig {
+            id: "t".into(),
+            name: "t".into(),
+            transport: McpTransport::Http {
+                url: url.to_string(),
+                headers: HashMap::new(),
+            },
+            auth: HttpAuth::None,
+            enabled: true,
+            auto_start: true,
+            oauth_client_id: None,
+            oauth_redirect_port: None,
+            created_at: "now".into(),
+        };
+        AuthHttpClient::new(cfg, store, Arc::new(|_, _| {}))
+    }
+
+    fn x_tenant_headers() -> HashMap<HeaderName, HeaderValue> {
+        HashMap::from([(
+            HeaderName::from_static("x-tenant"),
+            HeaderValue::from_static("acme"),
+        )])
+    }
+
+    async fn read_request(sock: &mut tokio::net::TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 1024];
+        loop {
+            let n = sock.read(&mut tmp).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 32_000 {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// Design §7.2.1: a configured header must never reach a different origin.
+    /// reqwest strips only `Authorization` and cookies on a cross-origin hop,
+    /// so a custom header such as `X-Tenant` would survive one; this client
+    /// refuses the hop outright - the second origin gets no request at all.
+    #[tokio::test]
+    async fn cross_origin_redirect_never_reaches_the_second_origin() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second_addr = second.local_addr().unwrap();
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = second.accept().await {
+                let _ = tx.send(read_request(&mut sock).await);
+            }
+        });
+
+        let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_addr = first.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = first.accept().await.unwrap();
+            let _ = read_request(&mut sock).await;
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{second_addr}/mcp\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("http://{first_addr}/mcp");
+        let client = client_for(&url, dir.path());
+        let message: ClientJsonRpcMessage =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#).unwrap();
+        let result = client
+            .post_message(url.into(), message, None, None, x_tenant_headers())
+            .await;
+        assert!(
+            result.is_err(),
+            "a cross-origin redirect must not be followed: {result:?}"
+        );
+        if let Ok(Ok(request)) =
+            tokio::time::timeout(std::time::Duration::from_millis(500), &mut rx).await
+        {
+            panic!(
+                "the redirect target received a request, so `x-tenant` crossed origins:\n{request}"
+            );
+        }
+    }
+
+    /// A same-origin redirect still works and still carries the configured
+    /// headers (design §7.2.1 keeps same-origin redirects).
+    #[tokio::test]
+    async fn same_origin_redirect_keeps_configured_headers() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let _ = read_request(&mut sock).await;
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{addr}/mcp-2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            sock.write_all(response.as_bytes()).await.unwrap();
+
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut sock).await;
+            let body = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = tx.send(request);
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("http://{addr}/mcp");
+        let client = client_for(&url, dir.path());
+        let message: ClientJsonRpcMessage =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#).unwrap();
+        client
+            .post_message(url.into(), message, None, None, x_tenant_headers())
+            .await
+            .expect("a same-origin redirect must still be followed");
+        let request = tokio::time::timeout(std::time::Duration::from_secs(1), rx)
+            .await
+            .expect("the redirect target must be reached")
+            .expect("the request must be captured");
+        assert!(
+            request
+                .lines()
+                .any(|line| line.to_ascii_lowercase().starts_with("x-tenant:")),
+            "the configured header must survive a same-origin redirect:\n{request}"
+        );
+    }
+
+    /// A same-origin redirect loop must hit reqwest's 10-hop cap and fail
+    /// closed; without the cap the request would follow forever.
+    #[tokio::test]
+    async fn same_origin_redirect_loop_stops_at_the_hop_cap() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let _ = read_request(&mut sock).await;
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://{addr}/mcp\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let url = format!("http://{addr}/mcp");
+        let client = client_for(&url, dir.path());
+        let message: ClientJsonRpcMessage =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#).unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.post_message(url.into(), message, None, None, x_tenant_headers()),
+        )
+        .await
+        .expect("a same-origin redirect loop must hit the hop cap, not hang");
+        assert!(
+            result.is_err(),
+            "exceeding the hop cap must surface as an error: {result:?}"
+        );
+    }
 
     #[tokio::test]
     async fn post_accept_lists_json_before_event_stream() {

@@ -101,3 +101,18 @@ export function applySubagentDeltas(
   });
   return changed ? next : items;
 }
+
+/** Whether a user definition shadows a plugin subagent for the model.
+ * `merge_subagent_defs` compares the user's trimmed name with the plugin
+ * definition's slug, never with the plugin's display name, so the badge and
+ * the registry cannot disagree. `userNames` may be pre-lowercased. */
+export function pluginSubagentShadowed(
+  userNames: Iterable<string>,
+  slug: string,
+): boolean {
+  const key = slug.trim().toLowerCase();
+  for (const name of userNames) {
+    if (name.trim().toLowerCase() === key) return true;
+  }
+  return false;
+}

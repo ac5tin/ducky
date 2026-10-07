@@ -83,6 +83,39 @@ fn tool_allowed(allow: &[String], server_id: &str, qualified_name: &str) -> bool
     })
 }
 
+/// Merge the user's subagent definitions with the plugin-provided ones:
+/// user definitions first, plugin definitions after. The first definition with
+/// a name is the one `ducky__subagent` resolves, so a user definition wins a
+/// name collision; the shadowed plugin definition stays listed but is
+/// reported. Returns the registry and one diagnostic per shadowed plugin
+/// subagent.
+pub(crate) fn merge_subagent_defs(
+    mut user: Vec<crate::config::SubagentConfig>,
+    plugin: Vec<crate::config::SubagentConfig>,
+) -> (
+    Vec<crate::config::SubagentConfig>,
+    Vec<crate::plugins::Diagnostic>,
+) {
+    let mut diagnostics = Vec::new();
+    for def in plugin {
+        if let Some(winner) = user
+            .iter()
+            .find(|known| known.name.trim().eq_ignore_ascii_case(def.name.trim()))
+        {
+            diagnostics.push(crate::plugins::Diagnostic {
+                level: crate::plugins::DiagLevel::Warning,
+                target: def.id.clone(),
+                message: format!(
+                    "plugin subagent `{}` is shadowed by `{}` with the same name",
+                    def.id, winner.id
+                ),
+            });
+        }
+        user.push(def);
+    }
+    (user, diagnostics)
+}
+
 /// Whether a tool may be offered to the model — and may run — in this mode.
 /// The same predicate filters the tool list and gates execution, so a forced
 /// call can never do what the list would not offer.
@@ -301,6 +334,7 @@ pub(crate) fn system_message(
     scope: &RunScope,
     main_prompt: &str,
     mode: AgentMode,
+    skills_block: Option<&str>,
 ) -> Msg {
     let grounding = format!(
         "Working directory: {}. Resolve relative file paths the user mentions \
@@ -318,6 +352,10 @@ pub(crate) fn system_message(
             if !prompt.is_empty() {
                 text.push_str("\n\n");
                 text.push_str(prompt);
+            }
+            if let Some(block) = skills_block {
+                text.push_str("\n\n");
+                text.push_str(block);
             }
             if let Some(mode_text) = mode_prompt(mode, scope) {
                 text.push_str("\n\n");
@@ -350,6 +388,10 @@ pub(crate) fn system_message(
                         tools.join(", ")
                     ));
                 }
+            }
+            if let Some(block) = skills_block {
+                text.push_str("\n\n");
+                text.push_str(block);
             }
             if let Some(mode_text) = mode_prompt(mode, scope) {
                 text.push_str("\n\n");
@@ -470,6 +512,48 @@ impl Agent {
         if let Ok(parsed) = serde_json::from_value::<BackendEvent>(event) {
             self.sink.emit(parsed);
         }
+    }
+
+    /// The live subagent registry: the user's definitions first, then the
+    /// enabled plugins' ones, rebuilt on every call so an enable/disable or a
+    /// config edit applies mid-turn. Every mapping and shadowing diagnostic is
+    /// logged — the agent has no UI channel for them.
+    fn subagent_registry(&self) -> Vec<crate::config::SubagentConfig> {
+        let user = self.store.config.lock().unwrap().subagents.clone();
+        let builtin_tools: Vec<String> = crate::builtin::tools()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        let mcp_tools: Vec<String> = self
+            .manager
+            .aggregated_tools()
+            .iter()
+            .map(|t| t.qualified_name.clone())
+            .collect();
+        let (plugin, diagnostics) = self
+            .manager
+            .plugins()
+            .resolved_subagents(&builtin_tools, &mcp_tools);
+        let (registry, shadowed) = merge_subagent_defs(user, plugin);
+        for diag in diagnostics.iter().chain(shadowed.iter()) {
+            tracing::warn!(subagent = %diag.target, "plugin subagent: {}", diag.message);
+        }
+        registry
+    }
+
+    /// The skills visible to this run, resolved from the plugin index and the
+    /// three filesystem roots. Read fresh on every call so a root edit or an
+    /// enable/disable applies mid-turn.
+    fn resolved_skills(&self, cwd: &std::path::Path) -> Vec<crate::plugins::skills::ResolvedSkill> {
+        let enabled = self
+            .store
+            .config
+            .lock()
+            .unwrap()
+            .settings
+            .plugins
+            .skills_enabled;
+        self.manager.plugins().resolved_skills(cwd, enabled)
     }
 
     /// Stream one text chunk to wherever this run's output goes: the
@@ -806,11 +890,16 @@ impl Agent {
                 cfg.settings.system_prompt.clone(),
             )
         };
+        let skills_block = crate::plugins::skills::prompt_block(
+            &self.resolved_skills(&cwd),
+            crate::plugins::skills::PROMPT_CAP,
+        );
         let executor_system = match system_message(
             &cwd,
             scope,
             &main_prompt,
             self.effective_mode(conversation_id),
+            skills_block.as_deref(),
         ) {
             Msg::System { text } => text,
             _ => unreachable!("system_message always builds a system message"),
@@ -1154,10 +1243,22 @@ impl Agent {
                     parameters: t.input_schema.clone(),
                 })
                 .collect();
+            let skills_enabled = self
+                .store
+                .config
+                .lock()
+                .unwrap()
+                .settings
+                .plugins
+                .skills_enabled;
             let mut builtin_defs = crate::builtin::tool_defs();
+            // the master switch hides the skill tools as well as the block
+            if !skills_enabled {
+                builtin_defs.retain(|t| !crate::builtin::skills::is_skill_tool(&t.name));
+            }
             // With configured agent types the subagent tool gains an `agent`
             // enum describing them; with none it stays the generic static def.
-            let subagent_defs = self.store.config.lock().unwrap().subagents.clone();
+            let subagent_defs = self.subagent_registry();
             if !subagent_defs.is_empty() {
                 builtin_defs.retain(|t| t.name != crate::builtin::SUBAGENT);
                 builtin_defs.push(crate::builtin::subagent_tool_def(&subagent_defs));
@@ -1190,13 +1291,23 @@ impl Agent {
                     cfg.settings.system_prompt.clone(),
                 )
             };
+            // the skills block is rebuilt each round, like the rest of the
+            // system message, so a plugin toggle or a new skill shows up
+            // without restarting the app
+            let skills_block = crate::plugins::skills::prompt_block(
+                &self.resolved_skills(&cwd),
+                crate::plugins::skills::PROMPT_CAP,
+            );
             let mut snapshot = history.clone();
             // A cancelled turn (or a crash between a call and its result)
             // leaves an assistant `tool_call` with no result, which every
             // provider rejects. Strip the snapshot, never `history` —
             // `run_turn` persists that copy as the transcript's record.
             crate::providers::strip_unanswered_tool_calls(&mut snapshot);
-            snapshot.insert(0, system_message(&cwd, scope, &main_prompt, mode));
+            snapshot.insert(
+                0,
+                system_message(&cwd, scope, &main_prompt, mode, skills_block.as_deref()),
+            );
             // A message that references an earlier chat carries an id token;
             // the model only sees the token, so remind it that the history is
             // not loaded and how to read it. In-memory only: never persisted.
@@ -1634,9 +1745,8 @@ impl Agent {
             None => (crate::builtin::DEFAULT_SUBAGENT_NAME, false),
         };
         let spec = {
-            let cfg = self.store.config.lock().unwrap();
-            match cfg
-                .subagents
+            let defs = self.subagent_registry();
+            match defs
                 .iter()
                 .find(|s| s.name.trim().eq_ignore_ascii_case(lookup_name))
                 .cloned()
@@ -1644,8 +1754,7 @@ impl Agent {
                 Some(def) => Some(SubagentSpec::from(def)),
                 None if explicit => {
                     let available: Vec<String> =
-                        cfg.subagents.iter().map(|s| s.name.clone()).collect();
-                    drop(cfg);
+                        defs.iter().map(|s| s.name.clone()).collect();
                     let msg = if available.is_empty() {
                         "no subagent types are configured; omit `agent` to spawn a generic \
                          subagent"
@@ -2110,6 +2219,17 @@ impl Agent {
                     &self.store,
                     conversation_id,
                     &call.arguments,
+                )
+            } else if crate::builtin::skills::is_skill_tool(&call.name) {
+                // the skill tools need the resolved list, not a cwd
+                let cwd = {
+                    let cfg = self.store.config.lock().unwrap();
+                    cfg.settings.effective_working_dir(&self.store.home_dir)
+                };
+                crate::builtin::skills::execute(
+                    &call.name,
+                    &call.arguments,
+                    &self.resolved_skills(&cwd),
                 )
             } else {
                 let cwd = {

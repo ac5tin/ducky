@@ -340,7 +340,13 @@ fn test_agent_full(
     }
     let sink = Arc::new(CollectingSink::default());
     let bridge = Arc::new(InteractiveBridge::new(sink.clone(), store.clone()));
-    let manager = Arc::new(McpManager::new(store.clone(), bridge.clone(), sink.clone()));
+    let plugins = crate::plugins::manager::PluginManager::new(&dir, &dir, None);
+    let manager = Arc::new(McpManager::new(
+        store.clone(),
+        bridge.clone(),
+        sink.clone(),
+        plugins,
+    ));
     let agent = Arc::new(Agent {
         store: store.clone(),
         manager,
@@ -2611,5 +2617,119 @@ async fn the_loop_auto_compacts_before_the_model_call() {
     assert!(
         texts.iter().any(|t| t == "done"),
         "the turn must finish: {texts:?}"
+    );
+}
+// ---------------------------------------------------------------------------
+// Skills at runtime (design §8)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn plan_mode_allows_skill_tools() {
+    use crate::agent::mode_allows;
+    use crate::builtin::skills::{LOAD_SKILL, READ_SKILL_FILE};
+
+    // read-only tools, so Plan and ReadOnly keep them and AutoApproveReadOnly
+    // covers them
+    for mode in [AgentMode::Plan, AgentMode::ReadOnly] {
+        assert!(mode_allows(mode, LOAD_SKILL, true), "{mode:?}");
+        assert!(mode_allows(mode, READ_SKILL_FILE, true), "{mode:?}");
+    }
+}
+
+/// Write a valid user-scope skill (`<root>/<name>/SKILL.md`).
+fn write_user_skill(root: &std::path::Path, name: &str, description: &str) {
+    let dir = root.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: {description}\n---\nBody."),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn skills_block_reaches_main_and_subagent_prompts() {
+    script(
+        "t9-skills-main",
+        vec![
+            MockRound::Tools(vec![(
+                SUBAGENT.into(),
+                serde_json::json!({"task": "t9-skills-sub"}),
+            )]),
+            MockRound::Text("main done".into()),
+        ],
+    );
+    script("t9-skills-sub", vec![MockRound::Text("sub answer".into())]);
+
+    let (agent, _sink, _store, dir) = test_agent_in_dir("t9-skills-conv", AgentMode::Default);
+    // the user root is `<data_dir>/skills`; the test agent's data dir is `dir`
+    write_user_skill(&dir.join("skills"), "demo", "demo skill for tests");
+
+    run(&agent, "t9-skills-conv", "t9-skills-main", &CancellationToken::new()).await;
+
+    let main = captures_for("t9-skills-main");
+    assert!(
+        main[0]
+            .system
+            .contains("- `demo` — demo skill for tests (user)"),
+        "{}",
+        main[0].system
+    );
+    // the subagent run sees the same block
+    let sub = captures_for("t9-skills-sub");
+    assert!(
+        sub[0].system.contains("demo skill for tests"),
+        "{}",
+        sub[0].system
+    );
+    assert!(sub[0].system.contains("# Skills"), "{}", sub[0].system);
+}
+
+#[test]
+fn user_subagent_wins_name_collision() {
+    let user = config_subagent("u1", "reviewer");
+    let plugin = config_subagent("plugin:acme:reviewer", "reviewer");
+
+    let (merged, diagnostics) = crate::agent::merge_subagent_defs(vec![user], vec![plugin]);
+
+    assert_eq!(merged.len(), 2, "both definitions are listed");
+    assert_eq!(merged[0].id, "u1", "the user definition is listed first");
+    assert_eq!(merged[1].id, "plugin:acme:reviewer");
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].level, crate::plugins::DiagLevel::Warning);
+    assert!(
+        diagnostics[0].message.contains("plugin:acme:reviewer")
+            && diagnostics[0].message.contains("shadowed"),
+        "{diagnostics:?}"
+    );
+}
+
+/// A minimal definition for registry-merge tests.
+fn config_subagent(id: &str, name: &str) -> SubagentConfig {
+    SubagentConfig {
+        id: id.into(),
+        name: name.into(),
+        description: "reviews code".into(),
+        system_prompt: String::new(),
+        provider_id: None,
+        model: None,
+        effort: None,
+        tools: None,
+        created_at: "t".into(),
+    }
+}
+
+#[tokio::test]
+async fn skills_block_absent_without_skills() {
+    script("t9-noskills-main", vec![MockRound::Text("ok".into())]);
+    let (agent, _sink, _store, _dir) = test_agent_in_dir("t9-noskills-conv", AgentMode::Default);
+
+    run(&agent, "t9-noskills-conv", "t9-noskills-main", &CancellationToken::new()).await;
+
+    let captured = captures_for("t9-noskills-main");
+    assert!(
+        !captured[0].system.contains("# Skills"),
+        "{}",
+        captured[0].system
     );
 }

@@ -14,6 +14,13 @@ use crate::config::{
 };
 use crate::mcp::bridge::{ApprovalDecision, PlanDecision};
 use crate::mcp::manager::McpManager;
+use crate::plugins::manager::{
+    CatalogEntry, MarketplaceInput, MarketplaceSummary, PluginDetail, PluginSummary,
+    PluginUpdateInfo,
+};
+use crate::plugins::marketplace::PluginSource;
+use crate::plugins::skills::{summarize, SkillSummary};
+use crate::plugins::UpdatePolicy;
 use crate::providers::Msg;
 use crate::state::AppState;
 
@@ -166,6 +173,88 @@ pub fn subagent_restore_defaults(state: State<'_, Arc<AppState>>) -> Result<usiz
         state.store.save_config().map_err(|e| e.to_string())?;
     }
     Ok(added)
+}
+
+/// What `subagent_clone_from_plugin` returns: the saved clone plus the
+/// mapping warnings (e.g. tools the plugin lists that this install does not
+/// have), so the UI can name what was dropped instead of a silent success.
+/// Errors are already refused by the core and never reach this shape.
+#[derive(Serialize)]
+pub struct ClonedSubagent {
+    pub subagent: SubagentConfig,
+    pub warnings: Vec<String>,
+}
+
+/// The reusable core of `subagent_clone_from_plugin`: map the plugin
+/// definition, give it a fresh user id and append it to the user's subagents.
+/// The caller owns saving the config.
+fn clone_plugin_subagent(
+    cfg: &mut config::AppConfig,
+    sub: &crate::plugins::layout::PluginSubagent,
+    builtin_tools: &[String],
+    mcp_tools: &[String],
+    now: &str,
+) -> Result<(SubagentConfig, Vec<String>), String> {
+    let (def, diagnostics) =
+        crate::plugins::layout::to_subagent_config(sub, builtin_tools, mcp_tools);
+    if let Some(error) = diagnostics
+        .iter()
+        .find(|diag| diag.level == crate::plugins::DiagLevel::Error)
+    {
+        return Err(error.message.clone());
+    }
+    let warnings: Vec<String> = diagnostics
+        .iter()
+        .filter(|diag| diag.level == crate::plugins::DiagLevel::Warning)
+        .map(|diag| diag.message.clone())
+        .collect();
+    let def = SubagentConfig {
+        id: uuid(),
+        created_at: now.to_string(),
+        ..def
+    };
+    config::validate_subagent(&def, &cfg.providers, &cfg.subagents)?;
+    cfg.subagents.push(def.clone());
+    Ok((def, warnings))
+}
+
+/// Copy one plugin-provided subagent into the user's own definitions. The
+/// clone gets a fresh user id (never the `plugin:` one), so it survives the
+/// plugin being disabled or uninstalled and is editable like any other. The
+/// warnings name what the mapping dropped, so the toast is not a silent
+/// success when a tool was unreachable on this install.
+#[tauri::command]
+pub fn subagent_clone_from_plugin(
+    state: State<'_, Arc<AppState>>,
+    plugin_id: String,
+    name: String,
+) -> Result<ClonedSubagent, String> {
+    let builtin_tools: Vec<String> = crate::builtin::tools()
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    let mcp_tools: Vec<String> = state
+        .manager
+        .aggregated_tools()
+        .iter()
+        .map(|t| t.qualified_name.clone())
+        .collect();
+    let sub = state
+        .plugins
+        .index()
+        .subagents
+        .into_iter()
+        .find(|sub| sub.plugin_id == plugin_id && sub.name == name)
+        .ok_or_else(|| format!("plugin `{plugin_id}` has no subagent named `{name}`"))?;
+    let (created, warnings) = {
+        let mut c = state.store.config.lock().unwrap();
+        clone_plugin_subagent(&mut c, &sub, &builtin_tools, &mcp_tools, &now())?
+    };
+    state.store.save_config().map_err(|e| e.to_string())?;
+    Ok(ClonedSubagent {
+        subagent: created,
+        warnings,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -451,6 +540,9 @@ pub async fn settings_set(
         if let Some(v) = settings.auto_compact_threshold {
             c.settings.auto_compact_threshold = v.clamp(1, 99);
         }
+        if let Some(v) = settings.plugins {
+            c.settings.plugins = v;
+        }
     }
     state.store.save_config().map_err(|e| e.to_string())?;
 
@@ -508,6 +600,7 @@ pub struct AppSettingsPatch {
     pub default_mode: Option<config::AgentMode>,
     pub auto_compact: Option<bool>,
     pub auto_compact_threshold: Option<u8>,
+    pub plugins: Option<config::PluginSettings>,
 }
 
 #[tauri::command]
@@ -905,11 +998,25 @@ pub(crate) fn build_export_payload(
             cfg.settings.show_reasoning,
         )
     };
+    let skills_block = {
+        let enabled = store
+            .config
+            .lock()
+            .unwrap()
+            .settings
+            .plugins
+            .skills_enabled;
+        crate::plugins::skills::prompt_block(
+            &manager.plugins().resolved_skills(&working_dir, enabled),
+            crate::plugins::skills::PROMPT_CAP,
+        )
+    };
     let system_message_now = crate::agent::system_message(
         &working_dir,
         &crate::agent::RunScope::Main,
         &system_prompt,
         mode,
+        skills_block.as_deref(),
     );
     let mut tools_now: Vec<serde_json::Value> = manager
         .aggregated_tools()
@@ -1987,6 +2094,221 @@ pub fn mcp_set_oauth_config(
         .map_err(|e| e.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Plugins
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn plugins_list(state: State<'_, Arc<AppState>>) -> Vec<PluginSummary> {
+    state.plugins.list()
+}
+
+/// Every skill the model can use: all four roots, in precedence order, each
+/// with its provenance and, when shadowed, the id that won. `/skills` renders
+/// exactly this; the system-prompt block is built from the same resolution.
+#[tauri::command]
+pub fn skills_list(state: State<'_, Arc<AppState>>) -> Vec<SkillSummary> {
+    let (cwd, enabled) = {
+        let cfg = state.store.config.lock().unwrap();
+        (
+            cfg.settings.effective_working_dir(&state.store.home_dir),
+            cfg.settings.plugins.skills_enabled,
+        )
+    };
+    summarize(&state.plugins.resolved_skills(&cwd, enabled))
+}
+
+#[tauri::command]
+pub fn plugin_detail(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<Option<PluginDetail>, String> {
+    state.plugins.detail(&id)
+}
+
+/// Install from a marketplace entry (`marketplace` + `name`) or from a direct
+/// `source`. The command layer applies `PluginSettings.policy_default` on top
+/// of the content-derived policy (ruling R18).
+///
+/// `async` keeps the fetch off the main thread, so the UI stays responsive and
+/// receives the progress events.
+#[tauri::command(async)]
+pub fn plugin_install(
+    state: State<'_, Arc<AppState>>,
+    marketplace: Option<String>,
+    name: Option<String>,
+    source: Option<PluginSource>,
+) -> Result<PluginDetail, String> {
+    let policy_default = state
+        .store
+        .config
+        .lock()
+        .unwrap()
+        .settings
+        .plugins
+        .policy_default;
+    let id = state.plugins.install(
+        marketplace.as_deref(),
+        name.as_deref(),
+        source.as_ref(),
+        policy_default,
+    )?;
+    state
+        .plugins
+        .detail(&id)?
+        .ok_or_else(|| format!("plugin `{id}` is not in the index"))
+}
+
+/// Returns the `plugin:<id>:<server>` ids the package owned; Task 8's MCP
+/// layer disconnects them.
+#[tauri::command(async)]
+pub fn plugin_uninstall(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    delete_data: bool,
+) -> Result<Vec<String>, String> {
+    state.plugins.uninstall(&id, delete_data)
+}
+
+#[tauri::command]
+pub fn plugin_set_enabled(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    state.plugins.set_enabled(&id, enabled)
+}
+
+#[tauri::command]
+pub fn plugin_set_server_enabled(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    server: String,
+    enabled: bool,
+) -> Result<(), String> {
+    state.plugins.set_server_enabled(&id, &server, enabled)
+}
+
+#[tauri::command]
+pub fn plugin_set_update_policy(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    policy: UpdatePolicy,
+) -> Result<(), String> {
+    state.plugins.set_policy(&id, policy)
+}
+
+#[tauri::command]
+pub async fn plugin_check_updates(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<PluginUpdateInfo>, String> {
+    state.plugins.check_updates().await
+}
+
+#[tauri::command(async)]
+pub fn plugin_update(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    force: Option<bool>,
+) -> Result<PluginUpdateInfo, String> {
+    state.plugins.update(&id, force.unwrap_or(false))
+}
+
+#[tauri::command(async)]
+pub fn plugin_update_all(
+    state: State<'_, Arc<AppState>>,
+    force: Option<bool>,
+) -> Result<Vec<PluginUpdateInfo>, String> {
+    state.plugins.update_all(force.unwrap_or(false))
+}
+
+#[tauri::command(async)]
+pub fn plugin_rollback(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<PluginUpdateInfo, String> {
+    state.plugins.rollback(&id)
+}
+
+/// Reveal a plugin's package (`which = "package"`, the default) or data
+/// directory, or the plugins root that holds every package (`which = "root"`,
+/// no plugin id needed).
+#[tauri::command]
+pub fn plugin_open_folder(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    id: Option<String>,
+    which: Option<String>,
+) -> Result<(), String> {
+    let path = match (id.as_deref(), which.as_deref()) {
+        (Some(id), which) => state.plugins.folder(id, which)?,
+        (None, Some("root")) => {
+            // The folder may not exist before the first install.
+            let root = state.plugins.plugins_dir.clone();
+            std::fs::create_dir_all(&root).map_err(|err| err.to_string())?;
+            root
+        }
+        (None, _) => return Err("plugin_open_folder needs a plugin id, or which = \"root\"".into()),
+    };
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .reveal_item_in_dir(path)
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+pub fn marketplaces_list(state: State<'_, Arc<AppState>>) -> Vec<MarketplaceSummary> {
+    state.plugins.marketplaces()
+}
+
+#[tauri::command]
+pub fn marketplace_add(
+    state: State<'_, Arc<AppState>>,
+    input: MarketplaceInput,
+    name: Option<String>,
+) -> Result<MarketplaceSummary, String> {
+    state.plugins.add_marketplace(input, name)
+}
+
+#[tauri::command]
+pub fn marketplace_remove(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    confirm: Option<bool>,
+) -> Result<(), String> {
+    state
+        .plugins
+        .remove_marketplace(&id, confirm.unwrap_or(false))
+}
+
+#[tauri::command]
+pub async fn marketplace_refresh(
+    state: State<'_, Arc<AppState>>,
+    id: Option<String>,
+) -> Result<Vec<MarketplaceSummary>, String> {
+    let manager = state.plugins.clone();
+    tauri::async_runtime::spawn(async move { manager.refresh_marketplace(id.as_deref()).await })
+        .await
+        .map_err(|err| format!("marketplace refresh task failed: {err}"))?
+}
+
+#[tauri::command]
+pub fn marketplace_set_auto_refresh(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    state.plugins.set_marketplace_auto_refresh(&id, enabled)
+}
+
+#[tauri::command]
+pub fn marketplace_catalog(
+    state: State<'_, Arc<AppState>>,
+    marketplace: Option<String>,
+) -> Result<Vec<CatalogEntry>, String> {
+    state.plugins.catalog(marketplace.as_deref())
+}
+
 // App version for the About panel
 #[tauri::command]
 pub fn app_info() -> serde_json::Value {
@@ -2109,6 +2431,70 @@ mod tests {
         assert_eq!(result.truncated, 2);
         assert_eq!(result.kept_messages, messages[..2]);
         assert_eq!(result.kept_records, vec![first]);
+    }
+
+    #[test]
+    fn clone_creates_user_subagent() {
+        let mut cfg = config::AppConfig::default();
+        let sub = crate::plugins::layout::PluginSubagent {
+            plugin_id: "acme".into(),
+            name: "reviewer".into(),
+            description: "reviews diffs".into(),
+            system_prompt: "You review.".into(),
+            model: None,
+            effort: Some(config::EffortLevel::High),
+            tools: Some(vec!["ducky__fs_read".into()]),
+            source_path: std::path::PathBuf::from("subagents/reviewer.md"),
+        };
+        let builtin: Vec<String> = crate::builtin::tools()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+
+        let (created, warnings) =
+            clone_plugin_subagent(&mut cfg, &sub, &builtin, &[], "t").unwrap();
+
+        assert!(!created.id.starts_with("plugin:"), "{}", created.id);
+        assert!(
+            ::uuid::Uuid::parse_str(&created.id).is_ok(),
+            "the clone needs a fresh id: {}",
+            created.id
+        );
+        assert_eq!(created.name, "reviewer");
+        assert_eq!(created.created_at, "t");
+        assert_eq!(created.effort, Some(config::EffortLevel::High));
+        assert_eq!(created.tools, Some(vec!["ducky__fs_read".to_string()]));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(cfg.subagents.len(), 1);
+        assert_eq!(cfg.subagents[0].id, created.id);
+    }
+
+    #[test]
+    fn clone_reports_dropped_tool_warnings() {
+        let mut cfg = config::AppConfig::default();
+        let sub = crate::plugins::layout::PluginSubagent {
+            plugin_id: "acme".into(),
+            name: "reviewer".into(),
+            description: "reviews diffs".into(),
+            system_prompt: "You review.".into(),
+            model: None,
+            effort: None,
+            tools: Some(vec!["ducky__nope".into(), "ducky__fs_read".into()]),
+            source_path: std::path::PathBuf::from("subagents/reviewer.md"),
+        };
+        let builtin: Vec<String> = crate::builtin::tools()
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+
+        let (created, warnings) =
+            clone_plugin_subagent(&mut cfg, &sub, &builtin, &[], "t").unwrap();
+
+        assert_eq!(created.tools, Some(vec!["ducky__fs_read".to_string()]));
+        assert!(
+            warnings.iter().any(|w| w.contains("ducky__nope")),
+            "the dropped tool must be named in the clone result: {warnings:?}"
+        );
     }
 
     fn steer(id: &str, text: &str) -> crate::agent::PendingSteer {
@@ -2248,7 +2634,12 @@ mod tests {
             sink.clone(),
             store.clone(),
         ));
-        let manager = McpManager::new(store.clone(), bridge, sink);
+        let plugins = crate::plugins::manager::PluginManager::new(
+            &store.home_dir,
+            &store.home_dir,
+            None,
+        );
+        let manager = McpManager::new(store.clone(), bridge, sink, plugins);
 
         let payload = build_export_payload(&store, &manager, "exp-1", "now".into()).unwrap();
 
