@@ -1099,10 +1099,13 @@ fn spawn_title_gen(state: Arc<AppState>, id: String, user_text: String, force: b
 // Chat
 // ---------------------------------------------------------------------------
 
-/// Largest base64 image payload accepted from the webview, in bytes of the
-/// base64 string itself (what the providers meter). Matches the frontend's
-/// pre-flight check so a paste usually fails fast, before any IPC.
-const MAX_IMAGE_BASE64_BYTES: usize = 5 * 1024 * 1024;
+/// Largest image file accepted from the webview, raw bytes on disk — the
+/// number the frontend pre-checks against the same limit.
+const MAX_IMAGE_FILE_BYTES: usize = 5 * 1024 * 1024;
+
+/// Largest base64 payload per image: the encoding of that file, plus a byte
+/// so the ceiling of `/3*4` never clips an exactly-at-the-limit image.
+const MAX_IMAGE_BASE64_BYTES: usize = MAX_IMAGE_FILE_BYTES / 3 * 4 + 4;
 
 /// Image types every wired provider renders. Anything else (SVG in
 /// particular) is refused rather than forwarded.

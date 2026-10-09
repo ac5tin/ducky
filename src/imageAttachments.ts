@@ -1,8 +1,9 @@
 import type { ImagePart } from "./types";
 
-/** Largest base64 payload per image, matching the backend's check. The raw
- * file cap is derived: base64 inflates every 3 bytes to 4. */
-export const MAX_IMAGE_BASE64_BYTES = 5 * 1024 * 1024;
+/// Largest image file accepted from the webview, raw bytes on disk (what the
+/// user sees in their file manager). The backend measures the base64
+/// encoding of this same file, so the two caps agree.
+export const MAX_IMAGE_FILE_BYTES = 5 * 1024 * 1024;
 
 const SUPPORTED_IMAGE_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 
@@ -17,8 +18,7 @@ export function imageRejection(file: {
   if (!SUPPORTED_IMAGE_TYPES.includes(file.type)) {
     return `Unsupported image type: ${file.type || "unknown"}. Use PNG, JPEG, GIF or WebP.`;
   }
-  const base64Length = Math.ceil(file.size / 3) * 4;
-  if (base64Length > MAX_IMAGE_BASE64_BYTES) {
+  if (file.size > MAX_IMAGE_FILE_BYTES) {
     return "Image is too large — the limit is 5 MB per image.";
   }
   return null;
@@ -27,6 +27,34 @@ export function imageRejection(file: {
 /** The `data:` URL the preview thumbnail renders from. */
 export function imagePreviewUrl(image: ImagePart): string {
   return `data:${image.media_type};base64,${image.data}`;
+}
+
+/**
+ * Image files from a paste event's clipboard data. `items` is the primary
+ * source; `files` is the fallback for webviews that populate only that.
+ * WebKitGTK returns files with an empty `type` on some clips — the item's
+ * MIME is the only correct one available, so the file is re-wrapped with it.
+ */
+export function clipboardImageFiles(clipboardData: {
+  items?: ArrayLike<{
+    kind: string;
+    type: string;
+    getAsFile(): File | null;
+  }>;
+  files?: ArrayLike<File>;
+}): File[] {
+  const out: File[] = [];
+  const items = clipboardData.items ? Array.from(clipboardData.items) : [];
+  for (const item of items) {
+    if (item.kind !== "file" || !item.type.startsWith("image/")) continue;
+    const file = item.getAsFile();
+    if (!file) continue;
+    out.push(file.type ? file : new File([file], file.name, { type: item.type }));
+  }
+  if (out.length > 0) return out;
+  return clipboardData.files
+    ? Array.from(clipboardData.files).filter((file) => file.type.startsWith("image/"))
+    : [];
 }
 
 /** Reads an image file into an `ImagePart`, base64 and all. */

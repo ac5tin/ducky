@@ -19,6 +19,8 @@ use crate::config::{ApiType, ProviderConfig};
 // ---------------------------------------------------------------------------
 
 /// One image attached to a user message, exactly as the user supplied it.
+// shortcut: images stored inline in history JSON as base64, move to a side
+// directory if history files get large.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ImagePart {
     /// MIME type, e.g. `image/png`. Validated at the command boundary.

@@ -20,6 +20,7 @@ import {
   type MessageActionKind,
 } from "../../chatMessageActions";
 import {
+  clipboardImageFiles,
   imagePreviewUrl,
   imageRejection,
   readImagePart,
@@ -728,6 +729,14 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
   const [suggestions, setSuggestions] = useState<string[] | null>(null);
   const ref = useRef<HTMLTextAreaElement>(null);
 
+  // attachments are transient composer state: a chat switch must not carry a
+  // pending chip into another conversation. The draft text keeps its own
+  // restore mechanism and is deliberately left alone.
+  useEffect(() => {
+    setAttachments([]);
+    setDraggingOver(false);
+  }, [activeId]);
+
   // /undo puts the removed prompt back into the composer
   useEffect(() => {
     if (restoredDraft === undefined || !activeId) return;
@@ -951,7 +960,14 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
               e.preventDefault();
               setDraggingOver(true);
             }}
-            onDragLeave={() => setDraggingOver(false)}
+            onDragLeave={(e) => {
+              // moving over the textarea re-fires dragleave with a
+              // relatedTarget inside the zone; that is not leaving
+              if (e.relatedTarget instanceof Node && e.currentTarget.contains(e.relatedTarget)) {
+                return;
+              }
+              setDraggingOver(false);
+            }}
             onDrop={(e) => {
               e.preventDefault();
               setDraggingOver(false);
@@ -1010,13 +1026,7 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
                 autoFocus={autoFocus}
                 rows={1}
                 onPaste={(e) => {
-                  const files = Array.from(e.clipboardData.items)
-                    .filter(
-                      (item) =>
-                        item.kind === "file" && item.type.startsWith("image/"),
-                    )
-                    .map((item) => item.getAsFile())
-                    .filter((file): file is File => file !== null);
+                  const files = clipboardImageFiles(e.clipboardData);
                   if (files.length === 0) return;
                   // the text part of a mixed paste still lands in the textarea
                   e.preventDefault();
