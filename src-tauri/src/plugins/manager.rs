@@ -727,9 +727,9 @@ impl PluginManager {
                             to: found.version.clone().or(found.resolved_sha.clone()),
                             // A check applies nothing: no server was stopped.
                             enabled_servers: Vec::new(),
-                            modified_locally: package.as_deref().is_some_and(|package| {
-                                update::locally_modified(record, package)
-                            }),
+                            modified_locally: package
+                                .as_deref()
+                                .is_some_and(|package| update::locally_modified(record, package)),
                         });
                     }
                     Ok(None) => {}

@@ -3002,7 +3002,10 @@ fn save_refuses_a_corrupt_marketplace_store() {
     let err = store.save(&dir).unwrap_err();
 
     assert!(err.to_string().contains("marketplaces.json"), "{err}");
-    assert_eq!(std::fs::read(dir.join("marketplaces.json")).unwrap(), damaged);
+    assert_eq!(
+        std::fs::read(dir.join("marketplaces.json")).unwrap(),
+        damaged
+    );
 }
 
 #[test]
@@ -5440,7 +5443,10 @@ async fn install_from_a_git_marketplace_refuses_an_escaping_symlink_entry() {
         )
         .unwrap_err();
 
-    assert!(err.contains("resolves outside the marketplace root"), "{err}");
+    assert!(
+        err.contains("resolves outside the marketplace root"),
+        "{err}"
+    );
     assert!(manager.list().is_empty());
     assert!(!tmp.path().join("plugins/outside-plugin").exists());
 }
