@@ -1235,6 +1235,11 @@ export const useStore = create<StoreState>((set, get) => ({
           return get().send(expandInitPrompt(workingDir, command.args));
         }
         case "skills": {
+          // The list renders in the transcript, which only exists inside a
+          // chat: from the draft page the command opens the chat first, and a
+          // failed open (no provider) leaves nothing to append to.
+          const id = await ensureConversation(set, get);
+          if (!id) return false;
           // always refresh: plugins_changed writes this slice too, but a
           // second /skills must never render a stale snapshot; a failed
           // refresh is reported, never rendered stale
@@ -1245,6 +1250,9 @@ export const useStore = create<StoreState>((set, get) => ({
           } catch (err) {
             text = `Could not list skills: ${String(err)}`;
           }
+          // a conversation switch during the awaits must not print the list
+          // into whatever transcript is on screen now
+          if (get().activeConversationId !== id) return true;
           set((s) => ({
             items: [
               ...s.items,
@@ -1325,66 +1333,10 @@ export const useStore = create<StoreState>((set, get) => ({
     if (!id) {
       // lazy chat creation: the record is made only when the first message is
       // sent from the draft page
-      if (creatingDraft) return false;
-      creatingDraft = true;
-      try {
-        const { config } = get();
-        // an app-level default model wins over "whatever was used last"
-        const defaultProvider = defaultProviderOf(config);
-        // a provider picked on the draft page beats the app default
-        const draftProvider = get().draftProviderId
-          ? (config?.providers.find((p) => p.id === get().draftProviderId) ??
-            null)
-          : null;
-        const provider =
-          draftProvider ?? defaultProvider ?? get().activeProvider();
-        if (!provider) {
-          get().toast(
-            "error",
-            "Add an AI provider first (Settings → Providers).",
-          );
-          return false;
-        }
-        const model = resolveDraftModel(get().draftModel, config, provider);
-        const meta = await api.conversationCreate(provider.id, model, get().draftGroupId);
-        const { draftEffort } = get();
-        if (draftEffort !== undefined) {
-          // non-fatal: the chat proceeds with the default effort if this fails
-          await api.conversationSetEffort(meta.id, draftEffort).catch(() => {});
-        }
-        const { draftMode } = get();
-        if (draftMode) {
-          // non-fatal: the chat keeps the app default if this fails
-          await api.conversationSetMode(meta.id, draftMode).catch(() => {});
-        }
-        const { draftWorkingDir } = get();
-        if (draftWorkingDir) {
-          // non-fatal: the chat keeps the app default if this fails
-          await api.conversationSetWorkingDir(meta.id, draftWorkingDir).catch(() => {});
-        }
-        set({
-          draftModel: null,
-          draftProviderId: null,
-          draftEffort: undefined,
-          draftMode: null,
-          draftWorkingDir: null,
-          draftGroupId: null,
-        });
-        await get().refreshConfig();
-        id = meta.id;
-      } catch (e) {
-        get().toast("error", `Could not start a new chat: ${e}`);
-        return false;
-      } finally {
-        creatingDraft = false;
-      }
+      id = await ensureConversation(set, get);
+      if (!id) return false;
     }
-    const convId = id;
-    if (get().activeConversationId !== convId) {
-      // first message from the draft page: the new chat becomes the active one
-      set({ activeConversationId: convId });
-    }
-    return dispatchSend(convId, text, set, get);
+    return dispatchSend(id, text, set, get);
   },
 
   async editMessage(messageIndex, text) {
@@ -1782,6 +1734,70 @@ const steeringInFlight = new Set<string>();
  *  may only accept them after that retraction, so the settle path retracts
  *  them once more. */
 const steeringWithdrawn = new Set<string>();
+
+/**
+ * The active conversation, creating one from the draft page when none exists.
+ * Returns null when creation fails (a toast explains) or another create is
+ * already in flight; the caller drops its action, as `send` always has.
+ */
+async function ensureConversation(set: SetFn, get: GetFn): Promise<string | null> {
+  const existing = get().activeConversationId;
+  if (existing) return existing;
+  if (creatingDraft) return null;
+  creatingDraft = true;
+  try {
+    const { config } = get();
+    // an app-level default model wins over "whatever was used last"
+    const defaultProvider = defaultProviderOf(config);
+    // a provider picked on the draft page beats the app default
+    const draftProvider = get().draftProviderId
+      ? (config?.providers.find((p) => p.id === get().draftProviderId) ??
+        null)
+      : null;
+    const provider = draftProvider ?? defaultProvider ?? get().activeProvider();
+    if (!provider) {
+      get().toast(
+        "error",
+        "Add an AI provider first (Settings → Providers).",
+      );
+      return null;
+    }
+    const model = resolveDraftModel(get().draftModel, config, provider);
+    const meta = await api.conversationCreate(provider.id, model, get().draftGroupId);
+    const { draftEffort } = get();
+    if (draftEffort !== undefined) {
+      // non-fatal: the chat proceeds with the default effort if this fails
+      await api.conversationSetEffort(meta.id, draftEffort).catch(() => {});
+    }
+    const { draftMode } = get();
+    if (draftMode) {
+      // non-fatal: the chat keeps the app default if this fails
+      await api.conversationSetMode(meta.id, draftMode).catch(() => {});
+    }
+    const { draftWorkingDir } = get();
+    if (draftWorkingDir) {
+      // non-fatal: the chat keeps the app default if this fails
+      await api.conversationSetWorkingDir(meta.id, draftWorkingDir).catch(() => {});
+    }
+    set({
+      draftModel: null,
+      draftProviderId: null,
+      draftEffort: undefined,
+      draftMode: null,
+      draftWorkingDir: null,
+      draftGroupId: null,
+    });
+    await get().refreshConfig();
+    // first message from the draft page: the new chat becomes the active one
+    set({ activeConversationId: meta.id });
+    return meta.id;
+  } catch (e) {
+    get().toast("error", `Could not start a new chat: ${e}`);
+    return null;
+  } finally {
+    creatingDraft = false;
+  }
+}
 
 /** Starts a turn for `convId`. Transcript updates, the `streaming` mirror and
  * the title flag apply only to the active conversation — a background flush

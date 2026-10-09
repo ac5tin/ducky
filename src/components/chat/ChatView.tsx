@@ -28,6 +28,7 @@ import { ModePicker } from "./ModePicker";
 import { AdvisorChip } from "./AdvisorChip";
 import { WorkingDirChip } from "./WorkingDirChip";
 import { SlashCommandMenu } from "./SlashCommandMenu";
+import { SkillsDialog } from "./SkillsDialog";
 import { SessionReferenceMenu } from "./SessionReferenceMenu";
 import { FileReferenceMenu } from "./FileReferenceMenu";
 import { TerminalPanel } from "./TerminalPanel";
@@ -117,6 +118,7 @@ export function ChatView() {
       toast("error", `${e}`);
     }
   }, [activeId, conversationTitle, toast]);
+  const [skillsOpen, setSkillsOpen] = useState(false);
   const [, setTick] = useState(0);
 
   useEffect(() => {
@@ -235,6 +237,16 @@ export function ChatView() {
                     <Icon name="plug" className="h-4 w-4 text-slate-400" />
                     Connectors
                   </button>
+                  <button
+                    className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition hover:bg-slate-50 dark:hover:bg-slate-800"
+                    onClick={() => {
+                      setMenuOpen(false);
+                      setSkillsOpen(true);
+                    }}
+                  >
+                    <Icon name="file" className="h-4 w-4 text-slate-400" />
+                    Skills
+                  </button>
                 </div>
               </>
             )}
@@ -291,6 +303,7 @@ export function ChatView() {
         open={connectorsOpen}
         onClose={() => setConnectorsOpen(false)}
       />
+      <SkillsDialog open={skillsOpen} onClose={() => setSkillsOpen(false)} />
     </div>
   );
 }
