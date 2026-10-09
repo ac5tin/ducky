@@ -15,6 +15,7 @@ import {
   formatVersion,
   hoursToInterval,
   pluginServerOwner,
+  runAddMarketplaceAction,
   runInstallPluginAction,
   runPluginBatchSwap,
   runPluginServerToggle,
@@ -902,7 +903,7 @@ export const useStore = create<StoreState>((set, get) => ({
 
   async addMarketplace(input, name) {
     try {
-      const summary = await api.marketplaceAdd(input, name);
+      const summary = await runAddMarketplaceAction(api, input, name);
       await get().refreshMarketplaces();
       await get().loadCatalog(get().catalogMarketplace);
       get().toast("success", `Added ${summary.name}`);

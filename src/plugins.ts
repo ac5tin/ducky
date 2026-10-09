@@ -3,6 +3,7 @@
 // drive this module directly (like `subagents.ts` and `slashCommands.ts`).
 import type {
   CatalogEntry,
+  MarketplaceInput,
   MarketplaceSummary,
   PluginDetail,
   PluginInstallRequest,
@@ -442,6 +443,31 @@ export async function runInstallPluginAction(
     api.marketplaceCatalog(marketplace),
   ]);
   return { installed, plugins, skills, catalog };
+}
+
+/** The api the add-marketplace action needs: the add plus its first fetch. */
+export interface MarketplaceAddApi {
+  marketplaceAdd: (
+    input: MarketplaceInput,
+    name?: string,
+  ) => Promise<MarketplaceSummary>;
+  marketplaceRefresh: (id: string) => Promise<MarketplaceSummary[]>;
+}
+
+/**
+ * The add action's body with the api injected, so `node --test` can drive it
+ * without Tauri. The source is fetched once right after it is recorded: git
+ * and url caches are only ever filled by a refresh, so the catalog the store
+ * loads next would otherwise read an empty cache and list no plugins.
+ */
+export async function runAddMarketplaceAction(
+  api: MarketplaceAddApi,
+  input: MarketplaceInput,
+  name?: string,
+): Promise<MarketplaceSummary> {
+  const summary = await api.marketplaceAdd(input, name);
+  await api.marketplaceRefresh(summary.id);
+  return summary;
 }
 
 /** The api one plugin-server switch needs, so tests can inject a fake. */

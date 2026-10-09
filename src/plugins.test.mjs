@@ -17,6 +17,7 @@ import {
   pluginTrustSummary,
   progressPhaseLabel,
   progressRowViews,
+  runAddMarketplaceAction,
   runInstallPlugin,
   runInstallPluginAction,
   runPluginBatchSwap,
@@ -358,6 +359,45 @@ test("install action sets catalogLoading then clears it", async () => {
     /unsafe id/,
   );
   assert.deepEqual(failed, ["loading:on", "loading:off"]);
+});
+
+test("adding a marketplace fetches it before anything reloads", async () => {
+  const events = [];
+  const summary = await runAddMarketplaceAction(
+    {
+      marketplaceAdd: async (input, name) => {
+        events.push(`add:${input.source}:${name}`);
+        return { id: "skills", name: "Skills" };
+      },
+      marketplaceRefresh: async (id) => {
+        events.push(`refresh:${id}`);
+        return [];
+      },
+    },
+    { source: "https://github.com/ac5tin/skills" },
+    undefined,
+  );
+  assert.deepEqual(events, [
+    "add:https://github.com/ac5tin/skills:undefined",
+    "refresh:skills",
+  ]);
+  assert.equal(summary.id, "skills");
+});
+
+test("a failed marketplace fetch rejects the add", async () => {
+  await assert.rejects(
+    runAddMarketplaceAction(
+      {
+        marketplaceAdd: async () => ({ id: "skills", name: "Skills" }),
+        marketplaceRefresh: async () => {
+          throw new Error("ipc gone");
+        },
+      },
+      { source: "https://github.com/ac5tin/skills" },
+      undefined,
+    ),
+    /ipc gone/,
+  );
 });
 
 test("catalogEntryAction maps install state to one button", () => {
