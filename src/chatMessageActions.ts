@@ -8,6 +8,7 @@ export type MessageActionKind = "copy" | "edit";
 export type MessageActionItem = {
   kind: "user" | "assistant" | "tool";
   text: string;
+  images?: import("./types").ImagePart[];
   messageIndex?: number;
   streaming?: boolean;
 };
@@ -23,6 +24,8 @@ export function messageActionKinds(
     ) {
       return [];
     }
+    // an edit re-sends text only; an image here would be silently dropped
+    if (item.images?.length) return ["copy"];
     return item.messageIndex === undefined ? ["copy"] : ["copy", "edit"];
   }
   if (item.kind === "assistant" && item.text && !item.streaming) {

@@ -4,6 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::AgentMode;
+use crate::providers::ImagePart;
 
 /// Identity of the advisor consulted by a `ducky__advisor` call, shown on its
 /// tool card.
@@ -55,6 +56,7 @@ pub enum BackendEvent {
         conversation_id: String,
         id: String,
         text: String,
+        images: Vec<ImagePart>,
         ts: String,
     },
     /// A full assistant turn (text + tool calls) is complete.

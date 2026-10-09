@@ -12,6 +12,7 @@ import type {
   ConversationMeta,
   EffortLevel,
   GroupLayout,
+  ImagePart,
   MarketplaceInput,
   MarketplaceSummary,
   McpServerConfig,
@@ -242,11 +243,18 @@ export const conversationGet = (
 export const conversationExport = (id: string, path: string) =>
   invoke<string>("conversation_export", { id, path });
 
-export const chatSend = (conversationId: string, text: string) =>
-  invoke<void>("chat_send", { conversationId, text });
+export const chatSend = (
+  conversationId: string,
+  text: string,
+  images: ImagePart[] = [],
+) => invoke<void>("chat_send", { conversationId, text, images });
 
-export const chatSteer = (conversationId: string, id: string, text: string) =>
-  invoke<void>("chat_steer", { conversationId, id, text });
+export const chatSteer = (
+  conversationId: string,
+  id: string,
+  text: string,
+  images: ImagePart[] = [],
+) => invoke<void>("chat_steer", { conversationId, id, text, images });
 
 export const chatUnsteer = (conversationId: string, id: string) =>
   invoke<void>("chat_unsteer", { conversationId, id });

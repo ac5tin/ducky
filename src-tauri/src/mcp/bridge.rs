@@ -382,7 +382,11 @@ impl InteractiveBridge {
         for m in &params.messages {
             let text = sampling_message_text(m);
             match m.role {
-                Role::User => msgs.push(Msg::User { text, ts: None }),
+                Role::User => msgs.push(Msg::User {
+                    text,
+                    images: Vec::new(),
+                    ts: None,
+                }),
                 Role::Assistant => msgs.push(Msg::Assistant {
                     text,
                     tool_calls: Vec::new(),

@@ -42,6 +42,7 @@ import type {
   ChatGroup,
   ConnectorSuggestion,
   EffortLevel,
+  ImagePart,
   MarketplaceInput,
   MarketplaceSummary,
   PlanRequest,
@@ -68,6 +69,7 @@ export interface UserItem {
   kind: "user";
   id: string;
   text: string;
+  images?: ImagePart[];
   /** Index in the raw backend transcript, not the display item list. */
   messageIndex?: number;
   ts?: string;
@@ -383,7 +385,7 @@ interface StoreState {
   setWorkingDir: (path: string | null) => Promise<void>;
   setActiveMcpIds: (mcpIds: string[] | null) => Promise<void>;
 
-  send: (text: string) => Promise<boolean>;
+  send: (text: string, images?: ImagePart[]) => Promise<boolean>;
   /** Remove a selected prompt and re-run the edited text. */
   editMessage: (messageIndex: number | undefined, text: string) => Promise<boolean>;
   stop: () => void;
@@ -429,6 +431,7 @@ function rawToItems(
         kind: "user",
         id: `u-${items.length}`,
         text: msg.text,
+        images: msg.images,
         messageIndex,
         ts: msg.ts ?? undefined,
       });
@@ -1220,7 +1223,7 @@ export const useStore = create<StoreState>((set, get) => ({
     await get().refreshConfig();
   },
 
-  async send(text): Promise<boolean> {
+  async send(text, images: ImagePart[] = []): Promise<boolean> {
     // slash commands never reach the model as chat text — and unlike real
     // messages they are never steered into a running turn
     const command = parseSlashCommand(text);
@@ -1303,6 +1306,7 @@ export const useStore = create<StoreState>((set, get) => ({
       const pending: SteeringMessage = {
         id: `u-steer-${++queueSeq}`,
         text,
+        images,
         ts: new Date().toISOString(),
       };
       set((s) => ({
@@ -1310,7 +1314,7 @@ export const useStore = create<StoreState>((set, get) => ({
       }));
       steeringInFlight.add(pending.id);
       try {
-        await api.chatSteer(convId, pending.id, text);
+        await api.chatSteer(convId, pending.id, text, images);
       } catch {
         // no running turn — the settle check below sends it as a normal turn
       }
@@ -1326,7 +1330,7 @@ export const useStore = create<StoreState>((set, get) => ({
         // The backend refused it, or accepted it onto a run that has since
         // ended: nothing will deliver it, so send it as a normal turn. When a
         // run IS active it either delivers the steer or the next flush does.
-        sendSteerAsTurn(convId, pending.id, text, set, get);
+        sendSteerAsTurn(convId, pending.id, text, images, set, get);
       }
       return true;
     }
@@ -1336,7 +1340,7 @@ export const useStore = create<StoreState>((set, get) => ({
       id = await ensureConversation(set, get);
       if (!id) return false;
     }
-    return dispatchSend(id, text, set, get);
+    return dispatchSend(id, text, images, set, get);
   },
 
   async editMessage(messageIndex, text) {
@@ -1806,6 +1810,7 @@ async function ensureConversation(set: SetFn, get: GetFn): Promise<string | null
 async function dispatchSend(
   convId: string,
   text: string,
+  images: ImagePart[],
   set: SetFn,
   get: GetFn,
 ): Promise<boolean> {
@@ -1821,6 +1826,7 @@ async function dispatchSend(
           kind: "user" as const,
           id: `u-live-${Date.now()}`,
           text,
+          images,
           ts: new Date().toISOString(),
         },
       ],
@@ -1836,7 +1842,7 @@ async function dispatchSend(
     }));
   }
   try {
-    await api.chatSend(convId, text);
+    await api.chatSend(convId, text, images);
     return true;
   } catch (e) {
     get().toast("error", `${e}`);
@@ -1868,13 +1874,14 @@ function sendSteerAsTurn(
   convId: string,
   id: string,
   text: string,
+  images: ImagePart[],
   set: SetFn,
   get: GetFn,
 ) {
   set((s) => ({
     steeringQueues: withSteeringRemoved(s.steeringQueues, convId, id),
   }));
-  void dispatchSend(convId, text, set, get);
+  void dispatchSend(convId, text, images, set, get);
 }
 
 /** Sends the next pending steer for `convId` as a normal turn, if any. One per
@@ -1892,7 +1899,7 @@ function flushSteering(convId: string, set: SetFn, get: GetFn) {
       [convId]: queue.filter((m) => m.id !== next.id),
     },
   });
-  void dispatchSend(convId, next.text, set, get);
+  void dispatchSend(convId, next.text, next.images ?? [], set, get);
 }
 
 /** Refresh the two slices the plugin index feeds: rows and skills. */
@@ -1966,6 +1973,7 @@ function handleEvent(event: BackendEvent, set: SetFn, get: GetFn) {
               kind: "user" as const,
               id: `u-steer-${event.id}`,
               text: event.text,
+              images: event.images,
               ts: event.ts,
             },
           ],

@@ -57,8 +57,25 @@ impl AnthropicProvider {
         for msg in messages {
             match msg {
                 Msg::System { text } => system_parts.push(text.clone()),
-                Msg::User { text, .. } => {
-                    push_block(&mut out, "user", json!({"type": "text", "text": text}));
+                Msg::User { text, images, .. } => {
+                    for image in images {
+                        push_block(
+                            &mut out,
+                            "user",
+                            json!({
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": image.media_type,
+                                    "data": image.data,
+                                },
+                            }),
+                        );
+                    }
+                    // an image-only turn sends no empty text block
+                    if !text.is_empty() || images.is_empty() {
+                        push_block(&mut out, "user", json!({"type": "text", "text": text}));
+                    }
                 }
                 Msg::Assistant {
                     text, tool_calls, ..
@@ -365,6 +382,7 @@ mod tests {
             },
             Msg::User {
                 text: "hello".into(),
+                images: Vec::new(),
                 ts: None,
             },
             Msg::Assistant {
@@ -397,6 +415,7 @@ mod tests {
         let msgs2 = vec![
             Msg::User {
                 text: "go".into(),
+                images: Vec::new(),
                 ts: None,
             },
             Msg::Assistant {
@@ -433,6 +452,26 @@ mod tests {
             "tool results must merge into one user message"
         );
         assert_eq!(wire2[2]["content"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn user_images_become_base64_source_blocks() {
+        let msgs = vec![Msg::User {
+            text: "what is this?".into(),
+            images: vec![super::super::ImagePart {
+                media_type: "image/webp".into(),
+                data: "eHk=".into(),
+            }],
+            ts: None,
+        }];
+        let (_, wire) = AnthropicProvider::messages_to_wire(&msgs);
+        assert_eq!(wire[0]["role"], "user");
+        assert_eq!(wire[0]["content"][0]["type"], "image");
+        assert_eq!(wire[0]["content"][0]["source"]["type"], "base64");
+        assert_eq!(wire[0]["content"][0]["source"]["media_type"], "image/webp");
+        assert_eq!(wire[0]["content"][0]["source"]["data"], "eHk=");
+        assert_eq!(wire[0]["content"][1]["type"], "text");
+        assert_eq!(wire[0]["content"][1]["text"], "what is this?");
     }
 
     #[test]

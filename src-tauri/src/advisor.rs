@@ -44,6 +44,7 @@ pub fn build_messages(history: &[Msg], tool_names: &[String], executor_system: &
     messages.extend(transcript);
     messages.push(Msg::User {
         text: ADVISOR_ASK.into(),
+        images: Vec::new(),
         ts: None,
     });
     messages
@@ -332,6 +333,7 @@ mod tests {
     fn user(text: &str) -> Msg {
         Msg::User {
             text: text.into(),
+            images: Vec::new(),
             ts: None,
         }
     }

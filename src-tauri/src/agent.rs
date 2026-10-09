@@ -13,8 +13,8 @@ use crate::events::{BackendEvent, EventSink};
 use crate::mcp::bridge::{ApprovalDecision, SamplingBackend};
 use crate::mcp::manager::{content_to_text, McpManager};
 use crate::providers::{
-    build_wired_provider, wire_for_model, LlmProvider, Msg, ProviderEvent, StopReason, ToolCall,
-    ToolDef,
+    build_wired_provider, wire_for_model, ImagePart, LlmProvider, Msg, ProviderEvent, StopReason,
+    ToolCall, ToolDef,
 };
 
 /// Maximum subagent nesting depth. The main agent runs at depth 0; a
@@ -410,6 +410,7 @@ pub struct PendingSteer {
     /// Frontend bubble id, echoed back on delivery so the UI can clear it.
     pub id: String,
     pub text: String,
+    pub images: Vec<ImagePart>,
     pub ts: String,
 }
 
@@ -1047,6 +1048,7 @@ impl Agent {
         model: String,
         mut history: Vec<Msg>,
         user_text: String,
+        user_images: Vec<ImagePart>,
         ct: CancellationToken,
         steering: Arc<SteeringQueue>,
     ) {
@@ -1057,6 +1059,7 @@ impl Agent {
                 &model,
                 &mut history,
                 user_text,
+                user_images,
                 &ct,
                 &steering,
             )
@@ -1099,11 +1102,13 @@ impl Agent {
         model: &str,
         history: &mut Vec<Msg>,
         user_text: String,
+        user_images: Vec<ImagePart>,
         ct: &CancellationToken,
         steering: &Arc<SteeringQueue>,
     ) -> Result<(), String> {
         history.push(Msg::User {
             text: user_text,
+            images: user_images,
             ts: Some(chrono::Utc::now().to_rfc3339()),
         });
 
@@ -1159,6 +1164,7 @@ impl Agent {
             if let Some(steer) = steering.and_then(|q| q.lock().unwrap().pop_front()) {
                 history.push(Msg::User {
                     text: steer.text.clone(),
+                    images: steer.images.clone(),
                     ts: Some(steer.ts.clone()),
                 });
                 self.persist(conversation_id, history)?;
@@ -1166,6 +1172,7 @@ impl Agent {
                     conversation_id: conversation_id.to_string(),
                     id: steer.id,
                     text: steer.text,
+                    images: steer.images,
                     ts: steer.ts,
                 });
             }
@@ -2011,6 +2018,7 @@ impl Agent {
         };
         let mut history = vec![Msg::User {
             text: task,
+            images: Vec::new(),
             ts: Some(chrono::Utc::now().to_rfc3339()),
         }];
         let outcome = self
@@ -2735,6 +2743,7 @@ impl Agent {
             },
             Msg::User {
                 text: user_text.to_string(),
+                images: Vec::new(),
                 ts: None,
             },
         ];

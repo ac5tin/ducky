@@ -274,9 +274,21 @@ export interface ToolCall {
         arguments: any;
 }
 
+/** One image attached to a user message, as the user supplied it. */
+export interface ImagePart {
+        media_type: string;
+        /** Base64 bytes, without the `data:` prefix. */
+        data: string;
+}
+
 export type RawMessage =
         | { kind: "system"; text: string }
-        | { kind: "user"; text: string; ts?: string | null }
+        | {
+                  kind: "user";
+                  text: string;
+                  images?: ImagePart[];
+                  ts?: string | null;
+          }
         | {
                   kind: "assistant";
                   text: string;
@@ -295,6 +307,7 @@ export type RawMessage =
 export interface SteeringMessage {
         id: string;
         text: string;
+        images?: ImagePart[];
         ts: string;
 }
 
@@ -396,6 +409,7 @@ export type BackendEvent =
                   conversation_id: string;
                   id: string;
                   text: string;
+                  images?: ImagePart[];
                   ts: string;
           }
         | { type: "message_done"; conversation_id: string; message_id: string }

@@ -21,7 +21,7 @@ use crate::plugins::manager::{
 use crate::plugins::marketplace::PluginSource;
 use crate::plugins::skills::{summarize, SkillSummary};
 use crate::plugins::UpdatePolicy;
-use crate::providers::Msg;
+use crate::providers::{ImagePart, Msg};
 use crate::state::AppState;
 
 fn uuid() -> String {
@@ -1099,13 +1099,42 @@ fn spawn_title_gen(state: Arc<AppState>, id: String, user_text: String, force: b
 // Chat
 // ---------------------------------------------------------------------------
 
+/// Largest base64 image payload accepted from the webview, in bytes of the
+/// base64 string itself (what the providers meter). Matches the frontend's
+/// pre-flight check so a paste usually fails fast, before any IPC.
+const MAX_IMAGE_BASE64_BYTES: usize = 5 * 1024 * 1024;
+
+/// Image types every wired provider renders. Anything else (SVG in
+/// particular) is refused rather than forwarded.
+const SUPPORTED_IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+fn validate_images(images: &[ImagePart]) -> Result<(), String> {
+    for image in images {
+        if !SUPPORTED_IMAGE_TYPES.contains(&image.media_type.as_str()) {
+            return Err(format!(
+                "Unsupported image type: {}. Paste PNG, JPEG, GIF or WebP.",
+                image.media_type
+            ));
+        }
+        if image.data.is_empty() {
+            return Err("Image is empty.".into());
+        }
+        if image.data.len() > MAX_IMAGE_BASE64_BYTES {
+            return Err("Image is too large — the limit is 5 MB per image.".into());
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn chat_send(
     state: State<'_, Arc<AppState>>,
     conversation_id: String,
     text: String,
+    images: Vec<ImagePart>,
 ) -> Result<(), String> {
-    if text.trim().is_empty() {
+    validate_images(&images)?;
+    if text.trim().is_empty() && images.is_empty() {
         return Err("Message is empty".into());
     }
 
@@ -1200,7 +1229,7 @@ pub async fn chat_send(
     };
 
     let app_state = state.inner().clone();
-    if auto_title {
+    if auto_title && !text.trim().is_empty() {
         spawn_title_gen(
             app_state.clone(),
             conversation_id.clone(),
@@ -1218,6 +1247,7 @@ pub async fn chat_send(
                 model,
                 history,
                 text,
+                images,
                 runtime.ct.clone(),
                 runtime.steering.clone(),
             )
@@ -1271,8 +1301,10 @@ pub async fn chat_steer(
     conversation_id: String,
     id: String,
     text: String,
+    images: Vec<ImagePart>,
 ) -> Result<(), String> {
-    if text.trim().is_empty() {
+    validate_images(&images)?;
+    if text.trim().is_empty() && images.is_empty() {
         return Err("Message is empty".into());
     }
     queue_steer(
@@ -1281,6 +1313,7 @@ pub async fn chat_steer(
         crate::agent::PendingSteer {
             id,
             text,
+            images,
             ts: now(),
         },
     )
@@ -2324,6 +2357,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn image_parts_must_be_a_supported_web_type_within_the_size_cap() {
+        for media_type in ["image/png", "image/jpeg", "image/gif", "image/webp"] {
+            assert!(
+                validate_images(&[ImagePart {
+                    media_type: media_type.into(),
+                    data: "aGk=".into(),
+                }])
+                .is_ok(),
+                "{media_type} must be accepted"
+            );
+        }
+
+        // svg is not a vision type and a data-URL script vector
+        let svg = vec![ImagePart {
+            media_type: "image/svg+xml".into(),
+            data: "aGk=".into(),
+        }];
+        assert!(validate_images(&svg).is_err());
+
+        let empty = vec![ImagePart {
+            media_type: "image/png".into(),
+            data: String::new(),
+        }];
+        assert!(validate_images(&empty).is_err());
+
+        let huge = vec![ImagePart {
+            media_type: "image/png".into(),
+            data: "x".repeat(MAX_IMAGE_BASE64_BYTES + 1),
+        }];
+        assert!(validate_images(&huge).is_err());
+    }
+
+    #[test]
     fn default_effort_patch_is_tristate() {
         // missing field keeps the current default
         let keep: AppSettingsPatch = serde_json::from_str("{}").unwrap();
@@ -2388,6 +2454,7 @@ mod tests {
         let messages = vec![
             Msg::User {
                 text: "first".into(),
+                images: Vec::new(),
                 ts: None,
             }
             .as_json(),
@@ -2399,6 +2466,7 @@ mod tests {
             .as_json(),
             Msg::User {
                 text: "second".into(),
+                images: Vec::new(),
                 ts: None,
             }
             .as_json(),
@@ -2501,6 +2569,7 @@ mod tests {
         crate::agent::PendingSteer {
             id: id.into(),
             text: text.into(),
+            images: Vec::new(),
             ts: "2026-09-24T00:00:00Z".into(),
         }
     }

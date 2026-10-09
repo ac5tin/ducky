@@ -201,6 +201,7 @@ impl LlmProvider for MockProvider {
                     queue.lock().unwrap().push_back(PendingSteer {
                         id: "s1".into(),
                         text,
+                        images: Vec::new(),
                         ts: "2026-09-24T00:00:00Z".into(),
                     });
                     round = Some(*inner);
@@ -372,6 +373,7 @@ async fn run_with_steering(
             "mock-model".into(),
             Vec::new(),
             prompt.to_string(),
+            Vec::new(),
             ct.clone(),
             steering,
         )
@@ -727,6 +729,7 @@ async fn cancelling_the_turn_cancels_subagents() {
                 "mock-model".into(),
                 Vec::new(),
                 "t5-main".into(),
+                Vec::new(),
                 task_ct,
                 Arc::new(Mutex::new(VecDeque::new())),
             )
@@ -2424,6 +2427,7 @@ async fn a_cancelled_batch_never_answers_the_next_turn_with_a_dangling_call() {
             "mock-model".into(),
             history,
             "cancel-batch-2".into(),
+            Vec::new(),
             CancellationToken::new(),
             Arc::new(Mutex::new(VecDeque::new())),
         )
@@ -2459,6 +2463,7 @@ async fn auto_compact_keeps_the_newest_user_turn_verbatim() {
     let mut history = vec![
         Msg::User {
             text: "first ask".into(),
+            images: Vec::new(),
             ts: None,
         },
         Msg::Assistant {
@@ -2468,6 +2473,7 @@ async fn auto_compact_keeps_the_newest_user_turn_verbatim() {
         },
         Msg::User {
             text: "newest ask".into(),
+            images: Vec::new(),
             ts: None,
         },
     ];
@@ -2500,6 +2506,7 @@ async fn auto_compact_leaves_the_history_alone_when_the_summary_is_empty() {
     let mut history = vec![
         Msg::User {
             text: "fail first ask".into(),
+            images: Vec::new(),
             ts: None,
         },
         Msg::Assistant {
@@ -2509,6 +2516,7 @@ async fn auto_compact_leaves_the_history_alone_when_the_summary_is_empty() {
         },
         Msg::User {
             text: "fail newest ask".into(),
+            images: Vec::new(),
             ts: None,
         },
     ];
@@ -2555,6 +2563,7 @@ async fn the_loop_auto_compacts_before_the_model_call() {
     let history = vec![
         Msg::User {
             text: format!("old ask {}", "x".repeat(4000)),
+            images: Vec::new(),
             ts: None,
         },
         Msg::Assistant {
@@ -2566,6 +2575,7 @@ async fn the_loop_auto_compacts_before_the_model_call() {
     let mut with_new = history.clone();
     with_new.push(Msg::User {
         text: "new ask".into(),
+        images: Vec::new(),
         ts: None,
     });
     script(
@@ -2581,6 +2591,7 @@ async fn the_loop_auto_compacts_before_the_model_call() {
             "mock-model".into(),
             history,
             "new ask".into(),
+            Vec::new(),
             CancellationToken::new(),
             Arc::new(Mutex::new(VecDeque::new())),
         )

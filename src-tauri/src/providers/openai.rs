@@ -80,7 +80,25 @@ impl OpenAiProvider {
         for msg in messages {
             match msg {
                 Msg::System { text } => out.push(json!({"role": "system", "content": text})),
-                Msg::User { text, .. } => out.push(json!({"role": "user", "content": text})),
+                Msg::User { text, images, .. } => {
+                    if images.is_empty() {
+                        out.push(json!({"role": "user", "content": text}));
+                    } else {
+                        let mut parts = Vec::with_capacity(images.len() + 1);
+                        if !text.is_empty() {
+                            parts.push(json!({"type": "text", "text": text}));
+                        }
+                        for image in images {
+                            parts.push(json!({
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": format!("data:{};base64,{}", image.media_type, image.data)
+                                },
+                            }));
+                        }
+                        out.push(json!({"role": "user", "content": parts}));
+                    }
+                }
                 Msg::Assistant {
                     text, tool_calls, ..
                 } => {
@@ -336,6 +354,7 @@ mod tests {
             },
             Msg::User {
                 text: "hello".into(),
+                images: Vec::new(),
                 ts: None,
             },
             Msg::Assistant {
@@ -366,6 +385,42 @@ mod tests {
         let tw = OpenAiProvider::tools_to_wire(&tools).unwrap();
         assert_eq!(tw[0]["type"], "function");
         assert!(OpenAiProvider::tools_to_wire(&[]).is_none());
+    }
+
+    #[test]
+    fn user_images_become_content_blocks() {
+        let msgs = vec![Msg::User {
+            text: "what is this?".into(),
+            images: vec![super::super::ImagePart {
+                media_type: "image/png".into(),
+                data: "aGk=".into(),
+            }],
+            ts: None,
+        }];
+        let wire = OpenAiProvider::messages_to_wire(&msgs);
+        assert_eq!(wire[0]["role"], "user");
+        assert_eq!(wire[0]["content"][0]["type"], "text");
+        assert_eq!(wire[0]["content"][0]["text"], "what is this?");
+        assert_eq!(wire[0]["content"][1]["type"], "image_url");
+        assert_eq!(
+            wire[0]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,aGk="
+        );
+    }
+
+    #[test]
+    fn image_only_user_message_has_no_text_block() {
+        let msgs = vec![Msg::User {
+            text: String::new(),
+            images: vec![super::super::ImagePart {
+                media_type: "image/jpeg".into(),
+                data: "eA==".into(),
+            }],
+            ts: None,
+        }];
+        let wire = OpenAiProvider::messages_to_wire(&msgs);
+        assert_eq!(wire[0]["content"][0]["type"], "image_url");
+        assert_eq!(wire[0]["content"].as_array().unwrap().len(), 1);
     }
 
     #[test]

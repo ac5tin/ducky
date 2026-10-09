@@ -18,6 +18,15 @@ use crate::config::{ApiType, ProviderConfig};
 // Shared chat model
 // ---------------------------------------------------------------------------
 
+/// One image attached to a user message, exactly as the user supplied it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ImagePart {
+    /// MIME type, e.g. `image/png`. Validated at the command boundary.
+    pub media_type: String,
+    /// Base64-encoded bytes, without the `data:` prefix.
+    pub data: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Msg {
@@ -26,6 +35,9 @@ pub enum Msg {
     },
     User {
         text: String,
+        /// Attached images, in paste order. Empty for text-only messages.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImagePart>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ts: Option<String>,
     },
@@ -589,12 +601,14 @@ mod tests {
         let mut messages = vec![
             Msg::User {
                 text: "one".into(),
+                images: Vec::new(),
                 ts: None,
             },
             assistant("", &[("c0", "fs_list"), ("c1", "fs_read")]),
             result("c0"),
             Msg::User {
                 text: "two".into(),
+                images: Vec::new(),
                 ts: None,
             },
             assistant("done", &[("c2", "fs_list")]),
@@ -606,12 +620,14 @@ mod tests {
             vec![
                 Msg::User {
                     text: "one".into(),
+                    images: Vec::new(),
                     ts: None,
                 },
                 assistant("", &[("c0", "fs_list")]),
                 result("c0"),
                 Msg::User {
                     text: "two".into(),
+                    images: Vec::new(),
                     ts: None,
                 },
                 assistant("done", &[("c2", "fs_list")]),
@@ -627,6 +643,7 @@ mod tests {
         let mut messages = vec![
             Msg::User {
                 text: "hi".into(),
+                images: Vec::new(),
                 ts: None,
             },
             assistant("", &[("c0", "fs_list")]),
@@ -636,6 +653,7 @@ mod tests {
             messages,
             vec![Msg::User {
                 text: "hi".into(),
+                images: Vec::new(),
                 ts: None,
             }]
         );

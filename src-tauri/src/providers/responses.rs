@@ -45,10 +45,19 @@ impl ResponsesProvider {
         for msg in messages {
             match msg {
                 Msg::System { .. } => {}
-                Msg::User { text, .. } => out.push(json!({
-                    "role": "user",
-                    "content": [{ "type": "input_text", "text": text }],
-                })),
+                Msg::User { text, images, .. } => {
+                    let mut content = Vec::with_capacity(images.len() + 1);
+                    if !text.is_empty() || images.is_empty() {
+                        content.push(json!({ "type": "input_text", "text": text }));
+                    }
+                    for image in images {
+                        content.push(json!({
+                            "type": "input_image",
+                            "image_url": format!("data:{};base64,{}", image.media_type, image.data),
+                        }));
+                    }
+                    out.push(json!({ "role": "user", "content": content }));
+                }
                 Msg::Assistant {
                     text, tool_calls, ..
                 } => {
@@ -354,6 +363,7 @@ mod tests {
             },
             Msg::User {
                 text: "hello".into(),
+                images: Vec::new(),
                 ts: None,
             },
         ];
@@ -366,6 +376,26 @@ mod tests {
         assert_eq!(body["input"].as_array().unwrap().len(), 1);
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn user_images_become_input_image_parts() {
+        let messages = vec![Msg::User {
+            text: "what is this?".into(),
+            images: vec![super::super::ImagePart {
+                media_type: "image/png".into(),
+                data: "aGk=".into(),
+            }],
+            ts: None,
+        }];
+        let input = ResponsesProvider::messages_to_input(&messages);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"][0]["type"], "input_text");
+        assert_eq!(input[0]["content"][1]["type"], "input_image");
+        assert_eq!(
+            input[0]["content"][1]["image_url"],
+            "data:image/png;base64,aGk="
+        );
     }
 
     #[test]

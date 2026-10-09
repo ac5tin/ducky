@@ -598,6 +598,7 @@ pub fn build_summarizer_messages(window: &Window, instructions: Option<&str>) ->
         },
         Msg::User {
             text: user,
+            images: Vec::new(),
             ts: None,
         },
     ]
@@ -607,6 +608,7 @@ pub fn build_summarizer_messages(window: &Window, instructions: Option<&str>) ->
 pub fn apply(summary: &str) -> Vec<Msg> {
     vec![Msg::User {
         text: format!("{COMPACT_MARKER}\n\n{}", summary.trim()),
+        images: Vec::new(),
         ts: Some(chrono::Utc::now().to_rfc3339()),
     }]
 }
@@ -709,6 +711,7 @@ mod tests {
     fn user(text: &str) -> Msg {
         Msg::User {
             text: text.into(),
+            images: Vec::new(),
             ts: None,
         }
     }
@@ -815,7 +818,7 @@ mod tests {
         let applied = apply("Objective: fix the bug.");
         assert_eq!(applied.len(), 1);
         let carrier = applied.first().unwrap();
-        let Msg::User { text, ts } = carrier else {
+        let Msg::User { text, ts, .. } = carrier else {
             panic!("carrier must be a user message");
         };
         assert!(text.starts_with(COMPACT_MARKER));

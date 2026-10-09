@@ -11,6 +11,7 @@ import {
   COMPACT_SUMMARY_MARKER,
   INIT_PROMPT_MARKER,
   filterCommands,
+  parseSlashCommand,
   type SlashCommand,
 } from "../../slashCommands";
 import { nextMode, resolveShownMode } from "../../modes";
@@ -18,6 +19,11 @@ import {
   messageActionKinds,
   type MessageActionKind,
 } from "../../chatMessageActions";
+import {
+  imagePreviewUrl,
+  imageRejection,
+  readImagePart,
+} from "../../imageAttachments";
 import { Icon } from "../icons";
 import { save } from "@tauri-apps/plugin-dialog";
 import * as api from "../../api";
@@ -46,7 +52,7 @@ import {
   matchFileReferences,
 } from "../../fileReferences";
 import { fsSuggest } from "../../api";
-import type { ConversationMeta } from "../../types";
+import type { ConversationMeta, ImagePart } from "../../types";
 
 export function ChatView() {
   const items = useStore((s) => s.items);
@@ -478,6 +484,18 @@ function UserMessageBubble({
           </div>
         ) : (
           <div className="whitespace-pre-wrap rounded-2xl rounded-br-md bg-sky-600 px-4 py-2.5 text-sm leading-relaxed text-white shadow-sm">
+            {item.images && item.images.length > 0 && (
+              <div className="mb-2 flex flex-wrap gap-2">
+                {item.images.map((image, index) => (
+                  <img
+                    key={index}
+                    src={imagePreviewUrl(image)}
+                    alt=""
+                    className="max-h-48 rounded-lg border border-white/20"
+                  />
+                ))}
+              </div>
+            )}
             {item.text}
           </div>
         )}
@@ -637,6 +655,18 @@ function SteeringBubble({
     <div className="flex justify-end">
       <div className="max-w-[85%]">
         <div className="whitespace-pre-wrap rounded-2xl rounded-br-md border border-dashed border-sky-400/70 bg-sky-600/40 px-4 py-2.5 text-sm leading-relaxed text-sky-50">
+          {message.images && message.images.length > 0 && (
+            <div className="mb-2 flex flex-wrap gap-2">
+              {message.images.map((image, index) => (
+                <img
+                  key={index}
+                  src={imagePreviewUrl(image)}
+                  alt=""
+                  className="max-h-48 rounded-lg border border-white/20"
+                />
+              ))}
+            </div>
+          )}
           {message.text}
         </div>
         <div className="mt-1 flex items-center justify-end gap-1.5 px-1 text-[11px] text-slate-400 dark:text-slate-500">
@@ -677,7 +707,13 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
     s.activeConversationId ? s.restoredDrafts[s.activeConversationId] : undefined,
   );
   const clearRestoredDraft = useStore((s) => s.clearRestoredDraft);
+  const toast = useStore((s) => s.toast);
   const [text, setText] = useState("");
+  // Images waiting to ride along with the next send. Transient: they are not
+  // restored per conversation like the draft text is.
+  const [attachments, setAttachments] = useState<ImagePart[]>([]);
+  const [draggingOver, setDraggingOver] = useState(false);
+  const fileInput = useRef<HTMLInputElement>(null);
   // Esc hides the popup for the current "/" token; leaving or clearing the
   // slash context reopens it
   const [dismissed, setDismissed] = useState(false);
@@ -823,15 +859,42 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
     });
   };
 
+  /** Paste, drop or file-picker images become pending attachments. Each file
+   * is pre-checked against the backend's rules so a refusal is instant; the
+   * reader hands back the base64 part the backend expects. */
+  const attachFiles = async (files: ArrayLike<File>) => {
+    const accepted: ImagePart[] = [];
+    for (const file of Array.from(files)) {
+      const why = imageRejection(file);
+      if (why) {
+        toast("error", why);
+        continue;
+      }
+      try {
+        accepted.push(await readImagePart(file));
+      } catch (e) {
+        toast("error", `Could not read ${file.name}: ${e}`);
+      }
+    }
+    if (accepted.length) setAttachments((current) => [...current, ...accepted]);
+  };
+
   const submit = () => {
     const t = text.trim();
-    if (!t || compacting) return;
+    if (compacting || (!t && attachments.length === 0)) return;
+    if (attachments.length > 0 && parseSlashCommand(t)) {
+      // a slash command never reaches the model, so it cannot carry images
+      setAttachments([]);
+      toast("info", "Slash commands can't carry images — the attachment was removed.");
+    }
     // while the agent is responding the store steers the message into the
     // running turn instead
     setText("");
     setChatsDismissed(false);
     setFilesDismissed(false);
-    send(t).catch((e) => console.error(e));
+    const carried = attachments;
+    setAttachments([]);
+    send(t, carried).catch((e) => console.error(e));
   };
 
   const cycleMode = () => {
@@ -878,34 +941,109 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
             Compacting the conversation…
           </div>
         ) : (
-          <>
-            <textarea
-              ref={ref}
-              value={text}
-              autoFocus={autoFocus}
-              rows={1}
-              placeholder={
-                streaming
-                  ? "Steer the response — it enters after the current step…"
-                  : "Ask anything — your connected tools are available automatically…"
-              }
-              className="max-h-40 min-h-[44px] flex-1 resize-none rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-sm outline-none transition focus:border-sky-400 focus:ring-2 focus:ring-sky-100 dark:border-slate-700 dark:bg-slate-900 dark:focus:border-sky-500 dark:focus:ring-sky-900/40"
-              onChange={(e) => {
-                const next = e.target.value;
-                const nextCaret = e.target.selectionStart ?? next.length;
-                setText(next);
-                setCaret(nextCaret);
-                if (!next.trim().startsWith("/")) setDismissed(false);
-                if (!sessionReferenceToken(next, nextCaret)) {
-                  setChatsDismissed(false);
+          <div
+            className={`flex min-h-[44px] flex-1 flex-col gap-2 rounded-xl border-2 border-dashed p-1.5 transition ${
+              draggingOver
+                ? "border-sky-400 bg-sky-50/60 dark:bg-sky-950/40"
+                : "border-transparent"
+            }`}
+            onDragOver={(e) => {
+              e.preventDefault();
+              setDraggingOver(true);
+            }}
+            onDragLeave={() => setDraggingOver(false)}
+            onDrop={(e) => {
+              e.preventDefault();
+              setDraggingOver(false);
+              void attachFiles(e.dataTransfer.files);
+            }}
+          >
+            {attachments.length > 0 && (
+              <div className="flex flex-wrap gap-2 px-1 pt-1">
+                {attachments.map((image, index) => (
+                  <div key={index} className="relative">
+                    <img
+                      src={imagePreviewUrl(image)}
+                      alt=""
+                      className="h-14 w-14 rounded-lg border border-slate-200 object-cover dark:border-slate-700"
+                    />
+                    <button
+                      type="button"
+                      className="absolute -right-1.5 -top-1.5 rounded-full bg-slate-800 p-0.5 text-white shadow transition hover:bg-slate-700"
+                      aria-label={`Remove image ${index + 1}`}
+                      onClick={() =>
+                        setAttachments((current) =>
+                          current.filter((_, i) => i !== index),
+                        )
+                      }
+                    >
+                      <Icon name="x" className="h-3 w-3" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div className="flex items-end gap-2">
+              <input
+                ref={fileInput}
+                type="file"
+                accept="image/png,image/jpeg,image/gif,image/webp"
+                multiple
+                className="hidden"
+                onChange={(e) => {
+                  if (e.target.files) void attachFiles(e.target.files);
+                  e.target.value = "";
+                }}
+              />
+              <button
+                type="button"
+                className="flex h-11 w-9 shrink-0 items-center justify-center rounded-xl text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-200"
+                aria-label="Attach image"
+                title="Attach image"
+                onClick={() => fileInput.current?.click()}
+              >
+                <Icon name="plus" className="h-4.5 w-4.5" />
+              </button>
+              <textarea
+                ref={ref}
+                value={text}
+                autoFocus={autoFocus}
+                rows={1}
+                onPaste={(e) => {
+                  const files = Array.from(e.clipboardData.items)
+                    .filter(
+                      (item) =>
+                        item.kind === "file" && item.type.startsWith("image/"),
+                    )
+                    .map((item) => item.getAsFile())
+                    .filter((file): file is File => file !== null);
+                  if (files.length === 0) return;
+                  // the text part of a mixed paste still lands in the textarea
+                  e.preventDefault();
+                  void attachFiles(files);
+                }}
+                placeholder={
+                  streaming
+                    ? "Steer the response — it enters after the current step…"
+                    : "Ask anything — your connected tools are available automatically…"
                 }
-                if (!fileReferenceToken(next, nextCaret)) {
-                  setFilesDismissed(false);
-                }
-                e.currentTarget.style.height = "auto";
-                e.currentTarget.style.height = `${Math.min(e.currentTarget.scrollHeight, 160)}px`;
-              }}
-              onSelect={(e) => setCaret(e.currentTarget.selectionStart ?? 0)}
+                className="max-h-40 min-h-[44px] flex-1 resize-none rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-sm outline-none transition focus:border-sky-400 focus:ring-2 focus:ring-sky-100 dark:border-slate-700 dark:bg-slate-900 dark:focus:border-sky-500 dark:focus:ring-sky-900/40"
+                onChange={(e) => {
+                  const next = e.target.value;
+                  const nextCaret = e.target.selectionStart ?? next.length;
+                  setText(next);
+                  setCaret(nextCaret);
+                  if (!next.trim().startsWith("/")) setDismissed(false);
+                  if (!sessionReferenceToken(next, nextCaret)) {
+                    setChatsDismissed(false);
+                  }
+                  if (!fileReferenceToken(next, nextCaret)) {
+                    setFilesDismissed(false);
+                  }
+                  e.currentTarget.style.height = "auto";
+                  e.currentTarget.style.height = `${Math.min(e.currentTarget.scrollHeight, 160)}px`;
+                }}
+                onSelect={(e) => setCaret(e.currentTarget.selectionStart ?? 0)}
               onKeyUp={(e) => setCaret(e.currentTarget.selectionStart ?? 0)}
               onClick={(e) => setCaret(e.currentTarget.selectionStart ?? 0)}
               onKeyDown={(e) => {
@@ -986,7 +1124,7 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
             />
             {streaming ? (
               <button
-                className="flex h-11 w-11 items-center justify-center rounded-xl bg-slate-800 text-white transition hover:bg-slate-700 dark:bg-slate-700"
+                className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-slate-800 text-white transition hover:bg-slate-700 dark:bg-slate-700"
                 aria-label="Stop"
                 onClick={stop}
               >
@@ -994,15 +1132,16 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
               </button>
             ) : (
               <button
-                className="flex h-11 w-11 items-center justify-center rounded-xl bg-sky-600 text-white shadow-sm transition hover:bg-sky-500 disabled:opacity-40"
+                className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-sky-600 text-white shadow-sm transition hover:bg-sky-500 disabled:opacity-40"
                 aria-label="Send"
-                disabled={!text.trim()}
+                disabled={!text.trim() && attachments.length === 0}
                 onClick={submit}
               >
                 <Icon name="send" className="h-4.5 w-4.5" />
               </button>
             )}
-          </>
+            </div>
+          </div>
         )}
       </div>
     </div>
