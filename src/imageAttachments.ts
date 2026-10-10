@@ -57,6 +57,31 @@ export function clipboardImageFiles(clipboardData: {
     : [];
 }
 
+/**
+ * Reads the first supported image off the async clipboard. WebKitGTK hands
+ * the paste event an empty payload for image clips, so the bytes are only
+ * reachable this way; the caller invokes it synchronously inside the paste
+ * dispatch to keep the transient activation the read requires. Rejections
+ * propagate — the caller decides what to tell the user.
+ */
+export async function readClipboardImage(reader: {
+  read(): Promise<
+    ArrayLike<{
+      readonly types: readonly string[];
+      getType(type: string): Promise<Blob>;
+    }>
+  >;
+}): Promise<File | null> {
+  const items = await reader.read();
+  for (const item of Array.from(items)) {
+    const type = item.types.find((t) => SUPPORTED_IMAGE_TYPES.includes(t));
+    if (!type) continue;
+    const extension = type.slice("image/".length);
+    return new File([await item.getType(type)], `pasted-image.${extension}`, { type });
+  }
+  return null;
+}
+
 /** Reads an image file into an `ImagePart`, base64 and all. */
 export function readImagePart(file: File): Promise<ImagePart> {
   return new Promise((resolve, reject) => {

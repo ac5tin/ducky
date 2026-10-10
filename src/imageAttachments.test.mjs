@@ -6,6 +6,7 @@ import {
   clipboardImageFiles,
   imagePreviewUrl,
   imageRejection,
+  readClipboardImage,
 } from "./imageAttachments.ts";
 
 test("imageRejection accepts the four web image types", () => {
@@ -62,4 +63,68 @@ test("clipboardImageFiles falls back to files when items carry nothing", () => {
   assert.equal(files.length, 1);
   assert.equal(files[0].name, "shot.png");
   assert.deepEqual(clipboardImageFiles({}), []);
+});
+
+test("readClipboardImage picks the allowlisted type when an item offers several", async () => {
+  const asked = [];
+  const png = new Blob([new Uint8Array([1])], { type: "image/png" });
+  const file = await readClipboardImage({
+    read: async () => [
+      {
+        types: ["image/avif", "image/png", "text/html"],
+        getType: async (type) => {
+          asked.push(type);
+          return png;
+        },
+      },
+    ],
+  });
+  assert.deepEqual(asked, ["image/png"]);
+  assert.equal(file?.type, "image/png");
+  assert.equal(file?.name, "pasted-image.png");
+});
+
+test("readClipboardImage returns null when no item carries an allowlisted image", async () => {
+  let asked = 0;
+  const file = await readClipboardImage({
+    read: async () => [
+      {
+        types: ["text/plain", "text/html"],
+        getType: async () => {
+          asked++;
+          return new Blob(["hi"]);
+        },
+      },
+      {
+        types: ["image/avif"],
+        getType: async () => {
+          asked++;
+          return new Blob([new Uint8Array([1])]);
+        },
+      },
+    ],
+  });
+  assert.equal(file, null);
+  assert.equal(asked, 0);
+});
+
+test("readClipboardImage wraps the blob as a File typed by the chosen MIME", async () => {
+  const webp = new Blob([new Uint8Array([1, 2])], { type: "image/webp" });
+  const file = await readClipboardImage({
+    read: async () => [{ types: ["image/webp"], getType: async () => webp }],
+  });
+  assert.equal(file?.type, "image/webp");
+  assert.equal(file?.name, "pasted-image.webp");
+  assert.equal(file?.size, 2);
+});
+
+test("readClipboardImage propagates a reader rejection", async () => {
+  await assert.rejects(
+    readClipboardImage({
+      read: async () => {
+        throw new Error("NotAllowedError");
+      },
+    }),
+    /NotAllowedError/,
+  );
 });

@@ -23,6 +23,7 @@ import {
   clipboardImageFiles,
   imagePreviewUrl,
   imageRejection,
+  readClipboardImage,
   readImagePart,
 } from "../../imageAttachments";
 import { Icon } from "../icons";
@@ -687,6 +688,10 @@ function SteeringBubble({
   );
 }
 
+/** Shown when an empty paste payload turns out to carry no reachable image. */
+const PASTE_IMAGE_FALLBACK =
+  "Screenshots may not reach the app on this system — use the + button or drag & drop the file instead.";
+
 function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
   const send = useStore((s) => s.send);
   const stop = useStore((s) => s.stop);
@@ -1027,10 +1032,37 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
                 rows={1}
                 onPaste={(e) => {
                   const files = clipboardImageFiles(e.clipboardData);
-                  if (files.length === 0) return;
-                  // the text part of a mixed paste still lands in the textarea
-                  e.preventDefault();
-                  void attachFiles(files);
+                  if (files.length > 0) {
+                    // the text part of a mixed paste still lands in the textarea
+                    e.preventDefault();
+                    void attachFiles(files);
+                    return;
+                  }
+                  // WebKitGTK reports an empty payload for image clips; the
+                  // bytes are only reachable through the async clipboard API.
+                  // A non-empty payload without an image is text, so it falls
+                  // through to the default paste untouched.
+                  if (e.clipboardData.types.length > 0) return;
+                  if (typeof navigator.clipboard?.read !== "function") {
+                    toast("info", PASTE_IMAGE_FALLBACK);
+                    return;
+                  }
+                  // the read must ride the paste's transient activation, so it
+                  // starts synchronously here, before any await
+                  const pastedInto = activeId;
+                  void readClipboardImage(navigator.clipboard)
+                    .then((file) => {
+                      if (useStore.getState().activeConversationId !== pastedInto) return;
+                      if (!file) {
+                        toast("info", PASTE_IMAGE_FALLBACK);
+                        return;
+                      }
+                      void attachFiles([file]);
+                    })
+                    .catch(() => {
+                      if (useStore.getState().activeConversationId !== pastedInto) return;
+                      toast("info", PASTE_IMAGE_FALLBACK);
+                    });
                 }}
                 placeholder={
                   streaming
