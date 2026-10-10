@@ -877,6 +877,7 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
    * is pre-checked against the backend's rules so a refusal is instant; the
    * reader hands back the base64 part the backend expects. */
   const attachFiles = async (files: ArrayLike<File>) => {
+    const target = activeId;
     const accepted: ImagePart[] = [];
     for (const file of Array.from(files)) {
       const why = imageRejection(file);
@@ -890,6 +891,9 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
         toast("error", `Could not read ${file.name}: ${e}`);
       }
     }
+    // reading is async; a switch that lands meanwhile must not inherit the
+    // pending attachment from the chat it was pasted into
+    if (useStore.getState().activeConversationId !== target) return;
     if (accepted.length) setAttachments((current) => [...current, ...accepted]);
   };
 
@@ -1033,7 +1037,8 @@ function Composer({ autoFocus = false }: { autoFocus?: boolean }) {
                 onPaste={(e) => {
                   const files = clipboardImageFiles(e.clipboardData);
                   if (files.length > 0) {
-                    // the text part of a mixed paste still lands in the textarea
+                    // an image payload is consumed here; any accompanying
+                    // text is not pasted
                     e.preventDefault();
                     void attachFiles(files);
                     return;
